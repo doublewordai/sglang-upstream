@@ -217,6 +217,23 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
-    self_named_buffers = dict(model.named_buffers())
+    # Build {full_name: (parent_module, buffer_attr_name)} for buffer replacement
+    buffer_owners = {}
+    for mod_name, module in model.named_modules():
+        for buf_name in module._buffers:
+            full_name = f"{mod_name}.{buf_name}" if mod_name else buf_name
+            buffer_owners[full_name] = (module, buf_name)
+
     for name, tensor in static_params["buffers"]:
-        self_named_buffers[name][...] = tensor
+        owner = buffer_owners.get(name)
+        if owner is not None:
+            # Replace buffer on parent module instead of in-place update.
+            # In-place update fails when buffers are inference tensors
+            # (scheduler runs under @DynamicGradMode / inference_mode).
+            parent, buf_name = owner
+            parent._buffers[buf_name] = tensor.clone().detach()
+        else:
+            # Fallback: try in-place (original behavior)
+            named_bufs = dict(model.named_buffers())
+            if name in named_bufs:
+                named_bufs[name][...] = tensor

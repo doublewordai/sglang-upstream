@@ -683,6 +683,17 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        # Reset any parameters that process_weights_after_loading may have
+        # reshaped (e.g. FP8 block quant scale expansion). This makes reload
+        # identical to first load for any quant method that implements
+        # prepare_weights_for_loading.
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None and hasattr(
+                quant_method, "prepare_weights_for_loading"
+            ):
+                quant_method.prepare_weights_for_loading(module)
+
         model.load_weights(weights)
 
         for _, module in model.named_modules():
@@ -697,6 +708,15 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
+
+        # After post-processing, copy new data back into original tensor
+        # storage to preserve GPU addresses for CUDA graph compatibility.
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None and hasattr(
+                quant_method, "finalize_weights_after_loading"
+            ):
+                quant_method.finalize_weights_after_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):

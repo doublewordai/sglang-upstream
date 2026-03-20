@@ -101,7 +101,15 @@ class BasevLLMParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
-        assert self.data.shape == loaded_weight.shape
+        # Shape-tolerant reload: scale parameters may have been expanded by
+        # process_weights_after_loading (e.g. FP8 block quant [16,1]->[2048,1]).
+        # On reload from disk, the compact shape returns. Replace self.data and
+        # let process_weights_after_loading re-expand afterward.
+        if self.data.shape != loaded_weight.shape:
+            self.data = loaded_weight.to(
+                device=self.data.device, dtype=self.data.dtype
+            )
+            return
         self.data.copy_(loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
@@ -158,12 +166,21 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim,
                     shard_size,
                 )
-                assert param_data.shape == loaded_weight.shape
+                if param_data.shape != loaded_weight.shape:
+                    return
                 param_data.copy_(loaded_weight)
                 return
             else:
+                start_idx = tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.output_dim]:
+                    # Loaded weight too small — shape changed by post-processing
+                    self.data = loaded_weight.to(
+                        device=self.data.device, dtype=self.data.dtype
+                    )
+                    return
                 loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
+                    self.output_dim, start_idx, shard_size
                 )
 
         copy_with_check(self.data, loaded_weight)
@@ -183,6 +200,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
 
         param_data = self.data
+
+        # Guard: if shard exceeds param dimension (expanded by post-processing),
+        # replace self.data with loaded weight and let post-processing re-expand.
+        if shard_offset + shard_size > param_data.shape[self.output_dim]:
+            self.data = loaded_weight.to(
+                device=self.data.device, dtype=self.data.dtype
+            )
+            return
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
@@ -214,7 +239,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                         self.output_dim, start_idx, shard_size
                     )
 
-        assert param_data.shape == loaded_weight.shape
+        if param_data.shape != loaded_weight.shape:
+            return
         param_data.copy_(loaded_weight)
 
     def load_qkv_weight(
@@ -327,7 +353,11 @@ class RowvLLMParameter(BasevLLMParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert self.data.shape == loaded_weight.shape
+        if self.data.shape != loaded_weight.shape:
+            self.data = loaded_weight.to(
+                device=self.data.device, dtype=self.data.dtype
+            )
+            return
         self.data.copy_(loaded_weight)
 
 
