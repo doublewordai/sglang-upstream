@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import logging
 import traceback
 from typing import TYPE_CHECKING, Tuple
@@ -45,67 +43,6 @@ logger = logging.getLogger(__name__)
 
 class SchedulerUpdateWeightsMixin:
 
-    def _warmstart_get_cudart(self: Scheduler):
-        cudart_path = ctypes.util.find_library("cudart")
-        if cudart_path is None:
-            cudart_path = "libcudart.so.12"
-        return ctypes.CDLL(cudart_path)
-
-    def _warmstart_clear_cuda_error(self: Scheduler, stage: str):
-        if self.tp_group.device.type != "cuda":
-            return
-
-        cudart = self._warmstart_get_cudart()
-        get_last_error = cudart.cudaGetLastError
-        get_last_error.argtypes = []
-        get_last_error.restype = ctypes.c_int
-
-        with torch.cuda.device(self.tp_group.device):
-            rc = get_last_error()
-        logger.info("%s: cudaGetLastError() -> %s", stage, rc)
-
-    def _warmstart_disable_tp_peer_access(self: Scheduler):
-        if self.tp_group.world_size <= 1 or self.tp_group.device.type != "cuda":
-            return
-
-        cudart = self._warmstart_get_cudart()
-        disable_peer_access = cudart.cudaDeviceDisablePeerAccess
-        disable_peer_access.argtypes = [ctypes.c_int]
-        disable_peer_access.restype = ctypes.c_int
-
-        local_device_idx = self.tp_group.device.index or 0
-        with torch.cuda.device(self.tp_group.device):
-            for peer_device_idx in range(self.tp_group.world_size):
-                if peer_device_idx == local_device_idx:
-                    continue
-                rc = disable_peer_access(peer_device_idx)
-                logger.info(
-                    "warmstart_teardown_tp_comms: cudaDeviceDisablePeerAccess(%s) -> %s",
-                    peer_device_idx,
-                    rc,
-                )
-
-    def _warmstart_enable_tp_peer_access(self: Scheduler):
-        if self.tp_group.world_size <= 1 or self.tp_group.device.type != "cuda":
-            return
-
-        cudart = self._warmstart_get_cudart()
-        enable_peer_access = cudart.cudaDeviceEnablePeerAccess
-        enable_peer_access.argtypes = [ctypes.c_int, ctypes.c_uint]
-        enable_peer_access.restype = ctypes.c_int
-
-        local_device_idx = self.tp_group.device.index or 0
-        with torch.cuda.device(self.tp_group.device):
-            for peer_device_idx in range(self.tp_group.world_size):
-                if peer_device_idx == local_device_idx:
-                    continue
-                rc = enable_peer_access(peer_device_idx, 0)
-                logger.info(
-                    "warmstart_reinit_tp_comms: cudaDeviceEnablePeerAccess(%s) -> %s",
-                    peer_device_idx,
-                    rc,
-                )
-
     def warmstart_teardown_tp_comms(self: Scheduler):
         assert (
             self._is_no_request()
@@ -116,8 +53,6 @@ class SchedulerUpdateWeightsMixin:
             torch.distributed.barrier(self.tp_cpu_group)
             logger.info("warmstart_teardown_tp_comms: passed pre-teardown barrier")
         self.tp_group.teardown_runtime_comms()
-        self._warmstart_disable_tp_peer_access()
-        self._warmstart_clear_cuda_error("warmstart_teardown_tp_comms")
         logger.info("warmstart_teardown_tp_comms: finished local teardown")
         if self.tp_group.world_size > 1:
             logger.info("warmstart_teardown_tp_comms: entering post-teardown barrier")
@@ -130,8 +65,6 @@ class SchedulerUpdateWeightsMixin:
             torch.distributed.barrier(self.tp_cpu_group)
             logger.info("warmstart_reinit_tp_comms: passed pre-reinit barrier")
         self.tp_group.reinit_runtime_comms(reinit_pynccl=False)
-        self._warmstart_enable_tp_peer_access()
-        self._warmstart_clear_cuda_error("warmstart_reinit_tp_comms")
         logger.info("warmstart_reinit_tp_comms: finished local reinit")
         if self.tp_group.world_size > 1:
             logger.info("warmstart_reinit_tp_comms: entering post-reinit barrier")
