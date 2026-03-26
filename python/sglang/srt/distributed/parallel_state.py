@@ -1320,29 +1320,20 @@ class GroupCoordinator:
 
     def teardown_runtime_comms(self):
         if self.device.type != "cpu":
-            logger.info("%s: synchronizing device before comm teardown", self.unique_name)
             self.device_module.synchronize()
 
         if self.pynccl_comm is not None:
-            logger.info("%s: closing pynccl communicator", self.unique_name)
             self.pynccl_comm.close()
             self.pynccl_comm = None
-            logger.info("%s: closed pynccl communicator", self.unique_name)
         if self.ca_comm is not None:
-            logger.info("%s: closing custom allreduce communicator", self.unique_name)
             self.ca_comm.close()
             self.ca_comm = None
-            logger.info("%s: closed custom allreduce communicator", self.unique_name)
         if self.qr_comm is not None:
-            logger.info("%s: closing quick allreduce communicator", self.unique_name)
             self.qr_comm.close()
             self.qr_comm = None
-            logger.info("%s: closed quick allreduce communicator", self.unique_name)
         if self.device_group is not None:
-            logger.info("%s: destroying device process group", self.unique_name)
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
-            logger.info("%s: destroyed device process group", self.unique_name)
 
     def reinit_runtime_comms(self, reinit_pynccl: bool = True):
         if self.world_size <= 1 or self.cpu_group is None:
@@ -1362,11 +1353,9 @@ class GroupCoordinator:
             )
 
         if self.device_group is None:
-            logger.info("%s: recreating device process group", self.unique_name)
             self.device_group = torch.distributed.new_group(
                 self.ranks, backend=self._torch_distributed_backend
             )
-            logger.info("%s: recreated device process group", self.unique_name)
 
         if reinit_pynccl and self.use_pynccl and self.pynccl_comm is None:
             self.pynccl_comm = PyNcclCommunicator(

@@ -49,100 +49,17 @@ class SchedulerUpdateWeightsMixin:
         ), "warmstart_teardown_tp_comms should be called only when no ongoing request."
 
         if self.tp_group.world_size > 1:
-            logger.info("warmstart_teardown_tp_comms: entering pre-teardown barrier")
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info("warmstart_teardown_tp_comms: passed pre-teardown barrier")
+            self.tp_group.barrier()
         self.tp_group.teardown_runtime_comms()
-        logger.info("warmstart_teardown_tp_comms: finished local teardown")
         if self.tp_group.world_size > 1:
-            logger.info("warmstart_teardown_tp_comms: entering post-teardown barrier")
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info("warmstart_teardown_tp_comms: passed post-teardown barrier")
+            self.tp_group.barrier()
 
     def warmstart_reinit_tp_comms(self: Scheduler):
         if self.tp_group.world_size > 1:
-            logger.info("warmstart_reinit_tp_comms: entering pre-reinit barrier")
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info("warmstart_reinit_tp_comms: passed pre-reinit barrier")
+            self.tp_group.barrier()
         self.tp_group.reinit_runtime_comms(reinit_pynccl=False)
-        logger.info("warmstart_reinit_tp_comms: finished local reinit")
         if self.tp_group.world_size > 1:
-            logger.info("warmstart_reinit_tp_comms: entering post-reinit barrier")
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info("warmstart_reinit_tp_comms: passed post-reinit barrier")
-
-    def warmstart_rebuild_runtime_pools(self: Scheduler):
-        assert (
-            self._is_no_request()
-        ), "warmstart_rebuild_runtime_pools should be called only when no ongoing request."
-
-        if self.tp_group.world_size > 1:
-            logger.info(
-                "warmstart_rebuild_runtime_pools: entering pre-rebuild barrier"
-            )
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info(
-                "warmstart_rebuild_runtime_pools: passed pre-rebuild barrier"
-            )
-
-        self.flush_cache()
-        self.tp_worker.model_runner.warmstart_rebuild_runtime_pools()
-        self.tp_worker.refresh_runtime_pool_info()
-
-        self.max_total_num_tokens = self.tp_worker.max_total_num_tokens
-        self.max_running_requests = self.tp_worker.max_running_requests
-        self.max_req_len = self.tp_worker.max_req_len
-        self.max_req_input_len = self.tp_worker.max_req_input_len
-
-        self.init_cache_with_memory_pool()
-        logger.info(
-            "warmstart_rebuild_runtime_pools: refreshed scheduler cache references"
-        )
-
-        if self.tp_group.world_size > 1:
-            logger.info(
-                "warmstart_rebuild_runtime_pools: entering post-rebuild barrier"
-            )
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info(
-                "warmstart_rebuild_runtime_pools: passed post-rebuild barrier"
-            )
-
-    def warmstart_rebuild_runtime_pools_skip_flush(self: Scheduler):
-        assert (
-            self._is_no_request()
-        ), "warmstart_rebuild_runtime_pools_skip_flush should be called only when no ongoing request."
-
-        if self.tp_group.world_size > 1:
-            logger.info(
-                "warmstart_rebuild_runtime_pools_skip_flush: entering pre-rebuild barrier"
-            )
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info(
-                "warmstart_rebuild_runtime_pools_skip_flush: passed pre-rebuild barrier"
-            )
-
-        self.tp_worker.model_runner.warmstart_rebuild_runtime_pools()
-        self.tp_worker.refresh_runtime_pool_info()
-
-        self.max_total_num_tokens = self.tp_worker.max_total_num_tokens
-        self.max_running_requests = self.tp_worker.max_running_requests
-        self.max_req_len = self.tp_worker.max_req_len
-        self.max_req_input_len = self.tp_worker.max_req_input_len
-
-        self.init_cache_with_memory_pool()
-        logger.info(
-            "warmstart_rebuild_runtime_pools_skip_flush: refreshed scheduler cache references"
-        )
-
-        if self.tp_group.world_size > 1:
-            logger.info(
-                "warmstart_rebuild_runtime_pools_skip_flush: entering post-rebuild barrier"
-            )
-            torch.distributed.barrier(self.tp_cpu_group)
-            logger.info(
-                "warmstart_rebuild_runtime_pools_skip_flush: passed post-rebuild barrier"
-            )
+            self.tp_group.barrier()
 
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput

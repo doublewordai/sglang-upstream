@@ -337,20 +337,9 @@ class ModelRunnerKVCacheMixin:
         )
 
     def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
-        def _warmstart_sync(stage: str):
-            if self.device == "cuda":
-                logger.info("init_memory_pool: sync begin %s", stage)
-                torch.cuda.synchronize()
-                logger.info("init_memory_pool: sync end %s", stage)
-
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        logger.info(
-            "init_memory_pool: profiled max_total_num_tokens=%s",
-            self.max_total_num_tokens,
-        )
-        _warmstart_sync("after_profile_max_num_token")
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -431,7 +420,6 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
-            logger.info("init_memory_pool: creating req_to_token_pool")
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             extra_max_context_len = 4
             if self.server_args.speculative_num_draft_tokens is not None:
@@ -492,12 +480,9 @@ class ModelRunnerKVCacheMixin:
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
-        logger.info("init_memory_pool: req_to_token_pool ready")
-        _warmstart_sync("after_req_to_token_pool")
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        logger.info("init_memory_pool: creating token_to_kv_pool")
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -695,13 +680,10 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.speculative_algorithm is not None
                         ),
                     )
-        logger.info("init_memory_pool: token_to_kv_pool ready")
-        _warmstart_sync("after_token_to_kv_pool")
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            logger.info("init_memory_pool: creating token_to_kv_pool_allocator")
             if _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
@@ -758,8 +740,6 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
-        logger.info("init_memory_pool: token_to_kv_pool_allocator ready")
-        _warmstart_sync("after_token_to_kv_pool_allocator")
 
         logger.info(
             f"Memory pool end. "

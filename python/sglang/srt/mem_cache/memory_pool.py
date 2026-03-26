@@ -25,8 +25,6 @@ KVCache actually holds the physical kv cache.
 """
 
 import abc
-import ctypes
-import ctypes.util
 import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
@@ -73,61 +71,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-_cudart = None
-
-
-def _load_cudart():
-    global _cudart
-    if _cudart is not None:
-        return _cudart
-    candidates = [
-        ctypes.util.find_library("cudart"),
-        "libcudart.so",
-        "libcudart.so.12",
-        "libcudart.so.11.0",
-    ]
-    for name in candidates:
-        if not name:
-            continue
-        try:
-            lib = ctypes.CDLL(name)
-            lib.cudaGetLastError.restype = ctypes.c_int
-            lib.cudaPeekAtLastError.restype = ctypes.c_int
-            lib.cudaGetErrorString.restype = ctypes.c_char_p
-            _cudart = lib
-            return _cudart
-        except OSError:
-            continue
-    return None
-
-
-def _warmstart_log_cuda_error_state(stage: str, clear: bool = False):
-    if not torch.cuda.is_available():
-        return
-    lib = _load_cudart()
-    if lib is None:
-        logger.info("memory_pool: %s cudart unavailable", stage)
-        return
-    err = lib.cudaGetLastError() if clear else lib.cudaPeekAtLastError()
-    err_str = lib.cudaGetErrorString(err)
-    if isinstance(err_str, bytes):
-        err_str = err_str.decode("utf-8", errors="replace")
-    logger.info(
-        "memory_pool: %s cuda_%s_last_error=%s (%s)",
-        stage,
-        "get" if clear else "peek",
-        err,
-        err_str,
-    )
-
-
-def _warmstart_sync_if_cuda(device: str, stage: str):
-    if device == "cuda":
-        logger.info("memory_pool: sync begin %s", stage)
-        torch.cuda.synchronize()
-        logger.info("memory_pool: sync end %s", stage)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -197,24 +140,11 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        _warmstart_log_cuda_error_state("before_req_to_token_alloc_peek")
-        _warmstart_log_cuda_error_state("before_req_to_token_alloc_clear", clear=True)
-        _warmstart_log_cuda_error_state("after_req_to_token_alloc_clear_peek")
-        logger.info(
-            "ReqToTokenPool: allocating req_to_token size=%s max_context_len=%s device=%s",
-            size,
-            max_context_len,
-            device,
-        )
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-        _warmstart_log_cuda_error_state("after_req_to_token_alloc_peek")
-        _warmstart_sync_if_cuda(device, "after_req_to_token_alloc")
-        logger.info("ReqToTokenPool: allocated req_to_token")
         self.free_slots = list(range(size))
-        logger.info("ReqToTokenPool: initialized free_slots")
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -302,13 +232,8 @@ class MambaPool:
         self.device = device
 
         # for disagg with nvlink
-        logger.info("MambaPool: initializing custom mem pool device=%s", self.device)
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
-        )
-        logger.info(
-            "MambaPool: custom mem pool enabled=%s",
-            self.enable_custom_mem_pool,
         )
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
@@ -316,7 +241,6 @@ class MambaPool:
             if self.enable_custom_mem_pool
             else nullcontext()
         ):
-            logger.info("MambaPool: allocating conv_state")
             conv_state = [
                 torch.zeros(
                     size=(num_mamba_layers, size + 1) + conv_shape,
@@ -325,8 +249,6 @@ class MambaPool:
                 )
                 for conv_shape in conv_state_shape
             ]
-            _warmstart_sync_if_cuda(device, "after_mamba_conv_state_alloc")
-            logger.info("MambaPool: allocated conv_state")
 
             if _is_cpu and _cpu_has_amx_support:
                 from sglang.srt.layers.amx_utils import _init_amx_conv_state
@@ -334,18 +256,14 @@ class MambaPool:
                 # CPU uses a different layout of conv_state for kernel optimization
                 conv_state = _init_amx_conv_state(conv_state)
 
-            logger.info("MambaPool: allocating temporal_state")
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
                 device=device,
             )
-            _warmstart_sync_if_cuda(device, "after_mamba_temporal_state_alloc")
-            logger.info("MambaPool: allocated temporal_state")
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                logger.info("MambaPool: allocating intermediate_ssm_state_cache")
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
@@ -358,11 +276,8 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                _warmstart_sync_if_cuda("cuda", "after_intermediate_ssm_state_cache_alloc")
-                logger.info("MambaPool: allocated intermediate_ssm_state_cache")
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-                logger.info("MambaPool: allocating intermediate_conv_window_cache")
                 intermediate_conv_window_cache = [
                     torch.zeros(
                         size=(
@@ -377,8 +292,6 @@ class MambaPool:
                     )
                     for conv_shape in conv_state_shape
                 ]
-                _warmstart_sync_if_cuda("cuda", "after_intermediate_conv_window_cache_alloc")
-                logger.info("MambaPool: allocated intermediate_conv_window_cache")
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -401,16 +314,12 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.free_slots = torch.arange(
+                1, self.size + 1, dtype=torch.int64, device=self.device
+            )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
-
-        # Keep bookkeeping slots out of the memory-saver region for debugging.
-        logger.info("MambaPool: allocating free_slots")
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
-        )
-        _warmstart_sync_if_cuda(self.device, "after_mamba_free_slots_alloc")
-        logger.info("MambaPool: allocated free_slots")
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -535,20 +444,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
     ):
-        logger.info("HybridReqToTokenPool: initializing base req_to_token pool")
         super().__init__(
             size=size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        logger.info("HybridReqToTokenPool: initialized base req_to_token pool")
         self.mamba_ping_pong_track_buffer_size = (
             2 if speculative_num_draft_tokens is None else 1
         )
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        logger.info("HybridReqToTokenPool: initializing mamba pool")
         self._init_mamba_pool(
             size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -557,7 +463,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        logger.info("HybridReqToTokenPool: initialized mamba pool")
 
     def _init_mamba_pool(
         self,
@@ -568,7 +473,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
     ):
-        logger.info("HybridReqToTokenPool: creating MambaPool")
         self.mamba_pool = MambaPool(
             size=size,
             spec_state_size=mamba_spec_state_size,
@@ -577,33 +481,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        logger.info("HybridReqToTokenPool: created MambaPool")
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
 
         self.device = device
-        logger.info("HybridReqToTokenPool: allocating req_index_to_mamba_index_mapping")
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             size, dtype=torch.int32, device=self.device
         )
-        _warmstart_sync_if_cuda(self.device, "after_req_index_to_mamba_index_mapping_alloc")
-        logger.info("HybridReqToTokenPool: allocated req_index_to_mamba_index_mapping")
         if enable_mamba_extra_buffer:
-            logger.info(
-                "HybridReqToTokenPool: allocating req_index_to_mamba_ping_pong_track_buffer_mapping"
-            )
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (size, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
-            )
-            _warmstart_sync_if_cuda(
-                self.device,
-                "after_req_index_to_mamba_ping_pong_track_buffer_mapping_alloc",
-            )
-            logger.info(
-                "HybridReqToTokenPool: allocated req_index_to_mamba_ping_pong_track_buffer_mapping"
             )
 
     # For chunk prefill req, we do not need to allocate mamba cache,
