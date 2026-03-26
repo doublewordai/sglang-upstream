@@ -470,6 +470,67 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.format_ue8m0 = True
         layer.input_scale = None
 
+    def prepare_weights_for_loading(self, layer: Module) -> None:
+        """Reset parameters expanded by process_weights_after_loading to on-disk shapes.
+
+        Called before model.load_weights() on reload so that weight loaders see
+        compact shapes matching disk data. process_weights_after_loading will
+        re-expand after loading.
+
+        Saves references to the current (expanded) tensors so that
+        finalize_weights_after_loading can copy new data back into the original
+        GPU storage, preserving addresses for CUDA graph compatibility.
+
+        No-op on first load (format_ue8m0 not yet set).
+        """
+        if not self.block_quant:
+            return
+        if not hasattr(layer, "weight_scale_inv"):
+            return
+        if not getattr(layer.weight_scale_inv, "format_ue8m0", False):
+            return  # first load or already compact — nothing to do
+
+        import math
+
+        block_n, block_k = self.quant_config.weight_block_size
+        n, k = layer.weight.data.shape[-2], layer.weight.data.shape[-1]
+        compact_shape = (math.ceil(n / block_n), math.ceil(k / block_k))
+
+        # Save original expanded tensors for CUDA graph address preservation
+        layer._reload_orig_scale = layer.weight_scale_inv.data
+        layer._reload_orig_weight = layer.weight.data
+
+        layer.weight_scale_inv.data = torch.empty(
+            compact_shape,
+            dtype=torch.float32,
+            device=layer.weight_scale_inv.data.device,
+        )
+        layer.weight_scale_inv.format_ue8m0 = False
+
+    def finalize_weights_after_loading(self, layer: Module) -> None:
+        """Copy post-processed data back into original tensor storage.
+
+        After process_weights_after_loading creates new tensors at new GPU
+        addresses, this copies the data into the original storage and swaps
+        .data back, so CUDA graphs that captured the original addresses
+        remain valid.
+        """
+        if hasattr(layer, "_reload_orig_scale"):
+            old = layer._reload_orig_scale
+            new = layer.weight_scale_inv.data
+            if old.shape == new.shape and old.dtype == new.dtype:
+                old.copy_(new)
+                layer.weight_scale_inv.data = old
+            del layer._reload_orig_scale
+
+        if hasattr(layer, "_reload_orig_weight"):
+            old = layer._reload_orig_weight
+            new = layer.weight.data
+            if old.shape == new.shape and old.dtype == new.dtype:
+                old.copy_(new)
+                layer.weight.data = old
+            del layer._reload_orig_weight
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
