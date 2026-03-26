@@ -1153,6 +1153,54 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.post("/warmstart/teardown_tp_comms")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def warmstart_teardown_tp_comms(request: Request):
+    try:
+        await _global_state.tokenizer_manager.collective_rpc(
+            "warmstart_teardown_tp_comms"
+        )
+        return ORJSONResponse({"success": True}, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/warmstart/reinit_tp_comms")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def warmstart_reinit_tp_comms(request: Request):
+    try:
+        await _global_state.tokenizer_manager.collective_rpc(
+            "warmstart_reinit_tp_comms"
+        )
+        return ORJSONResponse({"success": True}, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/warmstart/rebuild_runtime_pools")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def warmstart_rebuild_runtime_pools(request: Request):
+    try:
+        await _global_state.tokenizer_manager.collective_rpc(
+            "warmstart_rebuild_runtime_pools"
+        )
+        return ORJSONResponse({"success": True}, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/warmstart/rebuild_runtime_pools_skip_flush")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def warmstart_rebuild_runtime_pools_skip_flush(request: Request):
+    try:
+        await _global_state.tokenizer_manager.collective_rpc(
+            "warmstart_rebuild_runtime_pools_skip_flush"
+        )
+        return ORJSONResponse({"success": True}, status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.post("/weights_checker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(obj: CheckWeightsReqInput, request: Request):

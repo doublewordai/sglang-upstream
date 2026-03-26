@@ -386,6 +386,21 @@ class PyNcclCommunicator:
     def group_end(self):
         self.nccl.ncclGroupEnd()
 
+    def close(self):
+        comm = getattr(self, "comm", None)
+        if comm is None:
+            return
+
+        stream = getattr(self, "stream", None)
+        if stream is not None:
+            stream.synchronize()
+
+        self.nccl.ncclCommDestroy(comm)
+        self.comm = None
+        self.stream = None
+        self.available = False
+        self.disabled = True
+
     @contextmanager
     def change_state(
         self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None

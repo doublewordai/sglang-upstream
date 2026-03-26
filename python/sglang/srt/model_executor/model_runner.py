@@ -446,6 +446,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
+        self._warmstart_init_memory_pool_budget = min_per_gpu_memory
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
@@ -627,6 +628,80 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def _recompute_runtime_pool_limits(self):
+        self.max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if self.server_args.max_running_requests is None
+                else self.server_args.max_running_requests // (self.dp_size)
+            ),
+            self.req_to_token_pool.size,
+        )
+
+    def warmstart_rebuild_runtime_pools(self):
+        total_gpu_memory = getattr(
+            self, "_warmstart_init_memory_pool_budget", None
+        )
+        if total_gpu_memory is None:
+            total_gpu_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_world_group().world_size > 1,
+                cpu_group=get_world_group().cpu_group,
+            )
+
+        logger.info(
+            "warmstart_rebuild_runtime_pools begin. total_gpu_memory=%.2f GB",
+            total_gpu_memory,
+        )
+
+        def _warmstart_sync(stage: str):
+            if self.device == "cuda":
+                logger.info("warmstart_rebuild_runtime_pools: sync begin %s", stage)
+                torch.cuda.synchronize()
+                logger.info("warmstart_rebuild_runtime_pools: sync end %s", stage)
+
+        self.req_to_token_pool = None
+        self.token_to_kv_pool = None
+        self.token_to_kv_pool_allocator = None
+        self.attn_backend = None
+        self.decode_attn_backend = None
+        self.decode_attn_backend_group = []
+        self.graph_runner = None
+        self.piecewise_cuda_graph_runner = None
+        logger.info("warmstart_rebuild_runtime_pools: cleared runtime references")
+        _warmstart_sync("after_clear_runtime_refs")
+
+        gc.collect()
+        logger.info("warmstart_rebuild_runtime_pools: gc complete")
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+            logger.info("warmstart_rebuild_runtime_pools: empty_cache complete")
+        _warmstart_sync("after_empty_cache")
+
+        logger.info("warmstart_rebuild_runtime_pools: calling init_memory_pool")
+        self.init_memory_pool(total_gpu_memory)
+        logger.info("warmstart_rebuild_runtime_pools: init_memory_pool returned")
+        _warmstart_sync("after_init_memory_pool")
+
+        logger.info("warmstart_rebuild_runtime_pools: recomputing runtime pool limits")
+        self._recompute_runtime_pool_limits()
+        logger.info(
+            "warmstart_rebuild_runtime_pools: recompute_runtime_pool_limits returned"
+        )
+        _warmstart_sync("after_recompute_runtime_pool_limits")
+
+        logger.info("warmstart_rebuild_runtime_pools: calling init_attention_backend")
+        self.init_attention_backend()
+        logger.info("warmstart_rebuild_runtime_pools: init_attention_backend returned")
+        _warmstart_sync("after_init_attention_backend")
+
+        logger.info(
+            "warmstart_rebuild_runtime_pools end. max_total_num_tokens=%s max_running_requests=%s",
+            self.max_total_num_tokens,
+            self.max_running_requests,
+        )
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(

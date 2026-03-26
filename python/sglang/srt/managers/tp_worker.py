@@ -90,6 +90,19 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def refresh_runtime_pool_info(self):
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        self.max_running_requests = self.model_runner.max_running_requests
+        assert self.max_running_requests > 0, "max_running_request is zero"
+        self.max_req_len = min(
+            self.model_config.context_len - 1,
+            self.model_runner.max_token_pool_size - 1,
+        )
+        self.max_req_input_len = self.max_req_len - 5
+        assert (
+            self.max_req_len > 0 and self.max_req_input_len > 0
+        ), "Memory pool size is too small"
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path,
