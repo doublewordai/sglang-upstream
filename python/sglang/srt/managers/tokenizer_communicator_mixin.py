@@ -166,6 +166,30 @@ class _Communicator(Generic[T]):
 class TokenizerCommunicatorMixin:
     """Mixin class for TokenizerManager to handle communication with the scheduler."""
 
+    def _warmstart_shutdown_local_mm_executor(self: TokenizerManager):
+        mm_processor = getattr(self, "mm_processor", None)
+        if mm_processor is None:
+            return
+
+        shutdown = getattr(mm_processor, "warmstart_shutdown_cpu_executor", None)
+        if shutdown is None:
+            return
+
+        logger.info("warmstart tokenizer shutting down local multimodal cpu executor")
+        shutdown()
+
+    def _warmstart_recreate_local_mm_executor(self: TokenizerManager):
+        mm_processor = getattr(self, "mm_processor", None)
+        if mm_processor is None:
+            return
+
+        recreate = getattr(mm_processor, "warmstart_recreate_cpu_executor", None)
+        if recreate is None:
+            return
+
+        logger.info("warmstart tokenizer recreating local multimodal cpu executor")
+        recreate()
+
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
@@ -837,6 +861,7 @@ class TokenizerCommunicatorMixin:
     ):
         self.auto_create_handle_loop()
         await self.release_memory_occupation_communicator(obj)
+        self._warmstart_shutdown_local_mm_executor()
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -845,6 +870,7 @@ class TokenizerCommunicatorMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+        self._warmstart_recreate_local_mm_executor()
 
     async def collective_rpc(
         self: TokenizerManager,

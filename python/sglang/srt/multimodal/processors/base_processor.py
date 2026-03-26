@@ -188,10 +188,7 @@ class BaseMultimodalProcessor(ABC):
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
         )
-        self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
+        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -242,6 +239,27 @@ class BaseMultimodalProcessor(ABC):
                 MM_FEATURE_CACHE_SIZE,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
+
+    def _create_cpu_executor(self):
+        return concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context("fork"),
+            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )
+
+    def warmstart_shutdown_cpu_executor(self):
+        if self.cpu_executor is None:
+            return
+
+        logger.info("warmstart shutting down multimodal cpu executor")
+        self.cpu_executor.shutdown(wait=True, cancel_futures=True)
+        self.cpu_executor = None
+
+    def warmstart_recreate_cpu_executor(self):
+        if self.cpu_executor is not None:
+            return
+
+        logger.info("warmstart recreating multimodal cpu executor")
+        self.cpu_executor = self._create_cpu_executor()
 
     @property
     def spatial_merge_size(self):
