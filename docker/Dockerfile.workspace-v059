@@ -17,9 +17,9 @@ FROM ${BASE_IMAGE} AS final
 
 WORKDIR /workspace
 
-# Overlay only the local Python package source for SGLang.
-COPY sglang/python/sglang /usr/local/lib/python3.12/dist-packages/sglang
-COPY sglang/python/sglang /sgl-workspace/sglang/python/sglang
+# Overlay only the local Python package source for SGLang from this stacked worktree.
+COPY sglang-tp-memory-saver/python/sglang /usr/local/lib/python3.12/dist-packages/sglang
+COPY sglang-tp-memory-saver/python/sglang /sgl-workspace/sglang/python/sglang
 
 # Replace the preinstalled torch_memory_saver package with the locally built one.
 COPY --from=torch-memory-saver-build /usr/local/lib/python3.12/dist-packages/torch_memory_saver /usr/local/lib/python3.12/dist-packages/torch_memory_saver
