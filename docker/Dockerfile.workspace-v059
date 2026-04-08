@@ -1,0 +1,32 @@
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.9-cu129-amd64
+
+FROM ${BASE_IMAGE} AS torch-memory-saver-build
+
+WORKDIR /workspace
+
+# Build the local torch_memory_saver package, including its CUDA extensions,
+# against the released SGLang 0.5.9 image environment.
+COPY torch_memory_saver ./torch_memory_saver
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --upgrade pip setuptools wheel ninja \
+    && python3 -m pip install --no-deps /workspace/torch_memory_saver
+
+
+FROM ${BASE_IMAGE} AS final
+
+WORKDIR /workspace
+
+# Overlay only the local Python package source for SGLang.
+COPY sglang/python/sglang /usr/local/lib/python3.12/dist-packages/sglang
+COPY sglang/python/sglang /sgl-workspace/sglang/python/sglang
+
+# Replace the preinstalled torch_memory_saver package with the locally built one.
+COPY --from=torch-memory-saver-build /usr/local/lib/python3.12/dist-packages/torch_memory_saver /usr/local/lib/python3.12/dist-packages/torch_memory_saver
+COPY --from=torch-memory-saver-build /usr/local/lib/python3.12/dist-packages/torch_memory_saver-0.0.9-py3.12.egg-info /usr/local/lib/python3.12/dist-packages/torch_memory_saver-0.0.9-py3.12.egg-info
+COPY --from=torch-memory-saver-build /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
+COPY --from=torch-memory-saver-build /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_torch.abi3.so /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_torch.abi3.so
+
+WORKDIR /sgl-workspace/sglang
+
+CMD ["/bin/bash"]

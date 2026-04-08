@@ -969,9 +969,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+        artifact_backend = None if enable_cpu_backup else os.environ.get(
+            "TMS_SGLANG_WEIGHTS_ARTIFACT_BACKEND", "ram"
+        )
+        artifact_path = (
+            os.environ.get("TMS_SGLANG_WEIGHTS_ARTIFACT_PATH")
+            if artifact_backend == "disk"
+            else None
+        )
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
+            artifact_backend=artifact_backend,
+            artifact_path=artifact_path,
         ):
             self.loader = get_model_loader(
                 load_config=self.load_config,
