@@ -25,6 +25,7 @@ import ctypes
 import logging
 import os
 import platform
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +71,53 @@ def find_nccl_library() -> str:
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
 ncclWindow_t = ctypes.c_void_p
+
+NCCL_SUCCESS = 0
+NCCL_IN_PROGRESS = 7
+NCCL_CONFIG_UNDEF_INT = -(2**31)
+NCCL_CONFIG_VERSION = 2 * 10000 + 27 * 100 + 3
+
+
+class ncclConfig_t(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_size_t),
+        ("magic", ctypes.c_uint),
+        ("version", ctypes.c_uint),
+        ("blocking", ctypes.c_int),
+        ("cgaClusterSize", ctypes.c_int),
+        ("minCTAs", ctypes.c_int),
+        ("maxCTAs", ctypes.c_int),
+        ("netName", ctypes.c_char_p),
+        ("splitShare", ctypes.c_int),
+        ("trafficClass", ctypes.c_int),
+        ("commName", ctypes.c_char_p),
+        ("collnetEnable", ctypes.c_int),
+        ("CTAPolicy", ctypes.c_int),
+        ("shrinkShare", ctypes.c_int),
+        ("nvlsCTAs", ctypes.c_int),
+    ]
+
+
+def nccl_config_default(*, blocking: int = NCCL_CONFIG_UNDEF_INT) -> ncclConfig_t:
+    # This struct layout matches the NCCL 2.27.x ABI used by the checkpoint
+    # experiments; unset fields stay at NCCL's default behavior.
+    return ncclConfig_t(
+        size=ctypes.sizeof(ncclConfig_t),
+        magic=0xCAFEBEEF,
+        version=NCCL_CONFIG_VERSION,
+        blocking=blocking,
+        cgaClusterSize=NCCL_CONFIG_UNDEF_INT,
+        minCTAs=NCCL_CONFIG_UNDEF_INT,
+        maxCTAs=NCCL_CONFIG_UNDEF_INT,
+        netName=None,
+        splitShare=NCCL_CONFIG_UNDEF_INT,
+        trafficClass=NCCL_CONFIG_UNDEF_INT,
+        commName=None,
+        collnetEnable=NCCL_CONFIG_UNDEF_INT,
+        CTAPolicy=NCCL_CONFIG_UNDEF_INT,
+        shrinkShare=NCCL_CONFIG_UNDEF_INT,
+        nvlsCTAs=NCCL_CONFIG_UNDEF_INT,
+    )
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -170,6 +218,23 @@ class NCCLLibrary:
             "ncclCommInitRank",
             ncclResult_t,
             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
+        ),
+        Function(
+            "ncclCommInitRankConfig",
+            ncclResult_t,
+            [
+                ctypes.POINTER(ncclComm_t),
+                ctypes.c_int,
+                ncclUniqueId,
+                ctypes.c_int,
+                ctypes.POINTER(ncclConfig_t),
+            ],
+        ),
+        Function("ncclCommFinalize", ncclResult_t, [ncclComm_t]),
+        Function(
+            "ncclCommGetAsyncError",
+            ncclResult_t,
+            [ncclComm_t, ctypes.POINTER(ncclResult_t)],
         ),
         # ncclResult_t  ncclAllReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
@@ -371,9 +436,29 @@ class NCCLLibrary:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")
 
     def NCCL_CHECK(self, result: ncclResult_t) -> None:
-        if result != 0:
+        if result != NCCL_SUCCESS:
             error_str = self.ncclGetErrorString(result)
             raise RuntimeError(f"NCCL error: {error_str}")
+
+    def _wait_for_async_result(
+        self,
+        comm: ncclComm_t,
+        *,
+        timeout_s: float = 100.0,
+        op_name: str,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            async_err = ncclResult_t(NCCL_IN_PROGRESS)
+            ret = self._funcs["ncclCommGetAsyncError"](comm, ctypes.byref(async_err))
+            if ret != NCCL_SUCCESS:
+                self.NCCL_CHECK(ret)
+            if async_err.value == NCCL_SUCCESS:
+                return
+            if async_err.value != NCCL_IN_PROGRESS:
+                self.NCCL_CHECK(async_err.value)
+            time.sleep(0.01)
+        raise RuntimeError(f"{op_name} timed out")
 
     def ncclGetRawVersion(self) -> int:
         version = ctypes.c_int()
@@ -405,6 +490,34 @@ class NCCLLibrary:
         )
         return comm
 
+    def ncclCommInitRankConfig(
+        self,
+        world_size: int,
+        unique_id: ncclUniqueId,
+        rank: int,
+        config: ncclConfig_t,
+    ) -> ncclComm_t:
+        comm = ncclComm_t()
+        result = self._funcs["ncclCommInitRankConfig"](
+            ctypes.byref(comm),
+            world_size,
+            unique_id,
+            rank,
+            ctypes.byref(config),
+        )
+        if result not in (NCCL_SUCCESS, NCCL_IN_PROGRESS):
+            self.NCCL_CHECK(result)
+        if result == NCCL_IN_PROGRESS:
+            self._wait_for_async_result(comm, op_name="ncclCommInitRankConfig")
+        return comm
+
+    def ncclCommFinalize(self, comm: ncclComm_t) -> None:
+        result = self._funcs["ncclCommFinalize"](comm)
+        if result not in (NCCL_SUCCESS, NCCL_IN_PROGRESS):
+            self.NCCL_CHECK(result)
+        if result == NCCL_IN_PROGRESS:
+            self._wait_for_async_result(comm, op_name="ncclCommFinalize")
+
     def ncclAllReduce(
         self,
         sendbuff: buffer_type,
@@ -420,11 +533,13 @@ class NCCLLibrary:
         # both are aliases of `ctypes.c_int`
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
-        self.NCCL_CHECK(
-            self._funcs["ncclAllReduce"](
-                sendbuff, recvbuff, count, datatype, op, comm, stream
-            )
+        result = self._funcs["ncclAllReduce"](
+            sendbuff, recvbuff, count, datatype, op, comm, stream
         )
+        if result not in (NCCL_SUCCESS, NCCL_IN_PROGRESS):
+            self.NCCL_CHECK(result)
+        if result == NCCL_IN_PROGRESS:
+            self._wait_for_async_result(comm, op_name="ncclAllReduce")
 
     def ncclReduce(
         self,
@@ -560,6 +675,7 @@ __all__ = [
     "ncclRedOpTypeEnum",
     "ncclUniqueId",
     "ncclComm_t",
+    "nccl_config_default",
     "cudaStream_t",
     "buffer_type",
 ]

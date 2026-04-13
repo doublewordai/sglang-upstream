@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     buffer_type,
     cudaStream_t,
     ncclComm_t,
+    nccl_config_default,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
@@ -110,8 +111,9 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
+            config = nccl_config_default(blocking=0)
+            self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
+                self.world_size, self.unique_id, self.rank, config
             )
             self.stream = torch.cuda.Stream()
 
@@ -395,6 +397,7 @@ class PyNcclCommunicator:
         if stream is not None:
             stream.synchronize()
 
+        self.nccl.ncclCommFinalize(comm)
         self.nccl.ncclCommDestroy(comm)
         self.comm = None
         self.stream = None

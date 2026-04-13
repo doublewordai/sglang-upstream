@@ -852,14 +852,13 @@ class TokenizerCommunicatorMixin:
         parameters: Optional[Dict[str, Any]] = None,
     ):
         self.auto_create_handle_loop()
-        await self.send_to_rpc.send_pyobj(
+        results = await self.rpc_communicator(
             RpcReqInput(method=method, parameters=parameters)
         )
-        recv_req = await self.send_to_rpc.recv_pyobj()
-        assert isinstance(recv_req, RpcReqOutput)
-        if not recv_req.success:
-            raise RuntimeError(recv_req.message)
-        return recv_req
+        all_success, all_message = _Communicator.merge_results(results)
+        if not all_success:
+            raise RuntimeError(all_message)
+        return results
 
     async def check_weights(
         self: TokenizerManager,
