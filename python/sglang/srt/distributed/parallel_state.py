@@ -1356,9 +1356,10 @@ class GroupCoordinator:
         if self.device.type != "cpu":
             self.device_module.synchronize()
 
-        if self.pynccl_comm is not None:
-            self.pynccl_comm.close()
-            self.pynccl_comm = None
+        # Skip pynccl_comm — its ncclCommDestroy deadlocks in blocking mode
+        # due to proxy thread mutual wait (see experiment 30). The leaked RM
+        # objects don't prevent CRIU checkpoint once the device_group P2P
+        # state is destroyed below.
         if self.ca_comm is not None:
             self.ca_comm.close()
             self.ca_comm = None
