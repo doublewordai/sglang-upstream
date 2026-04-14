@@ -71,6 +71,8 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RpcReqInput,
+    RpcReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,

@@ -53,6 +53,12 @@ class TorchMemorySaverAdapter(ABC):
     def resume(self, tag: str):
         raise NotImplementedError
 
+    def register_pause_hook(self, tag: str, fn):
+        raise NotImplementedError
+
+    def register_resume_hook(self, tag: str, fn):
+        raise NotImplementedError
+
     @property
     def enabled(self):
         raise NotImplementedError
@@ -78,6 +84,12 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
 
     def resume(self, tag: str):
         return _memory_saver.resume(tag=tag)
+
+    def register_pause_hook(self, tag: str, fn):
+        _memory_saver.register_pause_hook(tag, fn)
+
+    def register_resume_hook(self, tag: str, fn):
+        _memory_saver.register_resume_hook(tag, fn)
 
     @property
     def enabled(self):
@@ -105,6 +117,12 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         pass
 
     def resume(self, tag: str):
+        pass
+
+    def register_pause_hook(self, tag: str, fn):
+        pass
+
+    def register_resume_hook(self, tag: str, fn):
         pass
 
     @property
