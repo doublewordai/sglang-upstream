@@ -71,6 +71,49 @@ ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
 ncclWindow_t = ctypes.c_void_p
 
+NCCL_CONFIG_UNDEF_INT = -(2**31)
+NCCL_CONFIG_VERSION = 2 * 10000 + 27 * 100 + 3
+
+
+class ncclConfig_t(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_size_t),
+        ("magic", ctypes.c_uint),
+        ("version", ctypes.c_uint),
+        ("blocking", ctypes.c_int),
+        ("cgaClusterSize", ctypes.c_int),
+        ("minCTAs", ctypes.c_int),
+        ("maxCTAs", ctypes.c_int),
+        ("netName", ctypes.c_char_p),
+        ("splitShare", ctypes.c_int),
+        ("trafficClass", ctypes.c_int),
+        ("commName", ctypes.c_char_p),
+        ("collnetEnable", ctypes.c_int),
+        ("CTAPolicy", ctypes.c_int),
+        ("shrinkShare", ctypes.c_int),
+        ("nvlsCTAs", ctypes.c_int),
+    ]
+
+
+def nccl_config_default(*, blocking: int = NCCL_CONFIG_UNDEF_INT) -> ncclConfig_t:
+    return ncclConfig_t(
+        size=ctypes.sizeof(ncclConfig_t),
+        magic=0xCAFEBEEF,
+        version=NCCL_CONFIG_VERSION,
+        blocking=blocking,
+        cgaClusterSize=NCCL_CONFIG_UNDEF_INT,
+        minCTAs=NCCL_CONFIG_UNDEF_INT,
+        maxCTAs=NCCL_CONFIG_UNDEF_INT,
+        netName=None,
+        splitShare=NCCL_CONFIG_UNDEF_INT,
+        trafficClass=NCCL_CONFIG_UNDEF_INT,
+        commName=None,
+        collnetEnable=NCCL_CONFIG_UNDEF_INT,
+        CTAPolicy=NCCL_CONFIG_UNDEF_INT,
+        shrinkShare=NCCL_CONFIG_UNDEF_INT,
+        nvlsCTAs=NCCL_CONFIG_UNDEF_INT,
+    )
+
 
 class ncclUniqueId(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
@@ -170,6 +213,22 @@ class NCCLLibrary:
             "ncclCommInitRank",
             ncclResult_t,
             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
+        ),
+        Function(
+            "ncclCommInitRankConfig",
+            ncclResult_t,
+            [
+                ctypes.POINTER(ncclComm_t),
+                ctypes.c_int,
+                ncclUniqueId,
+                ctypes.c_int,
+                ctypes.POINTER(ncclConfig_t),
+            ],
+        ),
+        Function(
+            "ncclCommFinalize",
+            ncclResult_t,
+            [ncclComm_t],
         ),
         # ncclResult_t  ncclAllReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
@@ -404,6 +463,22 @@ class NCCLLibrary:
             )
         )
         return comm
+
+    def ncclCommInitRankConfig(
+        self, world_size: int, unique_id: ncclUniqueId, rank: int,
+        config: ncclConfig_t,
+    ) -> ncclComm_t:
+        comm = ncclComm_t()
+        self.NCCL_CHECK(
+            self._funcs["ncclCommInitRankConfig"](
+                ctypes.byref(comm), world_size, unique_id, rank,
+                ctypes.byref(config),
+            )
+        )
+        return comm
+
+    def ncclCommFinalize(self, comm: ncclComm_t) -> None:
+        self.NCCL_CHECK(self._funcs["ncclCommFinalize"](comm))
 
     def ncclAllReduce(
         self,
