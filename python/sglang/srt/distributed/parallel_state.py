@@ -258,6 +258,7 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+        self._torch_distributed_backend = torch_distributed_backend
 
         if is_cuda_alike():
             device_id = (
@@ -1351,17 +1352,83 @@ class GroupCoordinator:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def teardown_runtime_comms(self):
+        if self.device.type != "cpu":
+            self.device_module.synchronize()
+
+        if self.pynccl_comm is not None:
+            self.pynccl_comm.close()
+            self.pynccl_comm = None
+        if self.ca_comm is not None:
+            self.ca_comm.close()
+            self.ca_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm.close()
+            self.qr_comm = None
+        if self.device_group is not None:
+            torch.distributed.destroy_process_group(self.device_group)
+            self.device_group = None
+
+    def reinit_runtime_comms(self, reinit_pynccl: bool = True):
+        if self.world_size <= 1 or self.cpu_group is None:
+            return
+
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            dispatch_custom_allreduce,
+        )
+        from sglang.srt.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+
+        if is_hip():
+            from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+                QuickAllReduce,
+                qr_rocm_arch_available,
+            )
+
+        if self.device_group is None:
+            pg_options = get_torch_distributed_pg_options(self.unique_name)
+            self.device_group = torch.distributed.new_group(
+                self.ranks,
+                backend=self._torch_distributed_backend,
+                pg_options=pg_options,
+            )
+
+        if reinit_pynccl and self.use_pynccl and self.pynccl_comm is None:
+            self.pynccl_comm = PyNcclCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+
+        if self.use_custom_allreduce and self.ca_comm is None:
+            try:
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Warmstart reinit of custom allreduce failed with {e}."
+                )
+
+            if is_hip() and self.qr_comm is None:
+                try:
+                    if qr_rocm_arch_available():
+                        self.qr_comm = QuickAllReduce(
+                            group=self.cpu_group, device=self.device
+                        )
+                except Exception as e:
+                    logger.warning(f"Warmstart reinit of QuickAllReduce failed: {e}")
+
     def destroy(self):
+        self.teardown_runtime_comms()
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
-        if self.pynccl_comm is not None:
-            self.pynccl_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 

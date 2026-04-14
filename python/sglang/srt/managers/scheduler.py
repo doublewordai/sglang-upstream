@@ -3259,7 +3259,7 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier()
+        self.tp_group.barrier()
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
