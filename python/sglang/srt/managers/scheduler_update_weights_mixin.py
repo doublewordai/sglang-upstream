@@ -43,24 +43,6 @@ logger = logging.getLogger(__name__)
 
 class SchedulerUpdateWeightsMixin:
 
-    def warmstart_teardown_tp_comms(self: Scheduler):
-        assert (
-            self.is_fully_idle()
-        ), "warmstart_teardown_tp_comms should be called only when server is idle."
-
-        if self.tp_group.world_size > 1:
-            self.tp_group.barrier()
-        self.tp_group.teardown_runtime_comms()
-        if self.tp_group.world_size > 1:
-            self.tp_group.barrier()
-
-    def warmstart_reinit_tp_comms(self: Scheduler):
-        if self.tp_group.world_size > 1:
-            self.tp_group.barrier()
-        self.tp_group.reinit_runtime_comms(reinit_pynccl=False)
-        if self.tp_group.world_size > 1:
-            self.tp_group.barrier()
-
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
     ):

@@ -1014,6 +1014,14 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+        if self.tp_group.world_size > 1 and self.memory_saver_adapter.enabled:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+            self.memory_saver_adapter.register_pause_hook(
+                GPU_MEMORY_TYPE_WEIGHTS, self.tp_group.teardown_runtime_comms
+            )
+            self.memory_saver_adapter.register_resume_hook(
+                GPU_MEMORY_TYPE_WEIGHTS, self.tp_group.reinit_runtime_comms
+            )
         self.offload_tags = set()
 
         # Init recv skipper and input blocker

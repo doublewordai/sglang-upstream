@@ -991,21 +991,6 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
-    async def collective_rpc(
-        self: TokenizerManager,
-        method: str,
-        parameters: Optional[Dict[str, Any]] = None,
-    ):
-        self.auto_create_handle_loop()
-        await self.send_to_rpc.send_pyobj(
-            RpcReqInput(method=method, parameters=parameters)
-        )
-        recv_req = await self.send_to_rpc.recv_pyobj()
-        assert isinstance(recv_req, RpcReqOutput)
-        if not recv_req.success:
-            raise RuntimeError(recv_req.message)
-        return recv_req
-
     async def check_weights(
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
