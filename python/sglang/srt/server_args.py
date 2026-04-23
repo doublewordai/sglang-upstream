@@ -506,6 +506,7 @@ class ServerArgs:
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
+    ssd_orchestrator_addr: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -3345,7 +3346,17 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "SSD"):
+            if self.speculative_algorithm == "SSD":
+                if self.ssd_orchestrator_addr is None:
+                    raise ValueError(
+                        "SSD speculative decoding requires --ssd-orchestrator-addr."
+                    )
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled when using SSD speculative decoding (spec v2 is not supported yet)."
+                )
+
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
@@ -3374,11 +3385,12 @@ class ServerArgs:
                         "Spec v2 currently only supports topk = 1 for speculative decoding."
                     )
             else:
-                self.disable_overlap_schedule = True
-                logger.warning(
-                    "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
-                )
+                if self.speculative_algorithm != "SSD":
+                    self.disable_overlap_schedule = True
+                    logger.warning(
+                        "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "
+                        "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
+                    )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
@@ -5213,8 +5225,14 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "SSD", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
+        )
+        parser.add_argument(
+            "--ssd-orchestrator-addr",
+            type=str,
+            default=ServerArgs.ssd_orchestrator_addr,
+            help="SSD only. gRPC address of the remote SSD orchestrator.",
         )
         parser.add_argument(
             "--speculative-draft-model-path",

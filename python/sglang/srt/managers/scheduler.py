@@ -797,7 +797,7 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
-            is_eagle=self.spec_algorithm.is_eagle(),
+            is_eagle=self.spec_algorithm.is_eagle() or self.spec_algorithm.is_ssd(),
             tp_cache_group=(
                 self.attn_tp_cpu_group
                 if self.server_args.enable_dp_attention
@@ -1083,11 +1083,13 @@ class Scheduler(
                 hidden_size=(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_ssd()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_ssd()
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
@@ -1136,12 +1138,14 @@ class Scheduler(
                 hidden_size=(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_ssd()
                     or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_ssd()
                     or self.spec_algorithm.is_standalone()
                     else torch.float32
                 ),

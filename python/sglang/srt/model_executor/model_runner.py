@@ -2383,7 +2383,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_ssd()
+                or self.spec_algorithm.is_standalone()
+            ):
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:

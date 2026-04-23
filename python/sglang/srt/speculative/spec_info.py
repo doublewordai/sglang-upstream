@@ -18,6 +18,7 @@ class SpeculativeAlgorithm(Enum):
     DFLASH = auto()
     EAGLE = auto()
     EAGLE3 = auto()
+    SSD = auto()
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
@@ -40,6 +41,9 @@ class SpeculativeAlgorithm(Enum):
     def is_eagle(self) -> bool:
         # NOTE: EAGLE3 is a variant of EAGLE
         return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
+
+    def is_ssd(self) -> bool:
+        return self == SpeculativeAlgorithm.SSD
 
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
@@ -73,6 +77,14 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_ssd():
+            if enable_overlap:
+                raise ValueError("SSD does not support overlap scheduling (spec v2).")
+
+            from sglang.srt.speculative.ssd_worker import SSDWorker
+
+            return SSDWorker
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker

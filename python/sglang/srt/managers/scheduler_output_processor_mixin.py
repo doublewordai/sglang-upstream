@@ -558,6 +558,12 @@ class SchedulerOutputProcessorMixin:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            if (
+                self.draft_worker is not None
+                and hasattr(self.draft_worker, "finish_request")
+                and self.spec_algorithm.is_ssd()
+            ):
+                self.draft_worker.finish_request(req.rid)
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
