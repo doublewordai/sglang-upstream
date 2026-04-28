@@ -32,6 +32,41 @@ if not is_cpu():
 logger = logging.getLogger(__name__)
 
 
+def _mamba_indices_to_list(indices: Optional[torch.Tensor]) -> Optional[list[int]]:
+    if indices is None:
+        return None
+    return [int(x) for x in indices.detach().cpu().reshape(-1).tolist()]
+
+
+def _summarize_mamba_rows(
+    state_tensor: torch.Tensor,
+    indices: Optional[torch.Tensor],
+    *,
+    max_rows: int = 4,
+) -> list[dict[str, object]]:
+    if indices is None:
+        return []
+
+    flat_indices = [int(x) for x in indices.detach().cpu().reshape(-1).tolist()]
+    summaries: list[dict[str, object]] = []
+    for idx in flat_indices[:max_rows]:
+        if idx < 0:
+            summaries.append({"idx": idx, "valid": False})
+            continue
+        row = state_tensor[idx].detach().float().reshape(-1)
+        head = [round(float(x), 6) for x in row[:4].cpu().tolist()]
+        summaries.append(
+            {
+                "idx": idx,
+                "valid": True,
+                "sum": round(float(row.sum().item()), 6),
+                "absmax": round(float(row.abs().max().item()), 6),
+                "head": head,
+            }
+        )
+    return summaries
+
+
 # Kernel to track mamba states if needed based on track mask
 @triton.jit
 def track_mamba_state_if_needed_kernel(
@@ -966,6 +1001,16 @@ class HybridLinearAttnBackend(AttentionBackend):
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "Mamba trace verify-scatter cache_indices=%s src_steps=%s "
+                "track_cache_indices=%s track_src_steps=%s",
+                _mamba_indices_to_list(state_indices_tensor),
+                _mamba_indices_to_list(accepted_steps),
+                _mamba_indices_to_list(mamba_track_indices),
+                _mamba_indices_to_list(mamba_steps_to_track),
+            )
 
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls

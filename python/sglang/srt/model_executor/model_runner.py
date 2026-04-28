@@ -264,6 +264,58 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+def _tensor_to_int_list(
+    values: Optional[Union[torch.Tensor, List[int], Tuple[int, ...]]],
+) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if torch.is_tensor(values):
+        return [int(x) for x in values.detach().cpu().reshape(-1).tolist()]
+    return [int(x) for x in values]
+
+
+def _group_values(values: List[int], group_sizes: List[int]) -> List[List[int]]:
+    grouped: List[List[int]] = []
+    offset = 0
+    for size in group_sizes:
+        grouped.append(values[offset : offset + size])
+        offset += size
+    return grouped
+
+
+def _group_forward_values(
+    forward_batch: ForwardBatch,
+    values: Optional[Union[torch.Tensor, List[int], Tuple[int, ...]]],
+) -> Optional[Union[List[int], List[List[int]]]]:
+    flat_values = _tensor_to_int_list(values)
+    if flat_values is None:
+        return None
+
+    if forward_batch.forward_mode.is_target_verify():
+        draft_token_num = getattr(forward_batch.spec_info, "draft_token_num", 0)
+        if draft_token_num > 0 and len(flat_values) == forward_batch.batch_size * draft_token_num:
+            return _group_values(flat_values, [draft_token_num] * forward_batch.batch_size)
+
+    if forward_batch.forward_mode.is_decode() and len(flat_values) == forward_batch.batch_size:
+        return [[token] for token in flat_values]
+
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and extend_seq_lens_cpu is not None
+        and extend_prefix_lens_cpu is not None
+    ):
+        group_sizes = [
+            int(seq_len) - int(prefix_len)
+            for seq_len, prefix_len in zip(extend_seq_lens_cpu, extend_prefix_lens_cpu)
+        ]
+        if sum(group_sizes) == len(flat_values):
+            return _group_values(flat_values, group_sizes)
+
+    return flat_values
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -2783,6 +2835,72 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def _get_forward_trace_path(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[str]:
+        if self.spec_algorithm.is_ssd():
+            if forward_batch.forward_mode.is_target_verify():
+                return "ssd-target-verify"
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                return "ssd-target-extend"
+            return None
+
+        if self.spec_algorithm.is_eagle():
+            if forward_batch.forward_mode.is_target_verify():
+                return "eagle-target-verify"
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                return "eagle-target-extend"
+            return None
+
+        if self.spec_algorithm.is_speculative():
+            return None
+
+        if forward_batch.forward_mode.is_decode():
+            return "non-spec-decode"
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            return "non-spec-extend"
+        return None
+
+    def _log_forward_trace_input(self, forward_batch: ForwardBatch) -> None:
+        path = self._get_forward_trace_path(forward_batch)
+        if path is None or not logger.isEnabledFor(logging.INFO):
+            return
+
+        kv_cache_seq_lens = (
+            _group_forward_values(forward_batch, forward_batch.positions + 1)
+            if forward_batch.positions is not None
+            else None
+        )
+        logger.info(
+            "Forward trace path=%s mode=%s rids=%s input_tokens=%s kv_cache_seq_lens=%s",
+            path,
+            forward_batch.forward_mode.name,
+            forward_batch.rids,
+            _group_forward_values(forward_batch, forward_batch.input_ids),
+            kv_cache_seq_lens,
+        )
+
+    def _log_forward_trace_output(
+        self,
+        forward_batch: ForwardBatch,
+        next_token_ids: Optional[torch.Tensor],
+    ) -> None:
+        path = self._get_forward_trace_path(forward_batch)
+        if path is None or not logger.isEnabledFor(logging.INFO):
+            return
+
+        output_tokens = _tensor_to_int_list(next_token_ids)
+        if output_tokens is None:
+            return
+
+        logger.info(
+            "Forward trace path=%s mode=%s rids=%s output_tokens=%s",
+            path,
+            forward_batch.forward_mode.name,
+            forward_batch.rids,
+            output_tokens,
+        )
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -2906,6 +3024,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        self._log_forward_trace_input(forward_batch)
 
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
@@ -3108,6 +3227,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ),
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
+        self._log_forward_trace_output(forward_batch, next_token_ids)
         return next_token_ids
 
     def compute_logprobs_only(

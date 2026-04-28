@@ -84,6 +84,25 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def _group_verified_tokens(
+    verified_id: torch.Tensor, accept_lengths: List[int]
+) -> List[List[int]]:
+    flat_tokens = [int(x) for x in verified_id.detach().cpu().reshape(-1).tolist()]
+    grouped: List[List[int]] = []
+    offset = 0
+    for accepted in accept_lengths:
+        width = int(accepted) + 1
+        grouped.append(flat_tokens[offset : offset + width])
+        offset += width
+    return grouped
+
+
+def _tensor_to_int_list(values: Optional[torch.Tensor]) -> Optional[List[int]]:
+    if values is None:
+        return None
+    return [int(x) for x in values.detach().cpu().reshape(-1).tolist()]
+
+
 class EAGLEWorker(TpModelWorker):
 
     def __init__(
@@ -507,6 +526,21 @@ class EAGLEWorker(TpModelWorker):
             controller = getattr(self, "adaptive_controller", None)
             if controller is not None:
                 controller.on_verify_complete(verify_output.accept_length_per_req_cpu)
+
+            verified_tokens = _group_verified_tokens(
+                verify_output.verified_id,
+                verify_output.accept_length_per_req_cpu,
+            )
+            logger.info(
+                "Forward trace path=eagle-target-verify mode=%s rids=%s output_tokens=%s "
+                "verified_tokens=%s kv_cache_seq_lens_after=%s accept_lengths=%s",
+                batch.forward_mode.name,
+                [req.rid for req in batch.reqs],
+                verified_tokens,
+                verified_tokens,
+                [int(x) for x in batch.seq_lens_cpu.tolist()],
+                verify_output.accept_length_per_req_cpu,
+            )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -1046,6 +1080,15 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             mamba_steps_to_track = None
+
+        logger.info(
+            "Mamba trace path=eagle-target-verify rids=%s cache_src_steps=%s "
+            "track_cache_indices=%s track_src_steps=%s",
+            [req.rid for req in batch.reqs],
+            _tensor_to_int_list(accepted_steps),
+            _tensor_to_int_list(batch.mamba_track_indices),
+            _tensor_to_int_list(mamba_steps_to_track),
+        )
 
         self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
             accepted_steps=accepted_steps,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 import numpy as np
 
@@ -38,6 +38,32 @@ def _to_square_mask(values: Any) -> List[List[bool]]:
     if mask.ndim != 2:
         return []
     return mask.astype(bool).tolist()
+
+
+def extract_ssd_bonus_tokens(
+    verified_id: Any, accept_lengths: Sequence[int]
+) -> List[int]:
+    verified_tokens = _to_flat_list(verified_id)
+    bonus_tokens: List[int] = []
+    token_offset = 0
+
+    for accepted in accept_lengths:
+        accepted = int(accepted)
+        bonus_index = token_offset + accepted
+        if bonus_index >= len(verified_tokens):
+            raise ValueError(
+                "SSD verify output is shorter than expected for the provided "
+                "accept lengths."
+            )
+        bonus_tokens.append(int(verified_tokens[bonus_index]))
+        token_offset += accepted + 1
+
+    if token_offset != len(verified_tokens):
+        raise ValueError(
+            "SSD verify output length does not match the provided accept lengths."
+        )
+
+    return bonus_tokens
 
 
 def build_ssd_verify_payload(
