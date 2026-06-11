@@ -31,7 +31,10 @@ class SpecTelemetry:
     def __init__(self, out_dir: str):
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"spec_telemetry-{os.getpid()}.jsonl")
-        self._file = open(path, "a")
+        # Line-buffered: the server is torn down with signals, so records
+        # must reach the OS as they are written or partial runs leave
+        # nothing on disk.
+        self._file = open(path, "a", buffering=1)
         self._step_ct = 0
         self._unflushed_ct = 0
 
