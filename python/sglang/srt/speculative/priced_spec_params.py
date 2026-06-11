@@ -81,6 +81,10 @@ class PricedPolicyConfig:
     ema_alpha: float = 0.2
     warmup_rounds: int = 20
     max_tracked_requests: int = 8192
+    # Minimum decode rounds between runtime-state swaps. Swaps are not free
+    # and batch size flickers at low load; without a cooldown the policy
+    # thrashes between the per-B optima every round.
+    switch_cooldown_rounds: int = 16
 
 
 def load_priced_config(cfg: dict) -> PricedPolicyConfig:
@@ -132,6 +136,13 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
             f"priced policy: warmup_rounds must be an int >= 0, got {warmup_rounds!r}"
         )
     out.warmup_rounds = warmup_rounds
+
+    cooldown = cfg.get("switch_cooldown_rounds", out.switch_cooldown_rounds)
+    if not isinstance(cooldown, int) or cooldown < 0:
+        raise ValueError(
+            f"priced policy: switch_cooldown_rounds must be an int >= 0, got {cooldown!r}"
+        )
+    out.switch_cooldown_rounds = cooldown
 
     max_tracked = cfg.get("max_tracked_requests", out.max_tracked_requests)
     if not isinstance(max_tracked, int) or max_tracked < 1:
@@ -241,6 +252,7 @@ class PricedSpeculativeParams:
         # Decision bookkeeping.
         self._round_ct = 0
         self._switch_ct = 0
+        self._last_switch_round = -(10**9)
         self._last_round_idx: int | None = None
         self._last_round_t: float | None = None
         self._last_round_cost_key: tuple[int, int] | None = None
@@ -359,6 +371,11 @@ class PricedSpeculativeParams:
     # -- Decision internals --
 
     def _maybe_switch(self, batch_size: int, rids: list[str] | None) -> None:
+        if (
+            self._round_ct - self._last_switch_round
+            < self._cfg.switch_cooldown_rounds
+        ):
+            return
         goodputs = {
             steps: self._goodput(batch_size, rids, steps)
             for steps in self._available_steps
@@ -373,6 +390,7 @@ class PricedSpeculativeParams:
             return
         self.current_steps = best
         self._switch_ct += 1
+        self._last_switch_round = self._round_ct
         if (
             self._switch_ct <= _SWITCH_LOG_FIRST
             or self._switch_ct % _SWITCH_LOG_EVERY == 0
@@ -443,11 +461,50 @@ class PricedSpeculativeParams:
         )
 
     def _step_cost(self, batch_size: int, steps: int) -> float:
-        """Corrected cost: realized-gap EMA when available, else table."""
-        ema = self._cost_ema.get((self._cost_bucket(batch_size), steps))
+        """Corrected cost: realized-gap EMA when available, else derived
+        from observed EMA buckets, else table.
+
+        Candidates must be priced in commensurate units: comparing one
+        configuration at a realized ~10 ms against another at the flat 1.0 s
+        default makes the argmax meaningless (observed on first GPU run).
+        """
+        bucket = self._cost_bucket(batch_size)
+        ema = self._cost_ema.get((bucket, steps))
         if ema is not None:
             return ema
-        return self._table_cost(batch_size, steps)
+
+        # Unseen bucket: derive an estimate from observed EMAs (token-ratio
+        # scaling within the bucket, else same-g nearest bucket).
+        derived: float | None = None
+        if self._cost_ema:
+            same_bucket = [
+                (g, c) for (b, g), c in self._cost_ema.items() if b == bucket
+            ]
+            if same_bucket:
+                g_near, c_near = min(same_bucket, key=lambda gc: abs(gc[0] - steps))
+                derived = c_near * (steps + 1) / (g_near + 1)
+            else:
+                same_g = [
+                    (b, c) for (b, g), c in self._cost_ema.items() if g == steps
+                ]
+                if same_g:
+                    log_b = math.log(max(bucket, 1))
+                    _, c_near = min(
+                        same_g, key=lambda bc: abs(math.log(max(bc[0], 1)) - log_b)
+                    )
+                    derived = c_near
+
+        # Optimism under uncertainty: take the cheapest available estimate.
+        # A never-observed configuration must stay reachable — pricing it
+        # only from the incumbent's scaled EMA can freeze the policy on the
+        # incumbent forever (no exploration); the table's optimistic claim
+        # triggers the probe whose realized gap then corrects the EMA.
+        table = self._table_cost(batch_size, steps) if self._cost_table else None
+        estimates = [c for c in (derived, table) if c is not None]
+        if estimates:
+            return min(estimates)
+        # Nothing known at all: flat cost, maximize expected accept tokens.
+        return 1.0
 
     def _cost_bucket(self, batch_size: int) -> int:
         """The cuda-graph BS this batch actually pads up to (the executed

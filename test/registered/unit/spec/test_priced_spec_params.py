@@ -121,7 +121,8 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
         # high-confidence request justifies g=4.
         cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 2.0)])
         policy = PricedSpeculativeParams(
-            initial_steps=1, cfg=self._cfg([1, 4], cost_table=cost_table)
+            initial_steps=1,
+            cfg=self._cfg([1, 4], cost_table=cost_table, switch_cooldown_rounds=0),
         )
 
         # Realized rejections drive the low request's accept-rate EMA to 0.
@@ -186,7 +187,9 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
         # to 4 — then the realized wall gaps (10s at g=4, 1s at g=1) correct
         # the cost surface and pull it back to 1 for good.
         cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 1.0)])
-        cfg = self._cfg([1, 4], cost_table=cost_table, ema_alpha=0.5)
+        cfg = self._cfg(
+            [1, 4], cost_table=cost_table, ema_alpha=0.5, switch_cooldown_rounds=0
+        )
 
         clock = {"t": 0.0}
         with mock.patch("time.perf_counter", new=lambda: clock["t"]):
@@ -204,6 +207,40 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
             all(steps == 1 for steps in chosen[2:]),
             f"online correction did not stick: {chosen}",
         )
+
+    def test_switch_cooldown_suppresses_thrash(self):
+        # Alternating per-request evidence flips the optimum every round;
+        # the cooldown must hold the line between swaps.
+        cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 2.0)])
+        policy = PricedSpeculativeParams(
+            initial_steps=1,
+            cfg=self._cfg([1, 4], cost_table=cost_table, switch_cooldown_rounds=8),
+        )
+        policy.on_verify_complete([0], batch_size=1, rids=["lo"], num_steps=4)
+        policy.observe_draft_confidences(["hi"], [[0.99] * 4])
+        switches = 0
+        last = policy.current_steps
+        for i in range(8):
+            steps = policy.get_steps_for_batch(1, rids=["hi" if i % 2 else "lo"])
+            if steps != last:
+                switches += 1
+                last = steps
+        self.assertLessEqual(switches, 1, "cooldown failed to suppress thrash")
+
+    def test_unseen_buckets_price_from_observed_emas(self):
+        # No table: once one (bucket, g) has a realized gap, other g at the
+        # same bucket must be priced commensurately (token-ratio scaled),
+        # not at the flat 1.0 default (observed thrashing on first GPU run).
+        # warmup pins steps=1 so the realized gap lands at (bucket 1, g=1).
+        cfg = self._cfg([1, 4], switch_cooldown_rounds=0, warmup_rounds=100)
+        clock = {"t": 0.0}
+        with mock.patch("time.perf_counter", new=lambda: clock["t"]):
+            policy = PricedSpeculativeParams(initial_steps=1, cfg=cfg)
+            policy.get_steps_for_batch(1, rids=["r0"], round_idx=1)
+            clock["t"] += 0.010  # realized 10 ms at (1, g=1)
+            policy.get_steps_for_batch(1, rids=["r0"], round_idx=2)
+        # (1, g=4) unseen: expect 10 ms * (4+1)/(1+1) = 25 ms, not 1.0 s.
+        self.assertAlmostEqual(policy._step_cost(1, 4), 0.025, places=3)
 
     def test_non_consecutive_rounds_do_not_feed_the_cost_ema(self):
         cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 1.0)])
