@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_telemetry import get_spec_telemetry
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -544,6 +545,13 @@ class SchedulerBatchResultProcessor:
         self.model_worker.on_verify_complete_cpu(
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )
+
+        if result.spec_telemetry_step_idx is not None and (
+            (telem := get_spec_telemetry()) is not None
+        ):
+            telem.on_verify_result(
+                result.spec_telemetry_step_idx, result.num_correct_drafts_per_req_cpu
+            )
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this

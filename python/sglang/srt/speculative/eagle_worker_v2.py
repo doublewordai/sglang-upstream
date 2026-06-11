@@ -57,6 +57,10 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
+from sglang.srt.speculative.spec_telemetry import (
+    capture_draft_confidence,
+    get_spec_telemetry,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -149,6 +153,17 @@ class EagleDraftWorker(BaseDraftWorker):
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
+
+        # Persistent confidence buffer written in-place by draft_forward so
+        # captured draft graphs refresh it on replay (graph-pool tensors
+        # cannot be read back safely; a fixed-address buffer can).
+        # Rows: requests (capture-padded); cols: draft step. Sized once at
+        # init — allocating inside a capture would land it in the graph pool.
+        self._draft_conf_buffer = None
+        if capture_draft_confidence():
+            self._draft_conf_buffer = torch.zeros(
+                (8192, 16), dtype=torch.float32, device=server_args.device
+            )
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
@@ -530,6 +545,11 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
+        if self._draft_conf_buffer is not None:
+            # Column 0: probability of the first draft token (sampled in
+            # draft extend, carried in via spec_info.topk_p).
+            self._draft_conf_buffer[: topk_p.shape[0], 0].copy_(topk_p[:, 0])
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -580,12 +600,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.topk == 1 and not _is_hip:
+            if self.topk == 1 and not _is_hip and self._draft_conf_buffer is None:
                 # topk=1 → degenerate single-path tree; `topk_p` is unused
                 # downstream, so skip softmax and just argmax over logits.
                 # Gated to CUDA: on ROCm the argmax tie-break diverges from
                 # the softmax+max path on FP8 logits and corrupts MTP draft
                 # selection (DSV3.2 MTP GSM8K, see #26358).
+                # Confidence capture needs the real probabilities, so it
+                # takes the softmax path.
                 topk_index = torch.argmax(
                     logits_output.next_token_logits, dim=-1, keepdim=True
                 )
@@ -593,6 +615,8 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 probs = torch.softmax(logits_output.next_token_logits, dim=-1)
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self._draft_conf_buffer is not None:
+                self._draft_conf_buffer[: topk_p.shape[0], i + 1].copy_(topk_p[:, 0])
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -626,6 +650,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft_extend(self):
         pass
+
+    def read_draft_confidences(self, num_reqs: int, num_steps: int):
+        """Read back the confidence buffer after draft (graph or eager).
+
+        Synchronizes the stream; only called under spec telemetry.
+        """
+        if self._draft_conf_buffer is None:
+            return None
+        return self._draft_conf_buffer[:num_reqs, :num_steps].cpu().tolist()
 
     def _draft_extend_for_prefill(
         self,
@@ -788,9 +821,11 @@ class EagleDraftWorker(BaseDraftWorker):
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if self.topk == 1 and not _is_hip:
+        if self.topk == 1 and not _is_hip and self._draft_conf_buffer is None:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
+            # MTP draft selection on FP8 logits. Confidence capture needs the
+            # real probabilities (this topk_p seeds draft_forward column 0),
+            # so it takes the softmax path.
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
@@ -1002,6 +1037,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            if (telem := get_spec_telemetry()) is not None:
+                batch_output.spec_telemetry_step_idx = telem.on_decode_step(
+                    num_reqs=batch.seq_lens.shape[0],
+                    num_steps=self.speculative_num_steps,
+                    num_draft_tokens=self.speculative_num_draft_tokens,
+                    seq_lens_sum=int(batch.seq_lens_sum),
+                    confidences=self.draft_worker.read_draft_confidences(
+                        batch.seq_lens.shape[0], self.speculative_num_steps
+                    ),
+                )
 
             return batch_output
 
