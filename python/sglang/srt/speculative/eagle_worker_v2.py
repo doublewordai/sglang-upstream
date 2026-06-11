@@ -896,6 +896,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+        # Counts every forward_batch_generation round (prefill + decode);
+        # consecutive indices let the priced policy attribute wall gaps
+        # between back-to-back decode rounds to the previous round's cost.
+        self._forward_round_ct = 0
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
                 self,
@@ -962,6 +966,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        self._forward_round_ct += 1
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -998,7 +1003,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # The priced policy needs per-request identity; keep the EMA
+            # path free of the O(bs) rid-list build.
+            rids = None
+            if (
+                self.adaptive_controller is not None
+                and self.adaptive_controller.needs_request_context
+            ):
+                rids = [req.rid for req in batch.reqs]
+            self.activate_step_by_batch(
+                batch.seq_lens.shape[0],
+                rids=rids,
+                round_idx=self._forward_round_ct,
+            )
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1038,30 +1055,60 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
-            if (telem := get_spec_telemetry()) is not None:
+            # This round's confidences are only readable after draft; they
+            # feed the NEXT round's priced decision. Single read shared with
+            # telemetry — it forces a GPU sync, so it stays gated behind
+            # SGLANG_SPEC_CAPTURE_CONFIDENCE (read returns None otherwise).
+            telem = get_spec_telemetry()
+            policy_wants_confidences = (
+                self.adaptive_controller is not None
+                and self.adaptive_controller.wants_draft_confidences
+            )
+            confidences = None
+            if telem is not None or policy_wants_confidences:
+                confidences = self.draft_worker.read_draft_confidences(
+                    batch.seq_lens.shape[0], self.speculative_num_steps
+                )
+            if telem is not None:
                 batch_output.spec_telemetry_step_idx = telem.on_decode_step(
                     num_reqs=batch.seq_lens.shape[0],
                     num_steps=self.speculative_num_steps,
                     num_draft_tokens=self.speculative_num_draft_tokens,
                     seq_lens_sum=int(batch.seq_lens_sum),
-                    confidences=self.draft_worker.read_draft_confidences(
-                        batch.seq_lens.shape[0], self.speculative_num_steps
-                    ),
+                    confidences=confidences,
+                )
+            if policy_wants_confidences and rids is not None:
+                self.adaptive_controller.observe_draft_confidences(
+                    rids, confidences
                 )
 
             return batch_output
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req,
+                batch_size=batch_size,
+                rids=rids,
+                num_steps=num_steps,
             )
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(
+        self,
+        batch_size: int,
+        rids: list[str] | None = None,
+        round_idx: int | None = None,
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+            self.adaptive_controller.activate_step_by_batch(
+                batch_size, rids=rids, round_idx=round_idx
+            )
 
     # -- Adaptive speculative decoding protocol --
 
