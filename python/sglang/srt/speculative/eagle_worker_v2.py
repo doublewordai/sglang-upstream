@@ -1074,7 +1074,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     num_reqs=batch.seq_lens.shape[0],
                     num_steps=self.speculative_num_steps,
                     num_draft_tokens=self.speculative_num_draft_tokens,
-                    seq_lens_sum=int(batch.seq_lens_sum),
+                    seq_lens_sum=(
+                        int(batch.seq_lens_sum) if batch.seq_lens_sum is not None else -1
+                    ),
                     confidences=confidences,
                 )
             if policy_wants_confidences and rids is not None:
