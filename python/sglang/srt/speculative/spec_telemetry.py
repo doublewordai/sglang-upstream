@@ -10,6 +10,17 @@ two JSONL records joined offline by step index ``i``:
   verify result reaches the scheduler's result processor (which may be a few
   steps later under overlap scheduling).
 
+Confidence lag. The worker reads confidences zero-sync (one-round-stale
+staged delivery), so a ``"conf"`` field carrying ``"conf_lag": 1`` does NOT
+describe the record it sits on: it describes the most recent PRIOR worker-side
+decode record with ``k > 0`` from the same process (prefill and ``k == 0``
+rounds neither produce nor deliver confidences, so the lag is one step in the
+subsequence of ``k > 0`` worker records, not necessarily ``i - 1``). Its rows
+align with THAT record's request list (length = that record's ``bs``) and its
+column count with that record's ``k``. Fitters must shift ``conf`` back by one
+``k > 0`` worker record before joining per-request; records without
+``conf_lag`` carry same-round confidences (legacy traces).
+
 Under CUDA graphs the only honest step cost is the wall-clock gap between
 consecutive decode rounds, so analysis derives step time from successive
 worker-side timestamps (filtering rounds separated by prefill or idle gaps).
@@ -53,6 +64,7 @@ class SpecTelemetry:
         seq_lens_sum: int,
         confidences: Optional[List[List[float]]] = None,
         worker_round_idx: Optional[int] = None,
+        conf_lag: Optional[int] = None,
     ) -> int:
         """Log the worker-side half of a decode round. Returns the step index
         used to join with the processor-side half.
@@ -60,6 +72,11 @@ class SpecTelemetry:
         ``worker_round_idx`` counts ALL worker rounds including prefill, so
         the offline fitter can reject decode-round pairs with a prefill in
         between (whose wall gap includes the prefill, not just the step).
+
+        ``conf_lag`` marks how many ``k > 0`` worker records back the
+        ``confidences`` belong to (the zero-sync staged read delivers the
+        previous round's values; see the module docstring). ``None``/0 means
+        same-round confidences.
         """
         step_idx = self._step_ct
         self._step_ct += 1
@@ -76,6 +93,8 @@ class SpecTelemetry:
             record["ri"] = worker_round_idx
         if confidences is not None:
             record["conf"] = confidences
+            if conf_lag:
+                record["conf_lag"] = conf_lag
         self._write(record)
         return step_idx
 

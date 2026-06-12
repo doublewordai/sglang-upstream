@@ -51,11 +51,17 @@ Acceptance model. Two layers:
        c. a global prior (config key ``"prior_accept_rate"``).
 
 When the anchor has any realized data, the per-request expectation is
-``E_global(g) * clamp(chain_i(g) / chain_mean(g), 1/MOD, MOD)`` with
-``chain_mean`` the batch mean of the chain signal and MOD the config key
+``E_global(g) * clamp(chain_i(g) / chain_baseline(g), 1/MOD, MOD)`` with
+``chain_baseline`` a per-g rolling EMA (``"ema_alpha"``) of round-mean
+chain values maintained ACROSS rounds and MOD the config key
 ``"confidence_modulation"``: per-request signal modulates *around* the
-realized level instead of free-running. Before any realized data the
-chain signal is used directly (layer 2 alone).
+realized level instead of free-running. The baseline must be
+cross-round: a same-round batch mean equals the lone request's own
+chain at batch size 1, forcing modulation to exactly 1.0 and killing
+per-request gating where it is worth most (observed at concurrency 1
+on GH200). Before the rolling baseline has data at a g, the same-round
+batch mean is used as the fallback baseline. Before any realized data
+the chain signal is used directly (layer 2 alone).
 
 Evidence staleness: g=0 rounds produce no confidences and no accepts, so
 per-request evidence would freeze (frozen pessimistic evidence makes g=0
@@ -348,6 +354,11 @@ class PricedSpeculativeParams:
         # realized num_correct_drafts per round at that g. Anchors the
         # acceptance model (see module docstring).
         self._realized_correct_ema: dict[int, float] = {}
+        # Rolling modulation baseline: num_steps -> EMA of round-mean chain
+        # signals, maintained across rounds. Normalizing against the
+        # same-round batch mean instead makes modulation identically 1.0 at
+        # batch size 1 (see module docstring).
+        self._chain_mean_ema: dict[int, float] = {}
 
         self._cuda_graph_bs: list[int] | None = None
         self._reqs: OrderedDict[str, _RequestState] = OrderedDict()
@@ -565,10 +576,12 @@ class PricedSpeculativeParams:
         """Batch E[num_correct_drafts | steps] (drafts only, no bonus).
 
         With realized data anywhere on the accept curve, each request gets
-        ``E_global(steps) * clamp(chain_i / chain_mean, 1/MOD, MOD)``: the
+        ``E_global(steps) * clamp(chain_i / baseline, 1/MOD, MOD)``: the
         realized anchor sets the level and the per-request chain signal only
         modulates around it (raw confidence chains overstate deep-g returns).
-        Without realized data the chain signal is used directly.
+        The baseline is the per-g rolling EMA of round-mean chains — see
+        ``_observe_chain_mean`` — so a confident round modulates > 1 even at
+        batch size 1. Without realized data the chain signal is used directly.
         """
         if steps <= 0:
             return 0.0
@@ -580,17 +593,37 @@ class PricedSpeculativeParams:
                 self._cfg.prior_accept_rate, steps
             )
         chains = [self._chain_correct_drafts(rid, steps) for rid in rids]
+        baseline = self._observe_chain_mean(steps, sum(chains) / len(chains))
         if anchor is None:
             return sum(chains)
-        chain_mean = sum(chains) / len(chains)
-        if chain_mean <= 0.0:
+        if baseline <= 0.0:
             return anchor * len(chains)
         modulation = self._cfg.confidence_modulation
         return sum(
             anchor
-            * min(max(chain / chain_mean, 1.0 / modulation), modulation)
+            * min(max(chain / baseline, 1.0 / modulation), modulation)
             for chain in chains
         )
+
+    def _observe_chain_mean(self, steps: int, batch_chain_mean: float) -> float:
+        """Fold this round's batch-mean chain signal at *steps* into the
+        rolling baseline and return the PRE-update baseline (the recent
+        typical chain level at this g, excluding the current observation).
+
+        Before the rolling baseline has data at this g, falls back to the
+        batch mean itself — the original same-round behavior, where the
+        modulation ratio is 1.0 for a lone request. Once cross-round data
+        exists, a confident round at batch size 1 yields a ratio > 1 (deeper
+        g can be justified) and an unconfident one < 1.
+        """
+        prev = self._chain_mean_ema.get(steps)
+        ema_alpha = self._cfg.ema_alpha
+        self._chain_mean_ema[steps] = (
+            batch_chain_mean
+            if prev is None
+            else (1.0 - ema_alpha) * prev + ema_alpha * batch_chain_mean
+        )
+        return batch_chain_mean if prev is None else prev
 
     def _anchored_correct_drafts(self, steps: int) -> float | None:
         """E_global[num_correct_drafts | steps] from the realized accept curve.

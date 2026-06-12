@@ -171,10 +171,27 @@ class EagleDraftWorker(BaseDraftWorker):
         # Rows: requests (capture-padded); cols: draft step. Sized once at
         # init — allocating inside a capture would land it in the graph pool.
         self._draft_conf_buffer = None
+        # One-round-stale, zero-sync confidence readback: each call to
+        # read_draft_confidences stages the GPU buffer into this pinned host
+        # buffer with a non-blocking copy and delivers the PREVIOUS call's
+        # staged values (paired with that call's rids). Confidences only
+        # inform the NEXT round's decision, so the staleness is free, while
+        # a blocking .cpu() read taxed every round (~1-2 ms of a ~9 ms round
+        # at batch size 1 on GH200).
+        self._conf_staging_buffer = None
+        self._conf_copy_event = None
+        self._staged_conf_rids: Optional[List[str]] = None
+        self._staged_conf_shape: Optional[Tuple[int, int]] = None
         if capture_draft_confidence():
             self._draft_conf_buffer = torch.zeros(
                 (8192, 16), dtype=torch.float32, device=server_args.device
             )
+            self._conf_staging_buffer = torch.zeros(
+                (8192, 16), dtype=torch.float32, pin_memory=True
+            )
+            self._conf_copy_event = torch.get_device_module(
+                server_args.device
+            ).Event()
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
@@ -662,14 +679,50 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_extend(self):
         pass
 
-    def read_draft_confidences(self, num_reqs: int, num_steps: int):
-        """Read back the confidence buffer after draft (graph or eager).
+    def read_draft_confidences(
+        self, rids: Optional[List[str]], num_reqs: int, num_steps: int
+    ) -> Optional[Tuple[Optional[List[str]], List[List[float]]]]:
+        """Stage this round's confidence buffer; deliver the previous round's.
 
-        Synchronizes the stream; only called under spec telemetry.
+        Zero-sync by construction: the GPU confidence buffer is staged into a
+        pinned host buffer with a non-blocking copy (row slice only, so the
+        D2H stays genuinely async), and the return value is the PREVIOUS
+        call's already-landed staged values, paired with the rids passed to
+        that call. Confidences only inform the NEXT round's decision, so the
+        one-round staleness is free.
+
+        Returns ``(rids_prev, values_prev)`` — ``rids_prev`` is ``None`` when
+        the previous caller passed no rids — or ``None`` when nothing is
+        deliverable: capture off, first call, ``num_steps == 0``, or the
+        staged copy has not landed yet. Landing is checked with a
+        non-blocking event query; a not-yet-landed copy skips the delivery
+        (never waits) and the policy's staleness decay absorbs the gap.
+
+        ``num_steps == 0`` rounds produce no fresh confidences: no copy, no
+        sync, no delivery; the staged state is left intact, so after a
+        g>0 -> g=0 transition the last staged values are still delivered once
+        at the next g>0 round (the caller re-pairs them against live rids).
         """
-        if self._draft_conf_buffer is None:
+        if self._draft_conf_buffer is None or num_steps <= 0:
             return None
-        return self._draft_conf_buffer[:num_reqs, :num_steps].cpu().tolist()
+        delivered = None
+        if self._staged_conf_shape is not None and self._conf_copy_event.query():
+            num_reqs_prev, num_steps_prev = self._staged_conf_shape
+            delivered = (
+                self._staged_conf_rids,
+                self._conf_staging_buffer[:num_reqs_prev, :num_steps_prev].tolist(),
+            )
+        num_reqs = min(num_reqs, self._conf_staging_buffer.shape[0])
+        self._conf_staging_buffer[:num_reqs].copy_(
+            self._draft_conf_buffer[:num_reqs], non_blocking=True
+        )
+        self._conf_copy_event.record()
+        self._staged_conf_rids = list(rids) if rids is not None else None
+        self._staged_conf_shape = (
+            num_reqs,
+            min(num_steps, self._draft_conf_buffer.shape[1]),
+        )
+        return delivered
 
     def _draft_extend_for_prefill(
         self,
@@ -1246,19 +1299,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             # This round's confidences are only readable after draft; they
-            # feed the NEXT round's priced decision. Single read shared with
-            # telemetry — it forces a GPU sync, so it stays gated behind
+            # feed the NEXT round's priced decision, so a one-round-stale
+            # delivery is free. The read stages this round's GPU values
+            # (non-blocking D2H into a pinned buffer) and hands back the
+            # PREVIOUS g>0 round's staged values paired with that round's
+            # rids — no GPU sync on the per-round path (a blocking read
+            # taxed ~1-2 ms of every ~9 ms round at batch size 1). Single
+            # read shared with telemetry; gated behind
             # SGLANG_SPEC_CAPTURE_CONFIDENCE (read returns None otherwise).
             telem = get_spec_telemetry()
             policy_wants_confidences = (
                 self.adaptive_controller is not None
                 and self.adaptive_controller.wants_draft_confidences
             )
+            conf_rids = None
             confidences = None
             if telem is not None or policy_wants_confidences:
-                confidences = self.draft_worker.read_draft_confidences(
-                    batch.seq_lens.shape[0], self.speculative_num_steps
+                staged = self.draft_worker.read_draft_confidences(
+                    rids, batch.seq_lens.shape[0], self.speculative_num_steps
                 )
+                if staged is not None:
+                    conf_rids, confidences = staged
             if telem is not None:
                 batch_output.spec_telemetry_step_idx = telem.on_decode_step(
                     num_reqs=batch.seq_lens.shape[0],
@@ -1268,12 +1329,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         int(batch.seq_lens_sum) if batch.seq_lens_sum is not None else -1
                     ),
                     confidences=confidences,
+                    # The staged values describe the PREVIOUS g>0 decode
+                    # round, not this record (see spec_telemetry docstring).
+                    conf_lag=1 if confidences is not None else None,
                     worker_round_idx=self._forward_round_ct,
                 )
-            if policy_wants_confidences and rids is not None:
-                self.adaptive_controller.observe_draft_confidences(
-                    rids, confidences
-                )
+            if (
+                policy_wants_confidences
+                and confidences is not None
+                and conf_rids is not None
+                and rids is not None
+            ):
+                # Re-pair the stale delivery against the live batch: requests
+                # that finished (or were evicted) since the values were staged
+                # are dropped; the policy's staleness decay covers any gap.
+                live_rids = set(rids)
+                pairs = [
+                    (rid, conf)
+                    for rid, conf in zip(conf_rids, confidences)
+                    if rid in live_rids
+                ]
+                if pairs:
+                    self.adaptive_controller.observe_draft_confidences(
+                        [rid for rid, _ in pairs],
+                        [conf for _, conf in pairs],
+                    )
 
             return batch_output
 

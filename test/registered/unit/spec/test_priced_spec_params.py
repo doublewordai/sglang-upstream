@@ -538,6 +538,131 @@ class TestRealizedAnchor(PricedSpecParamsTestBase):
         self.assertIsNone(policy._anchored_correct_drafts(4))
 
 
+def _chain(conf: float, steps: int) -> float:
+    """sum_{d=1..steps} conf**d — the per-request chain signal under a
+    constant per-position confidence."""
+    total, chain_prob = 0.0, 1.0
+    for _ in range(steps):
+        chain_prob *= conf
+        total += chain_prob
+    return total
+
+
+class TestRollingChainBaseline(PricedSpecParamsTestBase):
+    """The modulation baseline is a per-g rolling EMA of round-mean chain
+    signals maintained across rounds, not the same-round batch mean. The
+    same-round mean equals the lone request's own chain at batch size 1,
+    forcing modulation to exactly 1.0 and killing per-request gating where
+    it's worth most (conc-1 GH200: policy sat at k=1/k=3, -29% vs static
+    k=4, with +22% predicted from working per-request gating)."""
+
+    def _anchored_policy(self, initial_steps, **overrides):
+        # Realized anchors E_global(1) = 0.5 and E_global(4) = 1.5 (one
+        # ema_alpha=1.0 feed each); costs chosen so at batch size 1 the
+        # neutral-modulation goodputs are
+        #   goodput(1 | m=1) = (0.5 + 1) / 1.0  = 1.50   (g=1 wins)
+        #   goodput(4 | m=1) = (1.5 + 1) / 1.8 ~= 1.39
+        # while a +clamp modulation at g=4 flips it:
+        #   goodput(4 | m=2) = (3.0 + 1) / 1.8 ~= 2.22   (g=4 wins)
+        cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 1.8)])
+        cfg = self._cfg([1, 4], cost_table=cost_table, switch_cooldown_rounds=0)
+        cfg.update(overrides)
+        policy = PricedSpeculativeParams(initial_steps=initial_steps, cfg=cfg)
+        policy.on_verify_complete(
+            [1, 0], batch_size=2, rids=["s0", "s1"], num_steps=1
+        )
+        policy.on_verify_complete(
+            [2, 1], batch_size=2, rids=["s2", "s3"], num_steps=4
+        )
+        return policy
+
+    def _warm_baseline(self, policy, conf=0.6):
+        """Seed the per-g rolling baselines with a typical-confidence round
+        (helper ema_alpha=1.0: baseline = the latest round mean)."""
+        policy.observe_draft_confidences(["typ"], [[conf] * 4])
+        for steps in (1, 4):
+            policy._expected_correct_drafts_batch(1, ["typ"], steps)
+
+    def test_bs1_confident_round_modulates_up_and_goes_deeper(self):
+        # At batch size 1 a request more confident than the rolling typical
+        # level must yield modulation > 1 and justify deeper g. Under the
+        # old same-round batch mean the ratio was identically 1.0 and the
+        # policy stayed at g=1.
+        policy = self._anchored_policy(initial_steps=1)
+        self._warm_baseline(policy)
+        policy.observe_draft_confidences(["hi"], [[0.99] * 4])
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["hi"]), 4)
+
+    def test_bs1_unconfident_round_modulates_down_and_goes_shallower(self):
+        policy = self._anchored_policy(initial_steps=4)
+        self._warm_baseline(policy)
+        policy.observe_draft_confidences(["lo"], [[0.1] * 4])
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["lo"]), 1)
+
+    def test_modulation_clamp_respected_against_the_rolling_baseline(self):
+        # chain(0.99, 4) / chain(0.6, 4) ~= 2.99 > MOD=2.0: the up-clamp
+        # binds, so the expectation is exactly anchor * MOD.
+        policy = self._anchored_policy(initial_steps=1)
+        self._warm_baseline(policy)
+        policy.observe_draft_confidences(["hi"], [[0.99] * 4])
+        self.assertAlmostEqual(
+            policy._expected_correct_drafts_batch(1, ["hi"], 4),
+            1.5 * 2.0,
+            places=9,
+        )
+        # Zero chain hits the down-clamp: anchor / MOD.
+        policy2 = self._anchored_policy(initial_steps=1)
+        self._warm_baseline(policy2)
+        policy2.observe_draft_confidences(["lo"], [[0.0] * 4])
+        self.assertAlmostEqual(
+            policy2._expected_correct_drafts_batch(1, ["lo"], 4),
+            1.5 * 0.5,
+            places=9,
+        )
+
+    def test_no_baseline_data_falls_back_to_batch_mean(self):
+        # Before the rolling baseline has data at a g, the original
+        # same-round behavior holds: a lone request IS the mean, ratio 1,
+        # expectation = anchor regardless of confidence.
+        policy = self._anchored_policy(initial_steps=1)
+        policy.observe_draft_confidences(["hi"], [[0.99] * 4])
+        self.assertAlmostEqual(
+            policy._expected_correct_drafts_batch(1, ["hi"], 4), 1.5, places=9
+        )
+
+    def test_baseline_is_a_rolling_ema_across_rounds(self):
+        policy = self._anchored_policy(initial_steps=1, ema_alpha=0.5)
+        policy.observe_draft_confidences(["a"], [[0.6] * 4])
+        policy._expected_correct_drafts_batch(1, ["a"], 4)
+        self.assertAlmostEqual(
+            policy._chain_mean_ema[4], _chain(0.6, 4), places=9
+        )
+        policy.observe_draft_confidences(["b"], [[0.99] * 4])
+        policy._expected_correct_drafts_batch(1, ["b"], 4)
+        self.assertAlmostEqual(
+            policy._chain_mean_ema[4],
+            0.5 * _chain(0.6, 4) + 0.5 * _chain(0.99, 4),
+            places=9,
+        )
+
+    def test_baseline_read_excludes_the_current_round(self):
+        # The decision uses the PRE-update baseline: the current round's
+        # chain must not normalize itself back toward ratio 1. With helper
+        # ema_alpha=1.0 a post-update read would collapse the ratio to
+        # exactly 1 (baseline = own chain); conf 0.8 keeps the true ratio
+        # ~1.81, inside the clamp, so the two are distinguishable.
+        policy = self._anchored_policy(initial_steps=1)
+        self._warm_baseline(policy)
+        policy.observe_draft_confidences(["hi"], [[0.8] * 4])
+        expected_ratio = _chain(0.8, 4) / _chain(0.6, 4)
+        self.assertLess(expected_ratio, 2.0)
+        self.assertAlmostEqual(
+            policy._expected_correct_drafts_batch(1, ["hi"], 4),
+            1.5 * expected_ratio,
+            places=9,
+        )
+
+
 class TestLadderSwitching(PricedSpecParamsTestBase):
     def test_distant_optimum_is_reached_via_the_ladder(self):
         # From g=0 in [0, 1, 2, 3, 4, 8] a huge goodput gap to 8 moves at
