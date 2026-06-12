@@ -83,6 +83,8 @@ class SpecTelemetry:
         (``"ee": 1``): ``k``/``ndt`` are the EXECUTED depth (the depth the
         draft loop stopped at), not a runtime-state configuration, and
         ``confidences`` are same-round (the stop checks already synced them).
+        A pre-draft depth-0 skip records ``k=0``/``ndt=1`` with ``"ee": 1``
+        and no confidences (the drafter never ran).
         """
         step_idx = self._step_ct
         self._step_ct += 1

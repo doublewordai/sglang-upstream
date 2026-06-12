@@ -29,7 +29,9 @@ try:
         _EARLY_EXIT_FALLBACK_STOP_PRICE,
         PricedSpeculativeParams,
         decide_early_exit_depth,
+        early_exit_should_skip,
         early_exit_should_stop,
+        early_exit_stop_depths,
         load_priced_config,
     )
 except ImportError:
@@ -47,7 +49,9 @@ except ImportError:
     _spec.loader.exec_module(_mod)
     PricedSpeculativeParams = _mod.PricedSpeculativeParams
     decide_early_exit_depth = _mod.decide_early_exit_depth
+    early_exit_should_skip = _mod.early_exit_should_skip
     early_exit_should_stop = _mod.early_exit_should_stop
+    early_exit_stop_depths = _mod.early_exit_stop_depths
     load_priced_config = _mod.load_priced_config
     _EARLY_EXIT_FALLBACK_STOP_PRICE = _mod._EARLY_EXIT_FALLBACK_STOP_PRICE
 
@@ -109,6 +113,43 @@ class TestDecideEarlyExitDepth(unittest.TestCase):
         gains = [0.9, 0.5, 0.2]
         self.assertEqual(decide_early_exit_depth(gains, [1, 2, 3], 4, 0.0), 4)
         self.assertEqual(decide_early_exit_depth(gains, [1, 2, 3], 4, 10.0), 1)
+
+
+class TestEarlyExitShouldSkip(unittest.TestCase):
+    def test_low_first_probs_skip(self):
+        # A doomed batch (every first draft near-certain to be rejected)
+        # is identified before the drafter pass is paid.
+        self.assertTrue(early_exit_should_skip([0.05, 0.08], 0.2))
+
+    def test_high_first_prob_proceeds(self):
+        self.assertFalse(early_exit_should_skip([0.9], 0.2))
+
+    def test_batch_gain_is_the_sum(self):
+        # Each request alone falls short of the price, but the drafter pass
+        # is shared across the batch: the summed expected commits clear it.
+        self.assertTrue(early_exit_should_skip([0.15], 0.2))
+        self.assertTrue(early_exit_should_skip([0.1], 0.2))
+        self.assertFalse(early_exit_should_skip([0.15, 0.1], 0.2))
+
+    def test_tie_proceeds(self):
+        # Mirrors early_exit_should_stop: the round exactly pays for itself.
+        self.assertFalse(early_exit_should_skip([0.1, 0.1], 0.2))
+
+
+class TestEarlyExitStopDepths(unittest.TestCase):
+    def test_zero_included_only_when_zero_has_a_state(self):
+        self.assertEqual(early_exit_stop_depths([0, 2, 4]), [0, 2])
+        # No candidate 0 -> no depth-0 skip: the minimum depth stays 1.
+        self.assertEqual(early_exit_stop_depths([1, 2, 4]), [1, 2])
+
+    def test_zero_can_be_the_only_stop(self):
+        # Candidates {0, k_max}: no in-draft stop exists, but the pre-draft
+        # skip does.
+        self.assertEqual(early_exit_stop_depths([0, 4]), [0])
+
+    def test_k_max_is_never_a_stop(self):
+        self.assertEqual(early_exit_stop_depths([4]), [])
+        self.assertEqual(early_exit_stop_depths([]), [])
 
 
 class EarlyExitPolicyTestBase(unittest.TestCase):
@@ -226,6 +267,46 @@ class TestEarlyExitSwitchRestriction(EarlyExitPolicyTestBase):
         for _ in range(8):
             steps = params.get_steps_for_batch(8)
         self.assertEqual(steps, 2)
+
+
+class TestExecutedDepthCostAttribution(EarlyExitPolicyTestBase):
+    """Early-exit rounds run shallower than the parked configuration the
+    policy keyed at decision time; observe_round_executed_steps re-keys the
+    round's wall-gap attribution to the depth that actually ran."""
+
+    def _run_two_rounds(self, params, executed_steps=None):
+        params.get_steps_for_batch(1, round_idx=10)
+        if executed_steps is not None:
+            params.observe_round_executed_steps(executed_steps)
+        # Consecutive round indices: the wall gap since round 10 is folded
+        # into the cost EMA under round 10's (bucket, steps) key.
+        params.get_steps_for_batch(1, round_idx=11)
+
+    def test_depth0_skip_keys_the_gap_at_steps_zero(self):
+        params = self._params([0, 4])
+        self.assertEqual(params.current_steps, 4)
+        self._run_two_rounds(params, executed_steps=0)
+        self.assertIn((1, 0), params._cost_ema)
+        self.assertNotIn((1, 4), params._cost_ema)
+
+    def test_in_draft_stop_keys_the_gap_at_the_stop_depth(self):
+        params = self._params([0, 2, 4])
+        self.assertEqual(params.current_steps, 4)
+        self._run_two_rounds(params, executed_steps=2)
+        self.assertIn((1, 2), params._cost_ema)
+        self.assertNotIn((1, 4), params._cost_ema)
+
+    def test_full_depth_round_keeps_the_parked_key(self):
+        params = self._params([0, 4])
+        self._run_two_rounds(params)
+        self.assertIn((1, 4), params._cost_ema)
+        self.assertNotIn((1, 0), params._cost_ema)
+
+    def test_observe_without_a_pending_round_is_a_no_op(self):
+        params = self._params([0, 4])
+        params.observe_round_executed_steps(0)  # no decision keyed yet
+        params.get_steps_for_batch(1, round_idx=10)
+        self.assertEqual(params._cost_ema, {})
 
 
 class TestEarlyExitConfig(EarlyExitPolicyTestBase):

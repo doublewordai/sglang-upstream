@@ -161,8 +161,12 @@ class PricedPolicyConfig:
     max_switch_distance: int = 2
     # In-round early-exit drafting: at small batch the worker drafts eagerly
     # at the deepest candidate and may stop the loop at any intermediate
-    # candidate depth when the marginal step no longer pays. Off by default
-    # (opt-in: it changes the engine's draft execution path).
+    # candidate depth when the marginal step no longer pays — including
+    # depth 0 (skip drafting entirely for the round) when 0 is a candidate
+    # with a built runtime state and the pre-draft signal (the first draft
+    # token's confidence, computed by the previous round's draft extend)
+    # says even the first kept draft won't pay. Off by default (opt-in: it
+    # changes the engine's draft execution path).
     early_exit: bool = False
     # Largest batch size early exit applies to. Past it the per-step host
     # sync dominates and the captured draft graph wins.
@@ -602,6 +606,28 @@ class PricedSpeculativeParams:
             state = self._touch(rid)
             state.last_confidences = conf
             state.last_update_round = self._round_ct
+
+    def observe_round_executed_steps(self, executed_steps: int) -> None:
+        """Re-key the just-decided round's cost attribution to the depth the
+        round actually executed.
+
+        ``get_steps_for_batch`` keys the round's wall-gap attribution at
+        decision time from ``current_steps`` — the PARKED configuration. An
+        early-exit round executes a different depth (an in-draft stop at
+        g_v < k_max, or a pre-draft depth-0 skip with no drafter at all),
+        and the gap folded at the next invocation must price the
+        configuration that ran, not the parked one (a depth-1 stop billed
+        to k_max makes the deep config look cheap and the shallow one
+        unpriced). The worker calls this as soon as the executed depth is
+        known; a pending key from a same-round switch (already cleared) or
+        no prior decision is a no-op.
+        """
+        if self._last_round_cost_key is None:
+            return
+        self._last_round_cost_key = (
+            self._last_round_cost_key[0],
+            executed_steps,
+        )
 
     # -- In-round early-exit drafting --
 
@@ -1135,6 +1161,42 @@ def early_exit_should_stop(marginal_gain: float, stop_price: float) -> bool:
     expected marginal correct drafts of one more drafter step fall short of
     the price. Ties continue (the step exactly pays for itself)."""
     return marginal_gain < stop_price
+
+
+def early_exit_should_skip(
+    first_draft_probs: "list[float] | tuple[float, ...]", stop_price: float
+) -> bool:
+    """Pre-draft DEPTH-0 decision: skip drafting entirely for the round.
+
+    ``first_draft_probs`` are the per-request confidences of the FIRST
+    draft token (``spec_info.topk_p[:, 0]``) — computed by the previous
+    round's draft extend, so they are available before any drafter pass
+    this round. Keeping the chain to depth >= 1 commits request *i*'s
+    first draft with probability ``p1_i``, so the batch expected marginal
+    correct drafts of drafting at all is ``sum_i p1_i``; it is priced
+    against the same per-step stop price as the in-draft checks (the
+    depth-0 analog of the d-step rule — same shape, evaluated one step
+    earlier). Ties proceed, mirroring ``early_exit_should_stop``.
+    """
+    return early_exit_should_stop(sum(first_draft_probs), stop_price)
+
+
+def early_exit_stop_depths(
+    available_steps: "list[int] | tuple[int, ...]",
+) -> list[int]:
+    """Allowed early-exit stop depths given the candidates with built
+    runtime states: every candidate strictly below the deepest (k_max).
+
+    Includes 0 — the pre-draft depth-0 skip (no drafter at all for the
+    round) — only when 0 itself has a runtime state; without a g=0 state
+    the minimum depth stays 1. Depths >= 1 are the in-draft stop checks
+    (``decide_early_exit_depth``); k_max is the run-to-end default, never
+    a stop.
+    """
+    if not available_steps:
+        return []
+    k_max = max(available_steps)
+    return sorted(g for g in set(available_steps) if 0 <= g < k_max)
 
 
 def decide_early_exit_depth(

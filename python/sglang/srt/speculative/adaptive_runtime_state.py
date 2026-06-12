@@ -5,6 +5,7 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     read_adaptive_policy_name,
 )
+from sglang.srt.speculative.priced_spec_params import early_exit_stop_depths
 from sglang.srt.speculative.spec_telemetry import capture_draft_confidence
 
 if TYPE_CHECKING:
@@ -170,11 +171,14 @@ class AdaptiveController:
         """(allowed stop depths, stop price) for an in-round early-exit
         draft this round, or None when early exit does not apply: policy is
         not priced / knob off / batch too large / worker not parked at the
-        deepest candidate / no intermediate candidate depth to stop at.
+        deepest candidate / no candidate depth below k_max to stop at.
 
         Stop depths are the candidates with built runtime states strictly
-        inside (0, k_max): a stop always lands on a depth whose verify
-        graph and draft-extend resources exist.
+        below k_max (``early_exit_stop_depths``): a stop always lands on a
+        depth whose verify graph and draft-extend resources exist. Depth 0
+        is included only when a g=0 state exists — it marks the pre-draft
+        skip decision (no drafter at all for the round), which the worker
+        evaluates against the same stop price before invoking the drafter.
         """
         if self.policy_name != "priced":
             return None
@@ -185,10 +189,23 @@ class AdaptiveController:
         k_max = max(available)
         if self.worker.speculative_num_steps != k_max:
             return None
-        stop_depths = [g for g in available if 1 <= g < k_max]
+        stop_depths = early_exit_stop_depths(available)
         if not stop_depths:
             return None
         return stop_depths, params.early_exit_stop_price(batch_size)
+
+    def observe_round_executed_steps(self, executed_steps: int) -> None:
+        """Tell the policy the depth the current round actually executed.
+
+        Early-exit rounds run shallower than the parked configuration the
+        policy keyed its cost attribution to (an in-draft stop at
+        g_v < k_max, or a pre-draft depth-0 skip); the policy re-keys the
+        round's wall-gap attribution to the executed depth. No-op for
+        policies without per-round cost attribution (EMA).
+        """
+        observe = getattr(self.params, "observe_round_executed_steps", None)
+        if observe is not None:
+            observe(executed_steps)
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.

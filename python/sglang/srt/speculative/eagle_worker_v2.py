@@ -68,7 +68,10 @@ from sglang.srt.speculative.g0_gap_buffer import (
     G0GapBuffer,
     partition_catch_up_chunks,
 )
-from sglang.srt.speculative.priced_spec_params import early_exit_should_stop
+from sglang.srt.speculative.priced_spec_params import (
+    early_exit_should_skip,
+    early_exit_should_stop,
+)
 from sglang.srt.speculative.spec_telemetry import (
     capture_draft_confidence,
     get_spec_telemetry,
@@ -1554,9 +1557,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
             early_exit_plan = self._early_exit_round_plan(batch)
             if early_exit_plan is not None:
                 stop_depths, stop_price = early_exit_plan
-                return self._forward_early_exit_decode(
-                    batch, rids, stop_depths, stop_price, on_publish
-                )
+                # Pre-draft DEPTH-0 decision: when 0 is an allowed stop (a
+                # g=0 runtime state exists) and the first draft token's
+                # confidences — computed by the previous round's draft
+                # extend, so available before any drafter pass — say even
+                # the first kept draft won't pay, skip drafting entirely
+                # and run the round through the g=0 machinery.
+                if 0 in stop_depths and self._should_skip_drafting(
+                    batch, stop_price
+                ):
+                    return self._forward_depth0_decode(batch, rids, on_publish)
+                draft_stop_depths = [d for d in stop_depths if d >= 1]
+                if draft_stop_depths:
+                    return self._forward_early_exit_decode(
+                        batch, rids, draft_stop_depths, stop_price, on_publish
+                    )
+                # 0 was the only allowed stop and the batch proceeds: fall
+                # through to the normal captured draft path at the parked
+                # k_max (no intermediate depth to stop at in-draft).
 
             with (
                 self.draft_worker.draft_tp_context(
@@ -1647,6 +1665,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         rids: Optional[List[str]],
         on_publish=None,
+        early_exit: bool = False,
     ) -> GenerationBatchResult:
         """One g=0 (speculation-off) decode round.
 
@@ -1656,6 +1675,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         exactly like a spec result — ``accept_lens = ones(bs)``,
         ``speculative_num_draft_tokens = 1``, stride-1 ``next_token_ids`` —
         so every downstream consumer is untouched.
+
+        Runs in two situations: the worker is parked at g=0 (the policy's
+        state-swap decision), or an early-exit round took the pre-draft
+        depth-0 skip — then the caller scopes state[0]'s target resources
+        in (``_early_exit_verify_scope(0)``) and passes ``early_exit=True``
+        so telemetry marks the round (``"ee": 1``); everything below
+        depends only on those scoped resources, never on the parked
+        configuration.
 
         KV: the scheduler's spec-v2 ``prepare_for_decode`` already pre-claimed
         the bonus slot (``kv_committed_len += 1``) and the resolve side adds
@@ -1783,6 +1810,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 confidences=None,
                 worker_round_idx=self._forward_round_ct,
+                early_exit=early_exit,
             )
 
         return batch_output
@@ -1920,6 +1948,53 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return None
         return ac.early_exit_plan(batch.seq_lens.shape[0])
 
+    def _should_skip_drafting(
+        self, batch: ScheduleBatch, stop_price: float
+    ) -> bool:
+        """Pre-draft DEPTH-0 decision for an early-exit round.
+
+        Reads the first draft token's per-request confidence
+        (``spec_info.topk_p[:, 0]``, written by the previous round's draft
+        extend — or by this round's g=0 catch-up extend, which runs before
+        this check) and applies the priced skip rule. The ``.tolist()`` is
+        a blocking D2H sync of at most ``early_exit_max_batch`` floats —
+        the only blocking sync on the pre-draft path.
+        """
+        if self._g0_gap_buffer is None:
+            return False
+        draft_input: Optional[EagleDraftInput] = batch.spec_info
+        if draft_input is None or draft_input.topk_p is None:
+            return False
+        bs = batch.seq_lens.shape[0]
+        first_draft_probs = draft_input.topk_p[:bs, 0].tolist()
+        return early_exit_should_skip(first_draft_probs, stop_price)
+
+    def _forward_depth0_decode(
+        self,
+        batch: ScheduleBatch,
+        rids: Optional[List[str]],
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """One skipped (depth-0) round inside an early-exit phase.
+
+        The pre-draft signal said even the first drafter pass won't pay, so
+        the round runs the existing g=0 machinery — plain 1-token target
+        decode, g=0-shaped result (accept_lens ones, stride 1), and gap
+        buffering of the (token, hidden) pair for the drafter catch-up —
+        composed from state[0]'s target resources while the worker stays
+        parked at k_max (scoped rebind, no runtime-state swap). The next
+        k>0 round's catch-up trigger (gap buffer non-empty) drains the gap
+        exactly as a parked-g=0 phase re-entry does; the buffer and
+        catch-up are keyed by rid and handle per-round interleaving the
+        same as per-phase. Telemetry records k=0/ndt=1 with ``"ee": 1``;
+        on_verify_complete sees num_steps = 0 (no anchor update — E[0] is
+        0 definitionally); cost attribution is re-keyed to executed depth
+        0 via observe_round_executed_steps.
+        """
+        self.adaptive_controller.observe_round_executed_steps(0)
+        with self._early_exit_verify_scope(0):
+            return self._forward_g0_decode(batch, rids, on_publish, early_exit=True)
+
     @contextlib.contextmanager
     def _early_exit_verify_scope(self, depth: int):
         """Compose one round's verify + draft-extend from state[depth].
@@ -1928,7 +2003,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         graph runner), the draft-extend backend/graph, and the step scalars
         — NOT the draft-decode backend, the draft graph, or the topk=1
         chain prealloc buffers, which stay parked at k_max (the next round
-        drafts at k_max again). server_args is also left untouched: the
+        drafts at k_max again). ``depth == 0`` scopes a pre-draft skipped
+        round: state[0]'s target side is the plain-decode backend/graph and
+        its draft-extend members are None, exactly the environment a
+        parked-g=0 round runs in (the in-round flush catch-up uses the
+        draft runner's base attention backend, which no state ever swaps).
+        server_args is also left untouched: the
         scheduler's per-decode KV over-allocation is sized by
         max_speculative_num_draft_tokens, which already covers every depth,
         and prepare_for_decode's bonus-slot pre-claim plus the resolver's
@@ -2007,6 +2087,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             draft_tokens, depth, confidences = self.draft_worker.draft_early_exit(
                 batch, stop_depths, stop_price
             )
+
+        # Cost attribution must key the EXECUTED depth: the policy keyed
+        # this round at decision time from the parked current_steps
+        # (k_max); a stop at g_v < k_max would otherwise bill its wall gap
+        # to the full-depth configuration.
+        self.adaptive_controller.observe_round_executed_steps(depth)
 
         scope = (
             self._early_exit_verify_scope(depth)
