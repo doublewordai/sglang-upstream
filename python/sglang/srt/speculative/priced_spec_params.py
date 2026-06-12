@@ -519,11 +519,15 @@ class PricedSpeculativeParams:
         ):
             return
         current = self.current_steps
-        # Ladder switching: one switch moves at most max_switch_distance
-        # indices through the sorted candidate list. Distant configs are
-        # reached over successive cooldown windows (0 -> 2 -> 4 -> 8), which
-        # keeps every runtime-state swap incremental and bounds the g=0
-        # catch-up gap a single re-entry must drain.
+        # Ladder switching clamps the MOVE, not the comparison: the goodput
+        # argmax runs over ALL candidates (a distant winner must stay
+        # visible — restricting the argmax to the neighborhood parks the
+        # policy behind marginal intermediates that don't individually clear
+        # the hysteresis margin; observed at conc 4, k=0 vs k=4 +26%), then
+        # the actual step moves at most max_switch_distance indices toward
+        # it. Distant configs are reached over successive cooldown windows
+        # (0 -> 2 -> 4 -> 8), keeping every runtime-state swap incremental
+        # and bounding the g=0 catch-up gap a single re-entry must drain.
         try:
             current_idx = self._available_steps.index(current)
         except ValueError:  # defensive; current is kept inside available
@@ -531,19 +535,24 @@ class PricedSpeculativeParams:
                 range(len(self._available_steps)),
                 key=lambda i: abs(self._available_steps[i] - current),
             )
-        max_distance = self._cfg.max_switch_distance
-        window = self._available_steps[
-            max(current_idx - max_distance, 0) : current_idx + max_distance + 1
-        ]
         goodputs = {
-            steps: self._goodput(batch_size, rids, steps) for steps in window
+            steps: self._goodput(batch_size, rids, steps)
+            for steps in self._available_steps
         }
-        best = max(window, key=lambda s: goodputs[s])
+        best = max(self._available_steps, key=lambda s: goodputs[s])
         if best == current or current not in goodputs:
             return
         # Hysteresis: runtime state swaps have cost, so only move when the
         # predicted goodput gain clears the margin.
         if goodputs[best] <= goodputs[current] * (1.0 + self._cfg.switch_margin):
+            return
+        best_idx = self._available_steps.index(best)
+        max_distance = self._cfg.max_switch_distance
+        step_idx = current_idx + max(
+            -max_distance, min(max_distance, best_idx - current_idx)
+        )
+        best = self._available_steps[step_idx]
+        if best == current:
             return
         self.current_steps = best
         self._switch_ct += 1
