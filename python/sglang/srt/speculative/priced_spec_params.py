@@ -169,6 +169,15 @@ class PricedPolicyConfig:
     # than not speculating), while stop@2 already beats the best static
     # rate — doomed rounds should pay two passes, not one.
     early_exit_min_stop_depth: int = 1
+    # Hysteresis margin used at and above switch_margin_batch_threshold.
+    # Measured: a policy pinned at k=0 matches static k0 at conc 16-256
+    # (1.06/1.02/0.99) — the entire high-concurrency shortfall of the full
+    # policy is churn into spec configs that lose 1.5-2.4x there, nominated
+    # by estimators whose variance grows with batch (short prefill-churned
+    # visits). Demand a much larger predicted gain before leaving the
+    # incumbent at high batch; low-batch adaptivity is unaffected.
+    switch_margin_high_batch: float = 0.15
+    switch_margin_batch_threshold: int = 24
     # Clamp on how far the per-request chain signal may modulate the
     # global realized-acceptance anchor: ratio in [1/MOD, MOD].
     confidence_modulation: float = 2.0
@@ -276,6 +285,23 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
                 f"of E[num_correct_drafts | g] floats >= 0 for g=1.., got {curve!r}"
             )
         out.acceptance_prior_curve = [float(v) for v in curve]
+
+    hb_margin = cfg.get("switch_margin_high_batch", out.switch_margin_high_batch)
+    if not isinstance(hb_margin, (int, float)) or hb_margin < 0.0:
+        raise ValueError(
+            f"priced policy: switch_margin_high_batch must be >= 0, got {hb_margin!r}"
+        )
+    out.switch_margin_high_batch = float(hb_margin)
+
+    hb_thresh = cfg.get(
+        "switch_margin_batch_threshold", out.switch_margin_batch_threshold
+    )
+    if not isinstance(hb_thresh, int) or isinstance(hb_thresh, bool) or hb_thresh < 1:
+        raise ValueError(
+            "priced policy: switch_margin_batch_threshold must be an int >= 1, "
+            f"got {hb_thresh!r}"
+        )
+    out.switch_margin_batch_threshold = hb_thresh
 
     ee_min_stop = cfg.get("early_exit_min_stop_depth", out.early_exit_min_stop_depth)
     if not isinstance(ee_min_stop, int) or isinstance(ee_min_stop, bool) or ee_min_stop < 1:
@@ -759,7 +785,12 @@ class PricedSpeculativeParams:
             return
         # Hysteresis: runtime state swaps have cost, so only move when the
         # predicted goodput gain clears the margin.
-        if goodputs[best] <= goodputs[current] * (1.0 + self._cfg.switch_margin):
+        margin = (
+            self._cfg.switch_margin_high_batch
+            if batch_size >= self._cfg.switch_margin_batch_threshold
+            else self._cfg.switch_margin
+        )
+        if goodputs[best] <= goodputs[current] * (1.0 + margin):
             return
         best_idx = available.index(best)
         max_distance = self._cfg.max_switch_distance
