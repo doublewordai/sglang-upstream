@@ -164,6 +164,11 @@ class PricedPolicyConfig:
     # switching is the right granularity for spec on/off, so this defaults
     # OFF; in-draft stopping (depths >= 1) is unaffected.
     early_exit_skip: bool = False
+    # Minimum in-draft stop depth. Measured (GH200, ShareGPT, B=1):
+    # stopping at depth 1 is dilutive (7.9-8.8 ms for ~1.26 commits, worse
+    # than not speculating), while stop@2 already beats the best static
+    # rate — doomed rounds should pay two passes, not one.
+    early_exit_min_stop_depth: int = 1
     # Clamp on how far the per-request chain signal may modulate the
     # global realized-acceptance anchor: ratio in [1/MOD, MOD].
     confidence_modulation: float = 2.0
@@ -271,6 +276,13 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
                 f"of E[num_correct_drafts | g] floats >= 0 for g=1.., got {curve!r}"
             )
         out.acceptance_prior_curve = [float(v) for v in curve]
+
+    ee_min_stop = cfg.get("early_exit_min_stop_depth", out.early_exit_min_stop_depth)
+    if not isinstance(ee_min_stop, int) or isinstance(ee_min_stop, bool) or ee_min_stop < 1:
+        raise ValueError(
+            f"priced policy: early_exit_min_stop_depth must be an int >= 1, got {ee_min_stop!r}"
+        )
+    out.early_exit_min_stop_depth = ee_min_stop
 
     ee_skip = cfg.get("early_exit_skip", out.early_exit_skip)
     if not isinstance(ee_skip, bool):
@@ -1231,6 +1243,7 @@ def early_exit_should_skip(
 def early_exit_stop_depths(
     available_steps: "list[int] | tuple[int, ...]",
     allow_skip: bool = False,
+    min_stop_depth: int = 1,
 ) -> list[int]:
     """Allowed early-exit stop depths given the candidates with built
     runtime states: every candidate strictly below the deepest (k_max).
@@ -1244,7 +1257,7 @@ def early_exit_stop_depths(
     if not available_steps:
         return []
     k_max = max(available_steps)
-    min_depth = 0 if allow_skip else 1
+    min_depth = 0 if allow_skip else max(1, min_stop_depth)
     return sorted(g for g in set(available_steps) if min_depth <= g < k_max)
 
 

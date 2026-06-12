@@ -189,8 +189,12 @@ class AdaptiveController:
         k_max = max(available)
         if self.worker.speculative_num_steps != k_max:
             return None
-        allow_skip = bool(getattr(getattr(self.params, "_cfg", None), "early_exit_skip", False))
-        stop_depths = early_exit_stop_depths(available, allow_skip=allow_skip)
+        _cfg = getattr(self.params, "_cfg", None)
+        allow_skip = bool(getattr(_cfg, "early_exit_skip", False))
+        min_stop = int(getattr(_cfg, "early_exit_min_stop_depth", 1) or 1)
+        stop_depths = early_exit_stop_depths(
+            available, allow_skip=allow_skip, min_stop_depth=min_stop
+        )
         if not stop_depths:
             return None
         return stop_depths, params.early_exit_stop_price(batch_size)
