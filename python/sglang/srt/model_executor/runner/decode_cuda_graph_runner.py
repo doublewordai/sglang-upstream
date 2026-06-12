@@ -357,7 +357,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_speculative():
+        # Adaptive g=0 (speculation-off) runtime state: the target runs a
+        # plain 1-token decode round (ForwardMode.DECODE, spec_info=None), but
+        # EAGLE still needs the last-position hidden state per request so the
+        # drafter can catch up when speculation turns back on. Only reachable
+        # via an explicit speculative_num_steps=0 override (adaptive states);
+        # normal boot always has speculative_num_steps >= 1.
+        self.capture_plain_decode_for_spec = (
+            model_runner.spec_algorithm.is_speculative()
+            and not model_runner.is_draft_worker
+            and self.speculative_num_steps == 0
+        )
+        if self.capture_plain_decode_for_spec:
+            if not model_runner.spec_algorithm.is_standalone():
+                self.capture_hidden_mode = CaptureHiddenMode.LAST
+        elif model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
@@ -681,7 +695,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+        if (
+            self.capture_hidden_mode != CaptureHiddenMode.FULL
+            and not self.capture_plain_decode_for_spec
+        ):
+            # g=0 plain-decode capture keeps its __init__-chosen LAST mode:
+            # spec_info is None there but the drafter catch-up still needs
+            # the last-position hidden state per request.
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
@@ -1088,6 +1108,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # -----------------------------------------------------------------
     def get_spec_info(self, num_tokens: int):
         spec_info = None
+        if self.capture_plain_decode_for_spec:
+            # g=0 (speculation-off) state: capture a genuinely plain decode
+            # batch — no verify input, target backends must not see spec_info.
+            return None
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()

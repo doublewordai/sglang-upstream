@@ -181,6 +181,69 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
         self.assertEqual(policy._round_ct, 0)
 
 
+class TestG0Decision(PricedSpecParamsTestBase):
+    """g=0 (speculation-off) as a selectable candidate.
+
+    Cost table mirrors the measured Llama-3.1-8B + EAGLE3 / GH200 shape:
+    at high batch a plain decode round (ndt=1) is much cheaper than even
+    the shallowest spec round, while at B=1 the two are nearly equal.
+    """
+
+    def _g0_policy(self, **overrides):
+        cost_table = self._write_cost_table(
+            [
+                (1, 1, 0.016),
+                (1, 2, 0.017),
+                (64, 1, 0.016),
+                (64, 2, 0.039),
+            ]
+        )
+        cfg = self._cfg(
+            [0, 1],
+            cost_table=cost_table,
+            prior_accept_rate=0.01,
+            switch_cooldown_rounds=0,
+        )
+        cfg.update(overrides)
+        return PricedSpeculativeParams(initial_steps=1, cfg=cfg)
+
+    def test_high_batch_low_acceptance_picks_g0(self):
+        # goodput(0) = 64 / 0.016 = 4000 tok/s;
+        # goodput(1) = (64 * 0.01 + 64) / 0.039 ~= 1657 tok/s.
+        policy = self._g0_policy()
+        self.assertEqual(policy.get_steps_for_batch(64), 0)
+
+    def test_low_batch_high_confidence_picks_spec(self):
+        # goodput(1) = (0.99 + 1) / 0.017 ~= 117 > goodput(0) = 62.5.
+        policy = self._g0_policy()
+        policy.observe_draft_confidences(["hi"], [[0.99]])
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["hi"]), 1)
+
+    def test_switch_into_and_out_of_g0_with_zero_cooldown(self):
+        policy = self._g0_policy()
+        policy.observe_draft_confidences(["hi"], [[0.99]])
+        self.assertEqual(policy.get_steps_for_batch(64), 0)
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["hi"]), 1)
+        self.assertEqual(policy.get_steps_for_batch(64), 0)
+
+    def test_on_verify_complete_with_zero_steps_is_ignored(self):
+        # g=0 rounds have no drafts; they must not feed the accept-rate EMA.
+        policy = self._g0_policy()
+        policy.on_verify_complete([0], batch_size=1, rids=["r0"], num_steps=0)
+        self.assertEqual(len(policy._reqs), 0)
+
+    def test_goodput_at_g0_is_batch_over_cost(self):
+        policy = self._g0_policy()
+        self.assertAlmostEqual(policy._goodput(64, None, 0), 64 / 0.016, places=6)
+
+    def test_runtime_state_availability_handles_zero(self):
+        policy = self._g0_policy()
+        policy.set_cuda_graph_bs([4, 8])
+        self.assertEqual(policy.cuda_graph_bs_for_step(0), [4, 8])
+        policy.set_available_steps([0])
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["hi"]), 0)
+
+
 class TestOnlineCostCorrection(PricedSpecParamsTestBase):
     def test_realized_gaps_override_a_wrong_table(self):
         # (e) The table claims g=4 costs the same as g=1, so the policy jumps
@@ -288,8 +351,14 @@ class TestCostTable(PricedSpecParamsTestBase):
         with self.assertRaises(ValueError):
             load_cost_table(path)
 
-    def test_g0_rows_are_skipped(self):
+    def test_g0_rows_are_loaded(self):
+        # ndt=1 rows price the g=0 (speculation-off) plain-decode rounds.
         cost_table = self._write_cost_table([(1, 1, 1.0), (1, 2, 1.5)])
+        table = load_cost_table(cost_table)
+        self.assertEqual(table, {(1, 0): 1.0, (1, 1): 1.5})
+
+    def test_malformed_zero_ndt_rows_are_skipped(self):
+        cost_table = self._write_cost_table([(1, 0, 1.0), (1, 2, 1.5)])
         table = load_cost_table(cost_table)
         self.assertEqual(table, {(1, 1): 1.5})
 
@@ -299,10 +368,28 @@ class TestConfigValidation(PricedSpecParamsTestBase):
         with self.assertRaises(ValueError):
             load_priced_config({"policy": "priced"})
 
-    def test_candidate_steps_must_be_positive_ints(self):
-        for bad in ([], [0], [1, "2"], "1,2", [True]):
+    def test_candidate_steps_must_be_nonnegative_ints(self):
+        for bad in ([], [-1], [1, "2"], "1,2", [True]):
             with self.assertRaises(ValueError):
                 load_priced_config({"candidate_steps": bad})
+
+    def test_candidate_steps_accepts_zero(self):
+        # g=0 means speculation off for the round; it is a valid candidate.
+        self.assertEqual(load_priced_config({"candidate_steps": [0]}).candidate_steps, [0])
+        self.assertEqual(
+            load_priced_config({"candidate_steps": [3, 0, 1]}).candidate_steps,
+            [0, 1, 3],
+        )
+
+    def test_g0_max_gap_validated_with_default(self):
+        self.assertEqual(load_priced_config({"candidate_steps": [0, 1]}).g0_max_gap, 1024)
+        self.assertEqual(
+            load_priced_config({"candidate_steps": [0, 1], "g0_max_gap": 64}).g0_max_gap,
+            64,
+        )
+        for bad in (0, -1, 1.5, "64"):
+            with self.assertRaises(ValueError):
+                load_priced_config({"candidate_steps": [0, 1], "g0_max_gap": bad})
 
     def test_scalar_knobs_validated(self):
         base = {"candidate_steps": [1, 3]}

@@ -28,6 +28,10 @@ class SpecRuntimeState:
     stage has shape-dependent resources (attention backends and CUDA graphs)
     that must match the current configuration.  Switching adaptive steps
     means swapping the entire state atomically.
+
+    ``speculative_num_steps == 0`` is the speculation-off state: all
+    draft-side members are None and the target members are plain-decode
+    resources (1 token per request, ForwardMode.DECODE).
     """
 
     # -- Configuration (determines shapes for all stages) --
@@ -143,6 +147,13 @@ class AdaptiveController:
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
+
+    @property
+    def g0_max_gap(self) -> int:
+        """Per-request drafter-gap cap for g=0 (speculation-off) phases.
+        Only the priced policy can select g=0; others fall back to the
+        default bound (never reached)."""
+        return getattr(self.params, "g0_max_gap", 1024)
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.

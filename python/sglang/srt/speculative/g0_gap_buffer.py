@@ -1,0 +1,86 @@
+"""Per-request (token, hidden_state) gap bookkeeping for g=0 rounds.
+
+During g=0 (speculation-off) decode rounds the drafter is never invoked, so
+its KV cache falls behind the target's by one position per round. To re-enter
+g >= 1 the drafter must catch up over the gap, which needs the target hidden
+state and the next token at every missed position. The worker buffers that
+pair per request each g=0 round and drains the buffer into a catch-up
+draft-extend when speculation turns back on (or when a request's gap hits
+``max_gap``, to bound memory).
+
+Entries are opaque to this class (the worker stores GPU tensor rows); it is
+stdlib-only so pure-CPU unit tests can import it without torch.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# (token, hidden_state) pair for one gap position. The token is the drafter's
+# input token at that position (the token sampled by the round, i.e. position
+# + 1 in target terms); hidden_state is the target's output hidden state at
+# the position (None for draft architectures that don't consume it).
+GapEntry = Tuple[Any, Optional[Any]]
+
+
+class G0GapBuffer:
+    """Bounded per-rid append/drain buffer of drafter catch-up pairs."""
+
+    def __init__(self, max_gap: int = 1024):
+        if max_gap < 1:
+            raise ValueError(f"g0_max_gap must be >= 1, got {max_gap}")
+        self.g0_max_gap = max_gap
+        self._entries: Dict[str, List[GapEntry]] = {}
+
+    def is_empty(self) -> bool:
+        return not self._entries
+
+    def num_buffered(self, rid: str) -> int:
+        entries = self._entries.get(rid)
+        return len(entries) if entries else 0
+
+    def append_round(
+        self,
+        rids: Sequence[str],
+        tokens: Sequence[Any],
+        hidden_states: Optional[Sequence[Any]],
+    ) -> bool:
+        """Record one g=0 round's (token, hidden_state) per request.
+
+        Returns True when any request reached ``g0_max_gap`` — the caller
+        must then run a catch-up flush (``drain``) before the next append.
+        """
+        needs_flush = False
+        for i, rid in enumerate(rids):
+            entries = self._entries.setdefault(rid, [])
+            entries.append(
+                (tokens[i], hidden_states[i] if hidden_states is not None else None)
+            )
+            if len(entries) >= self.g0_max_gap:
+                needs_flush = True
+        return needs_flush
+
+    def retain(self, rids: Iterable[str]) -> None:
+        """Drop buffers for requests no longer running (finished/retracted)."""
+        keep = set(rids)
+        self._entries = {
+            rid: entries for rid, entries in self._entries.items() if rid in keep
+        }
+
+    def drop(self, rids: Iterable[str]) -> None:
+        """Drop buffers for requests that just (re-)prefilled: the prefill
+        draft-extend resyncs the drafter, so any buffered gap is stale."""
+        for rid in rids:
+            self._entries.pop(rid, None)
+
+    def drain(self, rids: Sequence[str]) -> Dict[str, List[GapEntry]]:
+        """Return the buffered gaps for *rids* (only non-empty ones) and clear
+        the whole buffer. Entries for rids not in *rids* belong to requests
+        that left the running batch and are discarded."""
+        out = {
+            rid: self._entries[rid]
+            for rid in rids
+            if self._entries.get(rid)
+        }
+        self._entries = {}
+        return out

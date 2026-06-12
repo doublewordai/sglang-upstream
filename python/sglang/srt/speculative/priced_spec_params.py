@@ -9,6 +9,11 @@ where ``B`` is the batch size, ``E_i[num_correct_drafts | g]`` is the
 per-request expected number of correct drafts (no bonus), and ``C(B, g)``
 is the wall-clock cost of one decode round at that configuration.
 
+``g = 0`` is speculation OFF for the round: the drafter is not invoked and
+the target runs a plain 1-token decode, so ``E[num_correct_drafts | 0] = 0``
+and ``goodput(0) = B / C(B, 0)``. Its cost lives in the table's
+``num_draft_tokens = 1`` rows.
+
 Cost model ``C(B, g)``:
   - Seeded from an optional CSV cost table (config key ``"cost_table"``,
     header ``batch_size,num_draft_tokens,step_seconds`` with
@@ -85,6 +90,9 @@ class PricedPolicyConfig:
     # and batch size flickers at low load; without a cooldown the policy
     # thrashes between the per-B optima every round.
     switch_cooldown_rounds: int = 16
+    # g=0 (speculation-off) only: max tokens buffered per request for the
+    # drafter catch-up before the worker force-flushes a catch-up extend.
+    g0_max_gap: int = 1024
 
 
 def load_priced_config(cfg: dict) -> PricedPolicyConfig:
@@ -93,11 +101,11 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
     if (
         not isinstance(steps, list)
         or not steps
-        or not all(isinstance(s, int) and not isinstance(s, bool) and s >= 1 for s in steps)
+        or not all(isinstance(s, int) and not isinstance(s, bool) and s >= 0 for s in steps)
     ):
         raise ValueError(
             "priced policy: candidate_steps is required and must be a non-empty "
-            f"list of ints >= 1 (g=0 is not representable at runtime), got {steps!r}"
+            f"list of ints >= 0 (g=0 means speculation off for the round), got {steps!r}"
         )
 
     out = PricedPolicyConfig(candidate_steps=sorted(set(steps)))
@@ -151,6 +159,13 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
         )
     out.max_tracked_requests = max_tracked
 
+    g0_max_gap = cfg.get("g0_max_gap", out.g0_max_gap)
+    if not isinstance(g0_max_gap, int) or g0_max_gap < 1:
+        raise ValueError(
+            f"priced policy: g0_max_gap must be an int >= 1, got {g0_max_gap!r}"
+        )
+    out.g0_max_gap = g0_max_gap
+
     return out
 
 
@@ -158,8 +173,9 @@ def load_cost_table(path: str) -> dict[tuple[int, int], float]:
     """Load a step-cost CSV into ``{(batch_size, num_steps): step_seconds}``.
 
     Header: ``batch_size,num_draft_tokens,step_seconds`` where
-    ``num_draft_tokens = g + 1``. Rows with ``num_draft_tokens <= 1``
-    (g=0 baselines) are skipped — g=0 is not representable at runtime.
+    ``num_draft_tokens = g + 1``. Rows with ``num_draft_tokens == 1`` are the
+    g=0 (speculation-off) plain-decode rounds; rows with
+    ``num_draft_tokens < 1`` are malformed and skipped.
     """
     table: dict[tuple[int, int], float] = {}
     with open(path, newline="") as f:
@@ -184,11 +200,11 @@ def load_cost_table(path: str) -> dict[tuple[int, int], float]:
                     f"cost_table {path} line {line_num}: need batch_size >= 1 "
                     f"and step_seconds > 0, got {row!r}"
                 )
-            if num_steps < 1:
+            if num_steps < 0:
                 continue
             table[(batch_size, num_steps)] = step_seconds
     if not table:
-        raise ValueError(f"cost_table {path}: no usable rows (num_draft_tokens >= 2)")
+        raise ValueError(f"cost_table {path}: no usable rows (num_draft_tokens >= 1)")
     return table
 
 
@@ -273,6 +289,11 @@ class PricedSpeculativeParams:
     @property
     def candidate_steps(self) -> list[int]:
         return list(self._candidate_steps)
+
+    @property
+    def g0_max_gap(self) -> int:
+        """Per-request drafter-gap cap during g=0 (speculation-off) phases."""
+        return self._cfg.g0_max_gap
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
