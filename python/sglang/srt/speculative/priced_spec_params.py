@@ -1149,6 +1149,15 @@ class PricedSpeculativeParams:
         if mean_cost <= 0.0:
             return
         key = next(iter(keys))
+        # Idle-gap sanity: windows spanning client turnarounds, rung drains
+        # or warmup boundaries produce means the calibrated table is never
+        # wrong by (observed: cost(k0)@B=1 stuck at 293 ms vs 5.8 ms table —
+        # poisoned excursion costs at conc 1 on the gate). Reject samples
+        # far outside the table's plausible band.
+        if self._cost_table:
+            base = self._table_cost(key[0], key[1])
+            if base and base > 0 and not (base / 8.0 <= mean_cost <= base * 8.0):
+                return
         prev = self._cost_ema.get(key)
         ema_alpha = self._cfg.ema_alpha
         self._cost_ema[key] = (

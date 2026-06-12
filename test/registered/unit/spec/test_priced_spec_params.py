@@ -267,8 +267,11 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
     def test_realized_gaps_override_a_wrong_table(self):
         # (e) The table claims g=4 costs the same as g=1, so the policy jumps
         # to 4 — then the realized wall gaps (10s at g=4, 1s at g=1) correct
-        # the cost surface and pull it back to 1 for good.
-        cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 1.0)])
+        # the cost surface and pull it back to 1 for good. The g=4 table row
+        # is 2.0 so the 10s reality sits inside the idle-gap sanity band
+        # (8x): a CALIBRATED table is never 10x wrong, so samples beyond the
+        # band are treated as idle pollution, not correction.
+        cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 2.0)])
         cfg = self._cfg(
             [1, 4], cost_table=cost_table, ema_alpha=0.5, switch_cooldown_rounds=0
         )
@@ -355,6 +358,21 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
         )
         policy._cost_ema[(64, 4)] = 0.05
         self.assertEqual(policy._step_cost(70, 1), 0.001)
+
+    def test_idle_polluted_windows_are_rejected(self):
+        # A window mean 50x the calibrated table (idle stretch, rung drain)
+        # must not poison the EMA.
+        cost_table = self._write_cost_table([(1, 2, 0.01)])
+        cfg = self._cfg([1], cost_table=cost_table)
+        clock = {"t": 0.0}
+        with mock.patch("time.perf_counter", new=lambda: clock["t"]):
+            policy = PricedSpeculativeParams(initial_steps=1, cfg=cfg)
+            from priced_spec_params import _COST_WINDOW
+
+            for i in range(_COST_WINDOW + 2):
+                policy.get_steps_for_batch(1, rids=["r0"], round_idx=1 + i)
+                clock["t"] += 0.5  # 500 ms "rounds": idle-polluted
+        self.assertEqual(policy._cost_ema, {})
 
     def test_non_consecutive_rounds_do_not_feed_the_cost_ema(self):
         cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 1.0)])
