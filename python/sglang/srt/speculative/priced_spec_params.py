@@ -101,6 +101,10 @@ _SWITCH_LOG_EVERY = 50
 # invocations (see _observe_round_gap).
 _COST_WINDOW = 8
 
+# At and above this batch size, per-request modulation is normalized to
+# conserve the anchored batch total (see _expected_correct_drafts_batch).
+_MODULATION_CONSERVE_MIN_BATCH = 8
+
 _COST_TABLE_COLUMNS = ("batch_size", "num_draft_tokens", "step_seconds")
 
 # Flat early-exit stop price (expected correct drafts per drafter step) used
@@ -900,11 +904,24 @@ class PricedSpeculativeParams:
         if baseline <= 0.0:
             return anchor * len(chains)
         modulation = self._cfg.confidence_modulation
-        return sum(
-            anchor
-            * min(max(chain / baseline, 1.0 / modulation), modulation)
+        ratios = [
+            min(max(chain / baseline, 1.0 / modulation), modulation)
             for chain in chains
-        )
+        ]
+        # At large batch, per-request signal REALLOCATES the anchored total
+        # rather than creating expectation: clamped ratios of right-skewed
+        # chains have mean > 1 (the bottom clamp dominates), which at B~94
+        # inflated batch E by ~40% and priced spec configs above k=0 against
+        # measured reality — no hysteresis margin survives a fake +57%
+        # goodput. The batch mean of chains is itself a low-variance
+        # estimate of the anchor there, so conserving the total loses
+        # nothing; at small batch the reallocation IS the gating signal and
+        # must be allowed to move the total.
+        if len(ratios) >= _MODULATION_CONSERVE_MIN_BATCH:
+            mean_ratio = sum(ratios) / len(ratios)
+            if mean_ratio > 0:
+                ratios = [r / mean_ratio for r in ratios]
+        return anchor * sum(ratios)
 
     def _observe_chain_mean(self, steps: int, batch_chain_mean: float) -> float:
         """Fold this round's batch-mean chain signal at *steps* into the
