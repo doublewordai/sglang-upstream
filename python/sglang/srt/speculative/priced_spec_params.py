@@ -157,6 +157,13 @@ class PricedPolicyConfig:
     # update (g=0 rounds generate neither). 0.97 ~= a 32-round time
     # constant; 1.0 disables decay.
     evidence_decay: float = 0.97
+    # Allow the pre-draft depth-0 skip inside early-exit rounds. Measured
+    # on GH200: per-round skips thrash (each skip->draft re-entry pays a
+    # drafter catch-up extend, ~10 ms/round vs 5.5 parked, and skipping
+    # starves the p1 signal that would end the streak) — phase-level g=0
+    # switching is the right granularity for spec on/off, so this defaults
+    # OFF; in-draft stopping (depths >= 1) is unaffected.
+    early_exit_skip: bool = False
     # Clamp on how far the per-request chain signal may modulate the
     # global realized-acceptance anchor: ratio in [1/MOD, MOD].
     confidence_modulation: float = 2.0
@@ -264,6 +271,13 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
                 f"of E[num_correct_drafts | g] floats >= 0 for g=1.., got {curve!r}"
             )
         out.acceptance_prior_curve = [float(v) for v in curve]
+
+    ee_skip = cfg.get("early_exit_skip", out.early_exit_skip)
+    if not isinstance(ee_skip, bool):
+        raise ValueError(
+            f"priced policy: early_exit_skip must be a bool, got {ee_skip!r}"
+        )
+    out.early_exit_skip = ee_skip
 
     est_decay = cfg.get("estimator_decay", out.estimator_decay)
     if not isinstance(est_decay, (int, float)) or not (0.0 < est_decay <= 1.0):
@@ -1216,6 +1230,7 @@ def early_exit_should_skip(
 
 def early_exit_stop_depths(
     available_steps: "list[int] | tuple[int, ...]",
+    allow_skip: bool = False,
 ) -> list[int]:
     """Allowed early-exit stop depths given the candidates with built
     runtime states: every candidate strictly below the deepest (k_max).
@@ -1229,7 +1244,8 @@ def early_exit_stop_depths(
     if not available_steps:
         return []
     k_max = max(available_steps)
-    return sorted(g for g in set(available_steps) if 0 <= g < k_max)
+    min_depth = 0 if allow_skip else 1
+    return sorted(g for g in set(available_steps) if min_depth <= g < k_max)
 
 
 def decide_early_exit_depth(

@@ -137,15 +137,24 @@ class TestEarlyExitShouldSkip(unittest.TestCase):
 
 
 class TestEarlyExitStopDepths(unittest.TestCase):
-    def test_zero_included_only_when_zero_has_a_state(self):
-        self.assertEqual(early_exit_stop_depths([0, 2, 4]), [0, 2])
-        # No candidate 0 -> no depth-0 skip: the minimum depth stays 1.
-        self.assertEqual(early_exit_stop_depths([1, 2, 4]), [1, 2])
+    def test_zero_included_only_when_skip_allowed_and_zero_has_a_state(self):
+        # Skips default OFF (measured: per-round skip thrash on GH200 —
+        # re-entry catch-up makes interleaved skips ~2x a parked-g0 round
+        # while starving the p1 signal); 0 appears only with allow_skip.
+        self.assertEqual(early_exit_stop_depths([0, 2, 4]), [2])
+        self.assertEqual(
+            early_exit_stop_depths([0, 2, 4], allow_skip=True), [0, 2]
+        )
+        # No candidate 0 -> no depth-0 skip even when allowed.
+        self.assertEqual(
+            early_exit_stop_depths([1, 2, 4], allow_skip=True), [1, 2]
+        )
 
     def test_zero_can_be_the_only_stop(self):
-        # Candidates {0, k_max}: no in-draft stop exists, but the pre-draft
-        # skip does.
-        self.assertEqual(early_exit_stop_depths([0, 4]), [0])
+        # Candidates {0, k_max}: no in-draft stop exists; the pre-draft
+        # skip exists only when allowed.
+        self.assertEqual(early_exit_stop_depths([0, 4]), [])
+        self.assertEqual(early_exit_stop_depths([0, 4], allow_skip=True), [0])
 
     def test_k_max_is_never_a_stop(self):
         self.assertEqual(early_exit_stop_depths([4]), [])
