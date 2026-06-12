@@ -163,6 +163,20 @@ class AdaptiveController:
         default budget (never reached)."""
         return getattr(self.params, "g0_catch_up_chunk_tokens", 4096)
 
+    @property
+    def g0_defer_prefill(self) -> bool:
+        """Whether requests admitted while the worker is parked at g=0 skip
+        the drafter prefill-extend (prompt-tail gap seeding + catch-up on
+        re-entry). Only the priced policy can select g=0; others fall back
+        to off (never reached)."""
+        return bool(getattr(self.params, "g0_defer_prefill", False))
+
+    @property
+    def g0_prompt_tail_tokens(self) -> int:
+        """Max trailing prompt positions buffered per deferred-prefill
+        request. Only meaningful when ``g0_defer_prefill`` is on."""
+        return getattr(self.params, "g0_prompt_tail_tokens", 512)
+
     def get_state(self, steps: int) -> SpecRuntimeState | None:
         """The pre-built runtime state for *steps*, or None when missing."""
         return self._states.get(steps)

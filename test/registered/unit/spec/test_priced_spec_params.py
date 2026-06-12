@@ -805,6 +805,12 @@ class TestConfigValidation(PricedSpecParamsTestBase):
             ("cost_table", 7),
             ("g0_catch_up_chunk_tokens", 0),
             ("g0_catch_up_chunk_tokens", 1.5),
+            ("g0_defer_prefill", 1),
+            ("g0_defer_prefill", "true"),
+            ("g0_prompt_tail_tokens", 0),
+            ("g0_prompt_tail_tokens", -1),
+            ("g0_prompt_tail_tokens", 1.5),
+            ("g0_prompt_tail_tokens", True),
             ("evidence_decay", 0.0),
             ("evidence_decay", 1.5),
             ("confidence_modulation", 0.5),
@@ -823,9 +829,31 @@ class TestConfigValidation(PricedSpecParamsTestBase):
         self.assertEqual(cfg.warmup_rounds, 20)
         self.assertEqual(cfg.max_tracked_requests, 8192)
         self.assertEqual(cfg.g0_catch_up_chunk_tokens, 4096)
+        # Deferred drafter prefill is opt-in.
+        self.assertFalse(cfg.g0_defer_prefill)
+        self.assertEqual(cfg.g0_prompt_tail_tokens, 512)
         self.assertEqual(cfg.evidence_decay, 0.97)
         self.assertEqual(cfg.confidence_modulation, 2.0)
         self.assertEqual(cfg.max_switch_distance, 2)
+
+    def test_g0_defer_prefill_round_trip(self):
+        cfg = load_priced_config(
+            {
+                "candidate_steps": [0, 3],
+                "g0_defer_prefill": True,
+                "g0_prompt_tail_tokens": 256,
+            }
+        )
+        self.assertTrue(cfg.g0_defer_prefill)
+        self.assertEqual(cfg.g0_prompt_tail_tokens, 256)
+        policy = PricedSpeculativeParams(
+            initial_steps=3,
+            cfg=self._cfg(
+                [0, 3], g0_defer_prefill=True, g0_prompt_tail_tokens=256
+            ),
+        )
+        self.assertTrue(policy.g0_defer_prefill)
+        self.assertEqual(policy.g0_prompt_tail_tokens, 256)
 
     def test_config_file_round_trip(self):
         import json

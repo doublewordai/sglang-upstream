@@ -1389,6 +1389,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # g=0 (speculation-off) support: per-request (token, hidden state)
         # buffering so the drafter can catch up when speculation turns back on.
         self._g0_gap_buffer: Optional[G0GapBuffer] = None
+        self._g0_defer_prefill = False
+        self._g0_prompt_tail_tokens = 512
+        # Counts requests whose drafter prefill-extend was deferred (skipped
+        # while parked at g=0); logged every 500.
+        self._g0_defer_prefill_req_ct = 0
         if (
             self.adaptive_controller is not None
             and 0 in self.adaptive_controller.candidate_steps
@@ -1407,6 +1412,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # running batch cannot OOM on extend activations.
             self._g0_catch_up_chunk_tokens = (
                 self.adaptive_controller.g0_catch_up_chunk_tokens
+            )
+            # Deferred drafter prefill: requests admitted while the worker is
+            # parked at g=0 skip the drafter prefill-extend; their prompt
+            # tail is seeded into the gap buffer and the catch-up rebuilds
+            # the drafter KV on re-entry to k>0.
+            self._g0_defer_prefill = self.adaptive_controller.g0_defer_prefill
+            self._g0_prompt_tail_tokens = (
+                self.adaptive_controller.g0_prompt_tail_tokens
             )
 
         # Some dummy tensors
@@ -1471,9 +1484,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         self._forward_round_ct += 1
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Prefill rounds behave the same in every adaptive state (incl.
-            # g=0): the draft extend below resyncs the drafter from scratch,
-            # so any buffered g=0 gap for these requests is stale.
+            # Prefill rounds resync the drafter from scratch (draft extend
+            # below, or the gap-buffer re-seed when deferred), so any
+            # buffered g=0 gap for these requests is stale.
             if self._g0_gap_buffer is not None:
                 self._g0_gap_buffer.drop(req.rid for req in batch.reqs)
             # Target prefill
@@ -1491,6 +1504,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # Deferred drafter prefill: while the worker is PARKED at g=0
+            # (steps == 0 runtime state, not an early-exit scoped round —
+            # prefill never runs inside that scope) the drafter prefill-
+            # extend is a standing tax for capability the parked phase never
+            # uses. Skip it and seed the g=0 gap buffer with the prompt tail
+            # instead; the existing catch-up rebuilds the drafter KV on
+            # re-entry to k>0. Multimodal prefills (mm_input_embeds) keep the
+            # immediate extend: the catch-up path has no embedding override.
+            if (
+                self._g0_defer_prefill
+                and self.speculative_num_steps == 0
+                and not batch.forward_mode.is_idle()
+                and batch_output.logits_output.mm_input_embeds is None
+            ):
+                batch_output.next_draft_input = self._defer_drafter_prefill(
+                    batch, batch_output
+                )
+                return batch_output
 
             # Draft prefill
             with (
@@ -1660,6 +1692,122 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
+    def _defer_drafter_prefill(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> EagleDraftInput:
+        """Skip the drafter prefill-extend for a prefill admitted while the
+        worker is parked at g=0; seed the gap buffer with the prompt tail.
+
+        Per request, the last ``g0_prompt_tail_tokens`` drafter rows of this
+        extend — entry ``p`` pairs the input token of position ``p + 1``
+        (the EAGLE one-left shift; the last row's token is the bonus token,
+        or the next prompt token for a non-final chunk) with the target's
+        FULL-capture hidden state of position ``p`` — are stored as the
+        request's initial gap. They are exactly the rows the immediate
+        drafter extend would have consumed, so the g=0 catch-up
+        (``_catch_up_drafter_after_g0``) drains them like decode gaps: at
+        re-entry the buffer holds the contiguous tail
+        ``[seq_len - gap, seq_len)`` (prompt tail + any g=0 decode rounds)
+        and the extend anchors there, with the drafter's rotary positions
+        set from the absolute position indices.
+
+        The accepted trade: drafter KV for prompt positions older than the
+        kept tail is NEVER built, and later drafter attention over those
+        slots reads unwritten/stale drafter-pool values. That degrades
+        draft quality for deferred requests (acceptance after re-entry may
+        be lower than for a fully prefilled request; the policy's
+        accept-EMA absorbs it) but never output correctness — the target
+        verifies every draft against its own clean KV.
+
+        The in-progress chunked request's non-final chunks are not seeded:
+        the next chunk's prefill drops the buffer anyway (its final chunk
+        seeds the tail). Returns the relay ``next_draft_input`` with real
+        bonus tokens and placeholder drafter fields (topk_p / topk_index /
+        hidden_states); the catch-up refreshes them in place before any
+        draft consumes them.
+        """
+        next_token_ids = batch_output.next_token_ids
+        target_hidden_states = batch_output.logits_output.hidden_states
+        tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+        tail_cap = min(
+            self._g0_prompt_tail_tokens, self._g0_gap_buffer.g0_max_gap
+        )
+
+        pt = 0
+        for i, extend_len in enumerate(batch.extend_lens):
+            req = batch.reqs[i]
+            if (
+                req is batch.chunked_req
+                and batch.chunked_req_next_prompt_token is not None
+            ):
+                # Non-final chunk: the next chunk re-seeds; don't hold
+                # hidden-state clones that are guaranteed to be dropped.
+                pt += extend_len
+                continue
+            n = min(tail_cap, extend_len)
+            # Drafter input tokens for the last n positions of this extend:
+            # one-left-shifted prompt tokens, tail token last. Match the
+            # dtype of the g=0 decode rounds' next_token_ids rows — the
+            # catch-up stacks seed and decode entries into one tensor.
+            gap_tokens = torch.cat(
+                (
+                    batch.input_ids[pt + extend_len - n + 1 : pt + extend_len],
+                    tail_tokens[i].reshape(1),
+                )
+            ).to(next_token_ids.dtype)
+            token_rows = [gap_tokens[j] for j in range(n)]
+            hidden_rows = None
+            if target_hidden_states is not None:
+                # Clone the tail slice out of the batch-wide FULL capture so
+                # the buffer doesn't pin the whole prefill's hidden tensor.
+                hidden_clone = target_hidden_states[
+                    pt + extend_len - n : pt + extend_len
+                ].clone()
+                hidden_rows = [hidden_clone[j] for j in range(n)]
+            self._g0_gap_buffer.seed_gap(
+                req.rid,
+                [
+                    (token_rows[j], hidden_rows[j] if hidden_rows else None)
+                    for j in range(n)
+                ],
+                tail_cap,
+            )
+            self._g0_defer_prefill_req_ct += 1
+            if self._g0_defer_prefill_req_ct % 500 == 0:
+                log_info_on_rank0(
+                    logger,
+                    "g0 deferred prefill: skipped the drafter prefill-extend "
+                    f"for {self._g0_defer_prefill_req_ct} requests so far "
+                    f"(prompt-tail cap {tail_cap} tokens/request)",
+                )
+            pt += extend_len
+
+        # Relay stub: real bonus tokens (the g=0 decode rounds consume them);
+        # zero drafter fields with the relay's shapes/dtypes — the catch-up
+        # extend overwrites them in place before any draft reads them.
+        bs = next_token_ids.shape[0]
+        hidden_size = EagleDraftInput.hidden_size_for(self.draft_worker)
+        return EagleDraftInput(
+            topk_p=torch.zeros(
+                (bs, self.topk), dtype=torch.float32, device=self.device
+            ),
+            topk_index=torch.zeros(
+                (bs, self.topk), dtype=torch.int64, device=self.device
+            ),
+            hidden_states=(
+                torch.zeros(
+                    (bs, hidden_size),
+                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                    device=self.device,
+                )
+                if hidden_size is not None
+                else None
+            ),
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
     def _forward_g0_decode(
         self,
         batch: ScheduleBatch,
@@ -1786,7 +1934,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         tokens = batch_output.next_token_ids
         token_rows = [tokens[i] for i in range(bs)]
         self._g0_gap_buffer.retain(rids)
-        needs_flush = self._g0_gap_buffer.append_round(rids, token_rows, hidden_rows)
+        # Deferred-prefill mode never runs the drafter during a parked phase
+        # (the mid-phase force-flush is the tax deferral avoids): the cap is
+        # enforced by dropping each request's oldest entries instead, and the
+        # catch-up anchors at the kept contiguous tail. Drafter KV below the
+        # kept range stays unbuilt — draft quality only, never correctness.
+        needs_flush = self._g0_gap_buffer.append_round(
+            rids, token_rows, hidden_rows, drop_oldest=self._g0_defer_prefill
+        )
         if needs_flush:
             # A request hit g0_max_gap: bound the buffer by syncing the
             # drafter now. batch.seq_lens already holds the post-round
@@ -1824,8 +1979,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         rows in place for the caught-up requests so the next draft round
         starts from each request's current position. ``batch.seq_lens`` must
         already cover the gap (the gap of request *i* is its last
-        ``num_buffered`` positions). Requests with no buffered gap (e.g.
-        prefilled during the g=0 phase) keep their fresh drafter fields.
+        ``num_buffered`` positions). Requests with no buffered gap (i.e.
+        immediately prefill-extended during the g=0 phase) keep their fresh
+        drafter fields.
+
+        Deferred-prefill seeds drain through here unchanged: a deferred
+        request's buffer is its prompt tail plus its g=0 decode entries — a
+        contiguous tail of drafter positions ending at the current position
+        — so the per-slice anchoring below covers both kinds of entries
+        with the same arithmetic. Drafter KV for positions below the kept
+        tail is never rebuilt (quality-only; see ``_defer_drafter_prefill``).
         """
         if rids is None:
             rids = [req.rid for req in batch.reqs]

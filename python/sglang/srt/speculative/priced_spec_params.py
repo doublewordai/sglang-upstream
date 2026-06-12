@@ -156,6 +156,23 @@ class PricedPolicyConfig:
     # concurrency 256 on GH200: one eager extend over every running
     # request's accumulated gap crashed the server).
     g0_catch_up_chunk_tokens: int = 4096
+    # g=0 only: defer the drafter prefill-extend for requests admitted while
+    # the worker is PARKED at g=0. Measured (within-node, replicated on 2
+    # nodes): a policy pinned at k=0 still loses 6-9% vs a true no-spec
+    # static at concurrency 64-256 under ShareGPT churn — the drafter
+    # prefill-extend paid on every admitted request is a standing tax for
+    # capability g=0 phases never use. Deferral buffers the prompt tail's
+    # (token, target hidden) pairs instead and lets the existing catch-up
+    # rebuild the drafter KV on re-entry to k>0. The trade: drafter KV for
+    # prompt positions older than the kept tail is never built, so accept
+    # rates after re-entry can be lower for deferred requests than fully
+    # prefilled ones (quality only — verification preserves outputs; the
+    # accept-EMA absorbs it). Opt-in.
+    g0_defer_prefill: bool = False
+    # With g0_defer_prefill: max trailing prompt positions whose (token,
+    # hidden) pairs are buffered per deferred request. Bounds the deferral's
+    # memory at tail_tokens x target aux hidden size x live requests.
+    g0_prompt_tail_tokens: int = 512
     # Per-round multiplicative decay of per-request evidence toward the
     # global prior while the request receives no fresh confidence/accept
     # update (g=0 rounds generate neither). 0.97 ~= a 32-round time
@@ -335,6 +352,25 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
             f"got {chunk_tokens!r}"
         )
     out.g0_catch_up_chunk_tokens = chunk_tokens
+
+    defer_prefill = cfg.get("g0_defer_prefill", out.g0_defer_prefill)
+    if not isinstance(defer_prefill, bool):
+        raise ValueError(
+            f"priced policy: g0_defer_prefill must be a bool, got {defer_prefill!r}"
+        )
+    out.g0_defer_prefill = defer_prefill
+
+    tail_tokens = cfg.get("g0_prompt_tail_tokens", out.g0_prompt_tail_tokens)
+    if (
+        not isinstance(tail_tokens, int)
+        or isinstance(tail_tokens, bool)
+        or tail_tokens < 1
+    ):
+        raise ValueError(
+            "priced policy: g0_prompt_tail_tokens must be an int >= 1, "
+            f"got {tail_tokens!r}"
+        )
+    out.g0_prompt_tail_tokens = tail_tokens
 
     evidence_decay = cfg.get("evidence_decay", out.evidence_decay)
     if not isinstance(evidence_decay, (int, float)) or not (
@@ -531,7 +567,9 @@ class PricedSpeculativeParams:
             f"evidence_decay={self._cfg.evidence_decay}, "
             f"confidence_modulation={self._cfg.confidence_modulation}, "
             f"max_switch_distance={self._cfg.max_switch_distance}, "
-            f"g0_catch_up_chunk_tokens={self._cfg.g0_catch_up_chunk_tokens}"
+            f"g0_catch_up_chunk_tokens={self._cfg.g0_catch_up_chunk_tokens}, "
+            f"g0_defer_prefill={self._cfg.g0_defer_prefill}, "
+            f"g0_prompt_tail_tokens={self._cfg.g0_prompt_tail_tokens}"
         )
 
     # -- Step-policy interface (shared with AdaptiveSpeculativeParams) --
@@ -549,6 +587,18 @@ class PricedSpeculativeParams:
     def g0_catch_up_chunk_tokens(self) -> int:
         """Max gap tokens per drafter catch-up extend after a g=0 phase."""
         return self._cfg.g0_catch_up_chunk_tokens
+
+    @property
+    def g0_defer_prefill(self) -> bool:
+        """Whether requests admitted while parked at g=0 skip the drafter
+        prefill-extend (prompt-tail buffering + catch-up on re-entry)."""
+        return self._cfg.g0_defer_prefill
+
+    @property
+    def g0_prompt_tail_tokens(self) -> int:
+        """Max trailing prompt positions buffered per deferred-prefill
+        request."""
+        return self._cfg.g0_prompt_tail_tokens
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
