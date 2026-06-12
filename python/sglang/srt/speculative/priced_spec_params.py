@@ -130,6 +130,14 @@ class PricedPolicyConfig:
     # g=0 (speculation-off) only: max tokens buffered per request for the
     # drafter catch-up before the worker force-flushes a catch-up extend.
     g0_max_gap: int = 1024
+    # Offline-calibrated E[num_correct_drafts | g] for g = 1..len (the trace
+    # bank's e-curve). Online estimators DECAY TOWARD calibrated truth
+    # (this curve; the cost table) with per-round factor estimator_decay:
+    # a transient that poisons an estimator the policy then avoids would
+    # otherwise freeze forever and self-confirm (observed: realized E at
+    # g=4 stuck at 0.039 vs 0.91 measured; cost EMAs physically backwards).
+    acceptance_prior_curve: list[float] | None = None
+    estimator_decay: float = 0.995
     # g=0 only: max gap tokens per drafter catch-up extend. The drain is
     # partitioned into sequential extends of at most this many tokens so a
     # large-batch re-entry cannot OOM on activations (observed at
@@ -219,6 +227,26 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
             f"priced policy: g0_max_gap must be an int >= 1, got {g0_max_gap!r}"
         )
     out.g0_max_gap = g0_max_gap
+
+    curve = cfg.get("acceptance_prior_curve", out.acceptance_prior_curve)
+    if curve is not None:
+        if (
+            not isinstance(curve, list)
+            or not curve
+            or not all(isinstance(v, (int, float)) and v >= 0.0 for v in curve)
+        ):
+            raise ValueError(
+                "priced policy: acceptance_prior_curve must be a non-empty list "
+                f"of E[num_correct_drafts | g] floats >= 0 for g=1.., got {curve!r}"
+            )
+        out.acceptance_prior_curve = [float(v) for v in curve]
+
+    est_decay = cfg.get("estimator_decay", out.estimator_decay)
+    if not isinstance(est_decay, (int, float)) or not (0.0 < est_decay <= 1.0):
+        raise ValueError(
+            f"priced policy: estimator_decay must be in (0, 1], got {est_decay!r}"
+        )
+    out.estimator_decay = float(est_decay)
 
     chunk_tokens = cfg.get("g0_catch_up_chunk_tokens", out.g0_catch_up_chunk_tokens)
     if not isinstance(chunk_tokens, int) or chunk_tokens < 1:
@@ -354,6 +382,10 @@ class PricedSpeculativeParams:
         # realized num_correct_drafts per round at that g. Anchors the
         # acceptance model (see module docstring).
         self._realized_correct_ema: dict[int, float] = {}
+        # Last-update round stamps: reads decay estimators toward calibrated
+        # truth (curve / table) by estimator_decay^age.
+        self._realized_round: dict[int, int] = {}
+        self._cost_ema_round: dict[tuple[int, int], int] = {}
         # Rolling modulation baseline: num_steps -> EMA of round-mean chain
         # signals, maintained across rounds. Normalizing against the
         # same-round batch mean instead makes modulation identically 1.0 at
@@ -479,6 +511,7 @@ class PricedSpeculativeParams:
                 if prev is None
                 else (1.0 - ema_alpha) * prev + ema_alpha * mean_correct_drafts
             )
+            self._realized_round[num_steps] = self._round_ct
         for rid, num_correct_drafts in zip(rids, num_correct_drafts_per_req):
             state = self._touch(rid)
             rate = min(max(num_correct_drafts / num_steps, 0.0), 1.0)
@@ -698,18 +731,53 @@ class PricedSpeculativeParams:
         nearest sampled g (invert its EMA into a constant per-position accept
         rate, extend that chain to *steps*). ``None`` before any realized data.
         """
+        curve = self._curve_expected(steps)
         if not self._realized_correct_ema:
-            return None
-        exact = self._realized_correct_ema.get(steps)
+            return curve  # calibrated truth (None without a curve)
+        exact = self._anchor_read(steps)
         if exact is not None:
             return max(exact, 0.0)
         nearest_steps = min(
             self._realized_correct_ema, key=lambda g: (abs(g - steps), g)
         )
         implied_rate = _implied_accept_rate(
-            self._realized_correct_ema[nearest_steps], nearest_steps
+            self._anchor_read(nearest_steps), nearest_steps
         )
-        return _geometric_expected(implied_rate, steps)
+        interpolated = _geometric_expected(implied_rate, steps)
+        # With a calibrated curve, cross-g interpolation only modulates it.
+        if curve is not None:
+            base = self._curve_expected(nearest_steps)
+            if base and base > 0:
+                ratio = min(max(interpolated / _geometric_expected(
+                    _implied_accept_rate(base, nearest_steps), steps
+                ), 0.25), 4.0)
+                return curve * ratio
+        return interpolated
+
+    def _curve_expected(self, steps: int) -> float | None:
+        """E[num_correct_drafts | steps] from the calibrated prior curve;
+        chain-extends past the curve's depth from its last point."""
+        curve = self._cfg.acceptance_prior_curve
+        if not curve or steps <= 0:
+            return None if not curve else 0.0
+        if steps <= len(curve):
+            return curve[steps - 1]
+        rate = _implied_accept_rate(curve[-1], len(curve))
+        return _geometric_expected(rate, steps)
+
+    def _anchor_read(self, steps: int) -> float | None:
+        """Realized-accept EMA at *steps*, decayed toward the calibrated
+        curve by estimator_decay^age (frozen garbage must wash out)."""
+        ema = self._realized_correct_ema.get(steps)
+        if ema is None:
+            return None
+        base = self._curve_expected(steps)
+        decay = self._cfg.estimator_decay
+        if base is None or decay >= 1.0:
+            return ema
+        age = max(self._round_ct - self._realized_round.get(steps, self._round_ct), 0)
+        w = decay**age
+        return base + (ema - base) * w
 
     def _chain_correct_drafts(self, rid: str, steps: int) -> float:
         """Per-request chain E[num_correct_drafts | steps] (no bonus).
@@ -748,10 +816,14 @@ class PricedSpeculativeParams:
 
     def _decay_target_rate(self) -> float:
         """Per-position rate that stale evidence reverts to: implied by the
-        realized accept curve at its deepest sampled g, else the prior."""
+        calibrated curve when present, else the deepest realized g, else
+        the prior."""
+        curve = self._cfg.acceptance_prior_curve
+        if curve:
+            return _implied_accept_rate(curve[-1], len(curve))
         if self._realized_correct_ema:
             g = max(self._realized_correct_ema)
-            return _implied_accept_rate(self._realized_correct_ema[g], g)
+            return _implied_accept_rate(self._anchor_read(g), g)
         return self._cfg.prior_accept_rate
 
     def _staleness_decay(self, state: _RequestState) -> float:
@@ -791,6 +863,27 @@ class PricedSpeculativeParams:
         self._cost_ema[key] = (
             gap if prev is None else (1.0 - ema_alpha) * prev + ema_alpha * gap
         )
+        self._cost_ema_round[key] = self._round_ct
+
+    def _cost_ema_read(self, key: tuple[int, int]) -> float | None:
+        """Cost EMA decayed toward the calibrated table by estimator_decay^age.
+
+        A transient-poisoned EMA at a config the policy then avoids would
+        otherwise freeze and self-confirm (observed: cost(B=23, g=2) stuck
+        at 59 ms vs 21 ms measured, while evidence-beats-optimism blocked
+        the honest table).
+        """
+        ema = self._cost_ema.get(key)
+        if ema is None:
+            return None
+        decay = self._cfg.estimator_decay
+        if decay >= 1.0 or not self._cost_table:
+            return ema
+        base = self._table_cost(key[0], key[1])
+        if base is None or base <= 0:
+            return ema
+        age = max(self._round_ct - self._cost_ema_round.get(key, self._round_ct), 0)
+        return base + (ema - base) * decay**age
 
     def _step_cost(self, batch_size: int, steps: int) -> float:
         """Corrected cost: realized-gap EMA when available, else derived
@@ -801,7 +894,7 @@ class PricedSpeculativeParams:
         default makes the argmax meaningless (observed on first GPU run).
         """
         bucket = self._cost_bucket(batch_size)
-        ema = self._cost_ema.get((bucket, steps))
+        ema = self._cost_ema_read((bucket, steps))
         if ema is not None:
             return ema
 
@@ -815,7 +908,9 @@ class PricedSpeculativeParams:
         derived: float | None = None
         if self._cost_ema:
             same_g = [
-                (b, c) for (b, g), c in self._cost_ema.items() if g == steps
+                (b, self._cost_ema_read((b, g)))
+                for (b, g) in self._cost_ema
+                if g == steps
             ]
             if same_g:
                 log_b = math.log(max(bucket, 1))
@@ -835,7 +930,9 @@ class PricedSpeculativeParams:
                 derived = c_near * ratio
             else:
                 same_bucket = [
-                    (g, c) for (b, g), c in self._cost_ema.items() if b == bucket
+                    (g, self._cost_ema_read((b, g)))
+                    for (b, g) in self._cost_ema
+                    if b == bucket
                 ]
                 if same_bucket:
                     g_near, c_near = min(
