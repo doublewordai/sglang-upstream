@@ -1078,6 +1078,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         int(batch.seq_lens_sum) if batch.seq_lens_sum is not None else -1
                     ),
                     confidences=confidences,
+                    worker_round_idx=self._forward_round_ct,
                 )
             if policy_wants_confidences and rids is not None:
                 self.adaptive_controller.observe_draft_confidences(

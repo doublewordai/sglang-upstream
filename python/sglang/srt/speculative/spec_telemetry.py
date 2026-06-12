@@ -52,9 +52,15 @@ class SpecTelemetry:
         num_draft_tokens: int,
         seq_lens_sum: int,
         confidences: Optional[List[List[float]]] = None,
+        worker_round_idx: Optional[int] = None,
     ) -> int:
         """Log the worker-side half of a decode round. Returns the step index
-        used to join with the processor-side half."""
+        used to join with the processor-side half.
+
+        ``worker_round_idx`` counts ALL worker rounds including prefill, so
+        the offline fitter can reject decode-round pairs with a prefill in
+        between (whose wall gap includes the prefill, not just the step).
+        """
         step_idx = self._step_ct
         self._step_ct += 1
         record = {
@@ -66,6 +72,8 @@ class SpecTelemetry:
             "ndt": num_draft_tokens,
             "sls": seq_lens_sum,
         }
+        if worker_round_idx is not None:
+            record["ri"] = worker_round_idx
         if confidences is not None:
             record["conf"] = confidences
         self._write(record)
