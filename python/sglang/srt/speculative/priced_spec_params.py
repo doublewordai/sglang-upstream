@@ -97,6 +97,10 @@ logger = logging.getLogger(__name__)
 _SWITCH_LOG_FIRST = 10
 _SWITCH_LOG_EVERY = 50
 
+# Cost is attributed as a window mean over this many uniform-config policy
+# invocations (see _observe_round_gap).
+_COST_WINDOW = 8
+
 _COST_TABLE_COLUMNS = ("batch_size", "num_draft_tokens", "step_seconds")
 
 # Flat early-exit stop price (expected correct drafts per drafter step) used
@@ -440,6 +444,8 @@ class PricedSpeculativeParams:
         # truth (curve / table) by estimator_decay^age.
         self._realized_round: dict[int, int] = {}
         self._cost_ema_round: dict[tuple[int, int], int] = {}
+        # (round_idx, t, prev cost key) ring for window-mean attribution.
+        self._cost_window: list = []
         # Rolling modulation baseline: num_steps -> EMA of round-mean chain
         # signals, maintained across rounds. Normalizing against the
         # same-round batch mean instead makes modulation identically 1.0 at
@@ -982,27 +988,54 @@ class PricedSpeculativeParams:
     # -- Cost internals --
 
     def _observe_round_gap(self, now: float, round_idx: int | None) -> None:
-        """Attribute the wall gap since the previous policy invocation to the
-        previous round's (B-bucket, num_steps), but only when the two
-        invocations were consecutive worker rounds (both decode)."""
-        if (
-            round_idx is None
-            or self._last_round_idx is None
-            or round_idx != self._last_round_idx + 1
-            or self._last_round_t is None
-            or self._last_round_cost_key is None
-        ):
+        """Fold WINDOW-MEAN effective round cost into the cost EMA.
+
+        Per-pair wall gaps are dishonest in both tails: under overlap
+        run-ahead at high batch the host dispatches rounds back-to-back, so
+        consecutive-pair gaps measure dispatch rate, not execution (observed
+        online at B=62: a k=4 cost EMA of 15.6 ms vs ~40 ms real, while
+        RUNNING k=4 — the same artifact the offline fitter hit). Instead:
+        when the last ``_COST_WINDOW`` policy invocations all executed the
+        same (bucket, steps) key, attribute mean cost = (t_now − t_first) /
+        (worker rounds spanned). The denominator counts prefill rounds, so a
+        config's k-dependent prefill surcharge (draft-extend) is priced in —
+        the throughput-relevant effective cost. Switch rounds clear the key
+        (None breaks window uniformity), excluding swap transients by
+        construction.
+        """
+        if round_idx is None:
+            self._cost_window.clear()
             return
-        gap = now - self._last_round_t
-        if gap <= 0.0:
+        # The PREVIOUS invocation's key describes the round whose cost the
+        # gap to ``now`` reflects; executed-depth corrections (early exit)
+        # were applied to it via observe_round_executed_steps.
+        self._cost_window.append((round_idx, now, self._last_round_cost_key))
+        if len(self._cost_window) > _COST_WINDOW + 1:
+            self._cost_window.pop(0)
+        if len(self._cost_window) < _COST_WINDOW + 1:
             return
-        key = self._last_round_cost_key
+        first = self._cost_window[0]
+        keys = {e[2] for e in self._cost_window[:-1]}
+        if len(keys) != 1 or None in keys:
+            return
+        ri_span = round_idx - first[0]
+        if ri_span < _COST_WINDOW:
+            return
+        mean_cost = (now - first[1]) / ri_span
+        if mean_cost <= 0.0:
+            return
+        key = next(iter(keys))
         prev = self._cost_ema.get(key)
         ema_alpha = self._cfg.ema_alpha
         self._cost_ema[key] = (
-            gap if prev is None else (1.0 - ema_alpha) * prev + ema_alpha * gap
+            mean_cost
+            if prev is None
+            else (1.0 - ema_alpha) * prev + ema_alpha * mean_cost
         )
         self._cost_ema_round[key] = self._round_ct
+        # Slide by half a window so successive updates aren't fully
+        # correlated samples of the same span.
+        del self._cost_window[: _COST_WINDOW // 2]
 
     def _cost_ema_read(self, key: tuple[int, int]) -> float | None:
         """Cost EMA decayed toward the calibrated table by estimator_decay^age.

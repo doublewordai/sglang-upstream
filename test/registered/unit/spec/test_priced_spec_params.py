@@ -277,7 +277,10 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
         with mock.patch("time.perf_counter", new=lambda: clock["t"]):
             policy = PricedSpeculativeParams(initial_steps=1, cfg=cfg)
             chosen = []
-            for round_idx in range(1, 13):
+            # Window-mean attribution needs a full uniform window before the
+            # EMA sees its first sample, so the wrong-table phase lasts about
+            # one window rather than one round.
+            for round_idx in range(1, 40):
                 steps = policy.get_steps_for_batch(
                     1, rids=["r0"], round_idx=round_idx
                 )
@@ -286,7 +289,7 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
 
         self.assertEqual(chosen[0], 4)  # trusted the wrong table
         self.assertTrue(
-            all(steps == 1 for steps in chosen[2:]),
+            all(steps == 1 for steps in chosen[-10:]),
             f"online correction did not stick: {chosen}",
         )
 
@@ -322,9 +325,12 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
         clock = {"t": 0.0}
         with mock.patch("time.perf_counter", new=lambda: clock["t"]):
             policy = PricedSpeculativeParams(initial_steps=1, cfg=cfg)
-            policy.get_steps_for_batch(1, rids=["r0"], round_idx=1)
-            clock["t"] += 0.010  # realized 10 ms at (1, g=1)
-            policy.get_steps_for_batch(1, rids=["r0"], round_idx=2)
+            # Window-mean attribution: a full uniform window of 10 ms rounds.
+            from priced_spec_params import _COST_WINDOW
+
+            for i in range(_COST_WINDOW + 2):
+                policy.get_steps_for_batch(1, rids=["r0"], round_idx=1 + i)
+                clock["t"] += 0.010  # realized 10 ms at (1, g=1)
         # (1, g=4) unseen: expect 10 ms * (4+1)/(1+1) = 25 ms, not 1.0 s.
         self.assertAlmostEqual(policy._step_cost(1, 4), 0.025, places=3)
 

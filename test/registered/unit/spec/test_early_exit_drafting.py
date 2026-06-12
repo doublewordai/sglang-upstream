@@ -275,12 +275,16 @@ class TestExecutedDepthCostAttribution(EarlyExitPolicyTestBase):
     round's wall-gap attribution to the depth that actually ran."""
 
     def _run_two_rounds(self, params, executed_steps=None):
-        params.get_steps_for_batch(1, round_idx=10)
-        if executed_steps is not None:
-            params.observe_round_executed_steps(executed_steps)
-        # Consecutive round indices: the wall gap since round 10 is folded
-        # into the cost EMA under round 10's (bucket, steps) key.
-        params.get_steps_for_batch(1, round_idx=11)
+        # Cost attribution is a WINDOW mean: it takes a full window of
+        # uniform-key consecutive rounds before the EMA receives a sample
+        # (see _observe_round_gap), so drive window+1 rounds, applying the
+        # same executed-depth correction each round.
+        from priced_spec_params import _COST_WINDOW
+
+        for i in range(_COST_WINDOW + 2):
+            params.get_steps_for_batch(1, round_idx=10 + i)
+            if executed_steps is not None:
+                params.observe_round_executed_steps(executed_steps)
 
     def test_depth0_skip_keys_the_gap_at_steps_zero(self):
         params = self._params([0, 4])
