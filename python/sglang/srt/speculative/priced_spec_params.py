@@ -849,12 +849,20 @@ class PricedSpeculativeParams:
         if (
             round_idx is None
             or self._last_round_idx is None
-            or round_idx != self._last_round_idx + 1
             or self._last_round_t is None
             or self._last_round_cost_key is None
         ):
             return
-        gap = now - self._last_round_t
+        span = round_idx - self._last_round_idx
+        # Spanning gaps (prefill rounds in between) are ATTRIBUTED, not
+        # skipped: spec configs pay a k-dependent draft-extend on every
+        # prefill that a decode-only gap estimator never sees (measured:
+        # effective round cost ~2x the pure-decode gap at k=4, conc 64 on
+        # ShareGPT — the policy must price the cost its choice actually
+        # induces). Normalize by span; cap so idle stretches stay out.
+        if span < 1 or span > 4:
+            return
+        gap = (now - self._last_round_t) / span
         if gap <= 0.0:
             return
         key = self._last_round_cost_key
