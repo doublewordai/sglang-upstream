@@ -772,10 +772,20 @@ class PricedSpeculativeParams:
             ]
             if same_g:
                 log_b = math.log(max(bucket, 1))
-                _, c_near = min(
+                b_near, c_near = min(
                     same_g, key=lambda bc: abs(math.log(max(bc[0], 1)) - log_b)
                 )
-                derived = c_near
+                # Transfer across buckets via the TABLE's measured B-shape
+                # at this g (rank-1 cost model): raw transfer applied bucket-1
+                # evidence (~9 ms) at bucket 256 (real ~100 ms) and priced a
+                # probe festival. Clamp the ratio for off-table sanity.
+                ratio = 1.0
+                if self._cost_table:
+                    t_here = self._table_cost(bucket, steps)
+                    t_near = self._table_cost(b_near, steps)
+                    if t_here > 0 and t_near > 0:
+                        ratio = min(max(t_here / t_near, 0.25), 32.0)
+                derived = c_near * ratio
             else:
                 same_bucket = [
                     (g, c) for (b, g), c in self._cost_ema.items() if b == bucket
