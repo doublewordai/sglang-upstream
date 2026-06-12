@@ -22,7 +22,10 @@ except ImportError:  # local dep-light runs; CI parses this call via AST anyway
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 try:
-    from sglang.srt.speculative.g0_gap_buffer import G0GapBuffer
+    from sglang.srt.speculative.g0_gap_buffer import (
+        G0GapBuffer,
+        partition_catch_up_chunks,
+    )
 except ImportError:
     _MODULE_PATH = (
         Path(__file__).resolve().parents[4]
@@ -37,6 +40,7 @@ except ImportError:
     sys.modules[_spec.name] = _mod
     _spec.loader.exec_module(_mod)
     G0GapBuffer = _mod.G0GapBuffer
+    partition_catch_up_chunks = _mod.partition_catch_up_chunks
 
 
 class TestAppend(unittest.TestCase):
@@ -120,6 +124,68 @@ class TestRetainDrop(unittest.TestCase):
         buf.drain(["a"])
         buf.append_round(["a"], [2], [2])
         self.assertEqual(buf.drain(["a"]), {"a": [(2, 2)]})
+
+
+class TestPartitionCatchUpChunks(unittest.TestCase):
+    """Token-budgeted partition of drained gaps into sequential catch-up
+    extends (one unbounded extend over a 256-request batch's accumulated
+    gaps OOMed on activations — the catch-up must be chunked)."""
+
+    def _check_invariants(self, gap_lens, chunks, budget):
+        # Every chunk respects the budget.
+        for chunk in chunks:
+            self.assertLessEqual(sum(length for _, _, length in chunk), budget)
+            # A rid appears at most once per chunk (ForwardBatch rows are
+            # per-request).
+            rids = [rid for rid, _, _ in chunk]
+            self.assertEqual(len(rids), len(set(rids)))
+        # Per rid: slices are contiguous, in order across chunks, and cover
+        # the whole gap exactly once.
+        flat = [s for chunk in chunks for s in chunk]
+        for rid, gap_len in gap_lens:
+            slices = [(start, length) for r, start, length in flat if r == rid]
+            expect_start = 0
+            for start, length in slices:
+                self.assertEqual(start, expect_start)
+                self.assertGreater(length, 0)
+                expect_start += length
+            self.assertEqual(expect_start, gap_len)
+
+    def test_everything_fits_in_one_chunk(self):
+        gap_lens = [("a", 3), ("b", 2)]
+        chunks = partition_catch_up_chunks(gap_lens, 8)
+        self.assertEqual(chunks, [[("a", 0, 3), ("b", 0, 2)]])
+
+    def test_requests_split_across_chunks_at_the_budget(self):
+        gap_lens = [("a", 3), ("b", 2)]
+        chunks = partition_catch_up_chunks(gap_lens, 4)
+        self.assertEqual(
+            chunks, [[("a", 0, 3), ("b", 0, 1)], [("b", 1, 1)]]
+        )
+        self._check_invariants(gap_lens, chunks, 4)
+
+    def test_single_gap_larger_than_budget_is_split_in_order(self):
+        gap_lens = [("a", 10)]
+        chunks = partition_catch_up_chunks(gap_lens, 4)
+        self.assertEqual(
+            chunks, [[("a", 0, 4)], [("a", 4, 4)], [("a", 8, 2)]]
+        )
+
+    def test_many_requests_keep_per_rid_ordering(self):
+        gap_lens = [("a", 5), ("b", 1), ("c", 7), ("d", 3)]
+        chunks = partition_catch_up_chunks(gap_lens, 4)
+        self._check_invariants(gap_lens, chunks, 4)
+
+    def test_zero_length_gaps_are_skipped(self):
+        chunks = partition_catch_up_chunks([("a", 0), ("b", 2)], 4)
+        self.assertEqual(chunks, [[("b", 0, 2)]])
+
+    def test_empty_input_yields_no_chunks(self):
+        self.assertEqual(partition_catch_up_chunks([], 4), [])
+
+    def test_budget_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            partition_catch_up_chunks([("a", 1)], 0)
 
 
 if __name__ == "__main__":

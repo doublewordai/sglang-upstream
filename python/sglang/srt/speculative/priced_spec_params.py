@@ -31,13 +31,44 @@ Cost model ``C(B, g)``:
     leak in — see the campaign worklog. EMA overrides the table once a
     bucket has at least one sample.
 
-Acceptance model ``E_i[num_correct_drafts | g] = sum_{d=1..g} prod_{j<=d} a_hat[i][j]``
-with ``a_hat[i][j]`` sourced in priority order from:
-  1. the request's most recent per-position draft-token confidences
-     (positions past the recorded length reuse the last position's value),
-  2. a per-request EMA of the position-averaged accept rate observed from
-     realized ``num_correct_drafts`` (a scalar alpha_i, ``E = sum_d alpha_i^d``),
-  3. a global prior (config key ``"prior_accept_rate"``).
+Acceptance model. Two layers:
+
+  1. A *global realized anchor*: an EMA per g of the mean realized
+     ``num_correct_drafts`` per round (updated in ``on_verify_complete``
+     for the g that actually ran). For a g with no direct sample, the
+     anchor is derived by chain interpolation: invert the nearest
+     sampled g's anchor into a constant per-position accept rate, then
+     extend that chain to the queried g. Raw per-position confidence
+     products systematically overstate deep-chain returns (measured on
+     GH200: E[correct|8] - E[correct|4] = +0.15 realized, while a
+     0.9^d chain predicts far more), so confidences never set the level.
+  2. A *per-request chain signal* ``chain_i(g) = sum_{d=1..g} prod_{j<=d}
+     a_hat[i][j]`` with ``a_hat[i][j]`` sourced in priority order from:
+       a. the request's most recent per-position draft-token confidences
+          (positions past the recorded length reuse the last position's value),
+       b. a per-request EMA of the position-averaged accept rate observed from
+          realized ``num_correct_drafts`` (a scalar alpha_i, ``E = sum_d alpha_i^d``),
+       c. a global prior (config key ``"prior_accept_rate"``).
+
+When the anchor has any realized data, the per-request expectation is
+``E_global(g) * clamp(chain_i(g) / chain_mean(g), 1/MOD, MOD)`` with
+``chain_mean`` the batch mean of the chain signal and MOD the config key
+``"confidence_modulation"``: per-request signal modulates *around* the
+realized level instead of free-running. Before any realized data the
+chain signal is used directly (layer 2 alone).
+
+Evidence staleness: g=0 rounds produce no confidences and no accepts, so
+per-request evidence would freeze (frozen pessimistic evidence makes g=0
+absorbing — observed at concurrency 4 on the first GH200 grid). Each
+request's evidence therefore decays toward the global prior by
+``"evidence_decay"`` per policy round without a fresh update, applied
+lazily at read time via a per-request last-updated round stamp.
+
+Switching is *laddered*: each switch moves at most
+``"max_switch_distance"`` indices through the sorted candidate list, so
+e.g. 0 -> 8 in {0,1,2,3,4,8} takes successive cooldown windows via
+0 -> 2 -> 4 -> 8. This bounds the g=0 catch-up gap drained per switch and
+prevents cliff-edge state swaps.
 
 This module intentionally imports only the standard library at module
 scope so pure-CPU unit tests can import it without torch/GPU deps.
@@ -93,6 +124,23 @@ class PricedPolicyConfig:
     # g=0 (speculation-off) only: max tokens buffered per request for the
     # drafter catch-up before the worker force-flushes a catch-up extend.
     g0_max_gap: int = 1024
+    # g=0 only: max gap tokens per drafter catch-up extend. The drain is
+    # partitioned into sequential extends of at most this many tokens so a
+    # large-batch re-entry cannot OOM on activations (observed at
+    # concurrency 256 on GH200: one eager extend over every running
+    # request's accumulated gap crashed the server).
+    g0_catch_up_chunk_tokens: int = 4096
+    # Per-round multiplicative decay of per-request evidence toward the
+    # global prior while the request receives no fresh confidence/accept
+    # update (g=0 rounds generate neither). 0.97 ~= a 32-round time
+    # constant; 1.0 disables decay.
+    evidence_decay: float = 0.97
+    # Clamp on how far the per-request chain signal may modulate the
+    # global realized-acceptance anchor: ratio in [1/MOD, MOD].
+    confidence_modulation: float = 2.0
+    # Max candidate-index distance a single switch may move through the
+    # sorted candidate list (ladder switching).
+    max_switch_distance: int = 2
 
 
 def load_priced_config(cfg: dict) -> PricedPolicyConfig:
@@ -166,6 +214,38 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
         )
     out.g0_max_gap = g0_max_gap
 
+    chunk_tokens = cfg.get("g0_catch_up_chunk_tokens", out.g0_catch_up_chunk_tokens)
+    if not isinstance(chunk_tokens, int) or chunk_tokens < 1:
+        raise ValueError(
+            "priced policy: g0_catch_up_chunk_tokens must be an int >= 1, "
+            f"got {chunk_tokens!r}"
+        )
+    out.g0_catch_up_chunk_tokens = chunk_tokens
+
+    evidence_decay = cfg.get("evidence_decay", out.evidence_decay)
+    if not isinstance(evidence_decay, (int, float)) or not (
+        0.0 < evidence_decay <= 1.0
+    ):
+        raise ValueError(
+            f"priced policy: evidence_decay must be in (0, 1], got {evidence_decay!r}"
+        )
+    out.evidence_decay = float(evidence_decay)
+
+    modulation = cfg.get("confidence_modulation", out.confidence_modulation)
+    if not isinstance(modulation, (int, float)) or modulation < 1.0:
+        raise ValueError(
+            f"priced policy: confidence_modulation must be >= 1, got {modulation!r}"
+        )
+    out.confidence_modulation = float(modulation)
+
+    max_switch_distance = cfg.get("max_switch_distance", out.max_switch_distance)
+    if not isinstance(max_switch_distance, int) or max_switch_distance < 1:
+        raise ValueError(
+            "priced policy: max_switch_distance must be an int >= 1, "
+            f"got {max_switch_distance!r}"
+        )
+    out.max_switch_distance = max_switch_distance
+
     return out
 
 
@@ -211,13 +291,16 @@ def load_cost_table(path: str) -> dict[tuple[int, int], float]:
 class _RequestState:
     """Per-request acceptance evidence, LRU-bounded by the owning policy."""
 
-    __slots__ = ("accept_rate_ema", "last_confidences")
+    __slots__ = ("accept_rate_ema", "last_confidences", "last_update_round")
 
     def __init__(self):
         # Position-averaged per-draft accept rate (paper alpha, no bonus).
         self.accept_rate_ema: float | None = None
         # Per-position draft-token confidences from the most recent round.
         self.last_confidences: list[float] | None = None
+        # Policy round of the last fresh confidence/accept update; staleness
+        # decay toward the prior is applied lazily at read time from this.
+        self.last_update_round: int = 0
 
 
 class PricedSpeculativeParams:
@@ -261,6 +344,10 @@ class PricedSpeculativeParams:
         # Online-corrected costs: (B-bucket, num_steps) -> EMA of realized
         # wall gaps between consecutive decode rounds.
         self._cost_ema: dict[tuple[int, int], float] = {}
+        # Global realized accept curve: num_steps -> EMA of the batch-mean
+        # realized num_correct_drafts per round at that g. Anchors the
+        # acceptance model (see module docstring).
+        self._realized_correct_ema: dict[int, float] = {}
 
         self._cuda_graph_bs: list[int] | None = None
         self._reqs: OrderedDict[str, _RequestState] = OrderedDict()
@@ -281,7 +368,11 @@ class PricedSpeculativeParams:
             f"switch_margin={self._cfg.switch_margin}, "
             f"ema_alpha={self._cfg.ema_alpha}, "
             f"warmup_rounds={self._cfg.warmup_rounds}, "
-            f"max_tracked_requests={self._cfg.max_tracked_requests}"
+            f"max_tracked_requests={self._cfg.max_tracked_requests}, "
+            f"evidence_decay={self._cfg.evidence_decay}, "
+            f"confidence_modulation={self._cfg.confidence_modulation}, "
+            f"max_switch_distance={self._cfg.max_switch_distance}, "
+            f"g0_catch_up_chunk_tokens={self._cfg.g0_catch_up_chunk_tokens}"
         )
 
     # -- Step-policy interface (shared with AdaptiveSpeculativeParams) --
@@ -294,6 +385,11 @@ class PricedSpeculativeParams:
     def g0_max_gap(self) -> int:
         """Per-request drafter-gap cap during g=0 (speculation-off) phases."""
         return self._cfg.g0_max_gap
+
+    @property
+    def g0_catch_up_chunk_tokens(self) -> int:
+        """Max gap tokens per drafter catch-up extend after a g=0 phase."""
+        return self._cfg.g0_catch_up_chunk_tokens
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
@@ -343,7 +439,8 @@ class PricedSpeculativeParams:
         rids: list[str] | None = None,
         num_steps: int | None = None,
     ) -> int | None:
-        """Fold realized correct-draft counts into per-request accept-rate EMAs.
+        """Fold realized correct-draft counts into per-request accept-rate EMAs
+        and into the global realized accept curve at the g that ran.
 
         Never requests an immediate switch (always returns ``None``); step
         decisions happen at the next ``get_steps_for_batch``.
@@ -351,6 +448,16 @@ class PricedSpeculativeParams:
         if not rids or not num_steps or num_steps <= 0:
             return None
         ema_alpha = self._cfg.ema_alpha
+        if num_correct_drafts_per_req:
+            mean_correct_drafts = sum(num_correct_drafts_per_req) / len(
+                num_correct_drafts_per_req
+            )
+            prev = self._realized_correct_ema.get(num_steps)
+            self._realized_correct_ema[num_steps] = (
+                mean_correct_drafts
+                if prev is None
+                else (1.0 - ema_alpha) * prev + ema_alpha * mean_correct_drafts
+            )
         for rid, num_correct_drafts in zip(rids, num_correct_drafts_per_req):
             state = self._touch(rid)
             rate = min(max(num_correct_drafts / num_steps, 0.0), 1.0)
@@ -360,6 +467,7 @@ class PricedSpeculativeParams:
                 state.accept_rate_ema = (
                     1.0 - ema_alpha
                 ) * state.accept_rate_ema + ema_alpha * rate
+            state.last_update_round = self._round_ct
         return None
 
     # -- Priced-only inputs --
@@ -387,7 +495,9 @@ class PricedSpeculativeParams:
         They become ``a_hat`` for each request in the NEXT round's decision.
         """
         for rid, conf in zip(rids, confidences):
-            self._touch(rid).last_confidences = conf
+            state = self._touch(rid)
+            state.last_confidences = conf
+            state.last_update_round = self._round_ct
 
     # -- Decision internals --
 
@@ -397,12 +507,27 @@ class PricedSpeculativeParams:
             < self._cfg.switch_cooldown_rounds
         ):
             return
-        goodputs = {
-            steps: self._goodput(batch_size, rids, steps)
-            for steps in self._available_steps
-        }
-        best = max(self._available_steps, key=lambda s: goodputs[s])
         current = self.current_steps
+        # Ladder switching: one switch moves at most max_switch_distance
+        # indices through the sorted candidate list. Distant configs are
+        # reached over successive cooldown windows (0 -> 2 -> 4 -> 8), which
+        # keeps every runtime-state swap incremental and bounds the g=0
+        # catch-up gap a single re-entry must drain.
+        try:
+            current_idx = self._available_steps.index(current)
+        except ValueError:  # defensive; current is kept inside available
+            current_idx = min(
+                range(len(self._available_steps)),
+                key=lambda i: abs(self._available_steps[i] - current),
+            )
+        max_distance = self._cfg.max_switch_distance
+        window = self._available_steps[
+            max(current_idx - max_distance, 0) : current_idx + max_distance + 1
+        ]
+        goodputs = {
+            steps: self._goodput(batch_size, rids, steps) for steps in window
+        }
+        best = max(window, key=lambda s: goodputs[s])
         if best == current or current not in goodputs:
             return
         # Hysteresis: runtime state swaps have cost, so only move when the
@@ -427,35 +552,109 @@ class PricedSpeculativeParams:
         self, batch_size: int, rids: list[str] | None, steps: int
     ) -> float:
         """Expected committed tokens per second at *steps* for this batch."""
-        if rids:
-            expected_correct_drafts = sum(
-                self._expected_correct_drafts(rid, steps) for rid in rids
-            )
-        else:
-            expected_correct_drafts = batch_size * _geometric_expected(
-                self._cfg.prior_accept_rate, steps
-            )
+        expected_correct_drafts = self._expected_correct_drafts_batch(
+            batch_size, rids, steps
+        )
         # Every request always commits the bonus token on top of its drafts.
         expected_accept_tokens = expected_correct_drafts + batch_size
         return expected_accept_tokens / self._step_cost(batch_size, steps)
 
-    def _expected_correct_drafts(self, rid: str, steps: int) -> float:
-        """E[num_correct_drafts | steps] for one request (drafts only, no bonus)."""
+    def _expected_correct_drafts_batch(
+        self, batch_size: int, rids: list[str] | None, steps: int
+    ) -> float:
+        """Batch E[num_correct_drafts | steps] (drafts only, no bonus).
+
+        With realized data anywhere on the accept curve, each request gets
+        ``E_global(steps) * clamp(chain_i / chain_mean, 1/MOD, MOD)``: the
+        realized anchor sets the level and the per-request chain signal only
+        modulates around it (raw confidence chains overstate deep-g returns).
+        Without realized data the chain signal is used directly.
+        """
+        if steps <= 0:
+            return 0.0
+        anchor = self._anchored_correct_drafts(steps)
+        if not rids:
+            if anchor is not None:
+                return batch_size * anchor
+            return batch_size * _geometric_expected(
+                self._cfg.prior_accept_rate, steps
+            )
+        chains = [self._chain_correct_drafts(rid, steps) for rid in rids]
+        if anchor is None:
+            return sum(chains)
+        chain_mean = sum(chains) / len(chains)
+        if chain_mean <= 0.0:
+            return anchor * len(chains)
+        modulation = self._cfg.confidence_modulation
+        return sum(
+            anchor
+            * min(max(chain / chain_mean, 1.0 / modulation), modulation)
+            for chain in chains
+        )
+
+    def _anchored_correct_drafts(self, steps: int) -> float | None:
+        """E_global[num_correct_drafts | steps] from the realized accept curve.
+
+        Exact EMA when this g has run; otherwise chain-interpolated from the
+        nearest sampled g (invert its EMA into a constant per-position accept
+        rate, extend that chain to *steps*). ``None`` before any realized data.
+        """
+        if not self._realized_correct_ema:
+            return None
+        exact = self._realized_correct_ema.get(steps)
+        if exact is not None:
+            return max(exact, 0.0)
+        nearest_steps = min(
+            self._realized_correct_ema, key=lambda g: (abs(g - steps), g)
+        )
+        implied_rate = _implied_accept_rate(
+            self._realized_correct_ema[nearest_steps], nearest_steps
+        )
+        return _geometric_expected(implied_rate, steps)
+
+    def _chain_correct_drafts(self, rid: str, steps: int) -> float:
+        """Per-request chain E[num_correct_drafts | steps] (no bonus).
+
+        Evidence priority: latest per-position confidences, then the
+        accept-rate EMA, then the global prior. Stale evidence (no fresh
+        update since ``last_update_round``) is decayed toward the prior by
+        ``evidence_decay`` per unupdated round, so g=0 phases — which
+        generate no updates — cannot freeze pessimistic evidence forever.
+        """
+        prior = self._cfg.prior_accept_rate
         state = self._reqs.get(rid)
         if state is None:
-            return _geometric_expected(self._cfg.prior_accept_rate, steps)
+            return _geometric_expected(prior, steps)
+        decay = self._staleness_decay(state)
         if state.last_confidences:
             conf = state.last_confidences
             total = 0.0
             chain_prob = 1.0
             for d in range(steps):
                 a_hat = conf[d] if d < len(conf) else conf[-1]
-                chain_prob *= min(max(a_hat, 0.0), 1.0)
+                a_hat = min(max(a_hat, 0.0), 1.0)
+                chain_prob *= prior + (a_hat - prior) * decay
                 total += chain_prob
             return total
         if state.accept_rate_ema is not None:
-            return _geometric_expected(state.accept_rate_ema, steps)
-        return _geometric_expected(self._cfg.prior_accept_rate, steps)
+            return _geometric_expected(
+                prior + (state.accept_rate_ema - prior) * decay, steps
+            )
+        return _geometric_expected(prior, steps)
+
+    def _staleness_decay(self, state: _RequestState) -> float:
+        """Multiplier in (0, 1] pulling stale evidence toward the prior.
+
+        A request updated for round N is fresh for the round N+1 decision;
+        each further round without an update compounds ``evidence_decay``.
+        """
+        evidence_decay = self._cfg.evidence_decay
+        if evidence_decay >= 1.0:
+            return 1.0
+        stale_rounds = self._round_ct - state.last_update_round - 1
+        if stale_rounds <= 0:
+            return 1.0
+        return evidence_decay**stale_rounds
 
     # -- Cost internals --
 
@@ -515,8 +714,17 @@ class PricedSpeculativeParams:
                     )
                     derived = c_near
 
-        # Optimism under uncertainty: take the cheapest available estimate.
-        # A never-observed configuration must stay reachable — pricing it
+        # Evidence beats optimism: once this g has a realized-gap EMA at ANY
+        # bucket, the derived estimate stands alone — re-applying the table's
+        # optimistic claim would resurrect configs that nearby-bucket
+        # evidence already refuted (observed at concurrency 64 on GH200:
+        # periodic k>0 probe excursions at ~3x step cost taxed a correct
+        # k=0 steady state below the no-spec bar).
+        if derived is not None and any(g == steps for (_, g) in self._cost_ema):
+            return derived
+
+        # Optimism under uncertainty, but only for never-visited g: a
+        # never-observed configuration must stay reachable — pricing it
         # only from the incumbent's scaled EMA can freeze the policy on the
         # incumbent forever (no exploration); the table's optimistic claim
         # triggers the probe whose realized gap then corrects the EMA.
@@ -574,6 +782,7 @@ class PricedSpeculativeParams:
         state = self._reqs.get(rid)
         if state is None:
             state = _RequestState()
+            state.last_update_round = self._round_ct
             self._reqs[rid] = state
             while len(self._reqs) > self._cfg.max_tracked_requests:
                 self._reqs.popitem(last=False)
@@ -588,3 +797,25 @@ def _geometric_expected(accept_rate: float, steps: int) -> float:
     if accept_rate >= 1.0:
         return float(steps)
     return accept_rate * (1.0 - accept_rate**steps) / (1.0 - accept_rate)
+
+
+def _implied_accept_rate(expected_correct_drafts: float, steps: int) -> float:
+    """Invert ``_geometric_expected``: the constant per-position accept rate
+    whose *steps*-deep chain yields *expected_correct_drafts*.
+
+    ``_geometric_expected(a, steps)`` is strictly increasing in ``a`` on
+    [0, 1] with range [0, steps], so a short bisection suffices.
+    """
+    target = min(max(expected_correct_drafts, 0.0), float(steps))
+    if target <= 0.0:
+        return 0.0
+    if target >= float(steps):
+        return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        if _geometric_expected(mid, steps) < target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0

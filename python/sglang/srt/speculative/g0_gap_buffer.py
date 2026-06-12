@@ -22,6 +22,46 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # the position (None for draft architectures that don't consume it).
 GapEntry = Tuple[Any, Optional[Any]]
 
+# One per-request slice of a catch-up chunk: (rid, start, length) into that
+# request's buffered gap entries.
+GapSlice = Tuple[str, int, int]
+
+
+def partition_catch_up_chunks(
+    gap_lens: Sequence[Tuple[str, int]], chunk_tokens: int
+) -> List[List[GapSlice]]:
+    """Partition drained gaps into catch-up extends of bounded token count.
+
+    Each returned chunk is a list of ``(rid, start, length)`` slices whose
+    lengths sum to at most *chunk_tokens*; the caller runs one drafter extend
+    per chunk, in order. Drafter KV writes are sequential per request, so a
+    request whose gap exceeds the budget is split across consecutive chunks
+    with its slices in position order (slice ``start`` is the offset into the
+    request's gap). A rid never appears twice within one chunk, and requests
+    keep their input order. Zero-length gaps are skipped.
+    """
+    if chunk_tokens < 1:
+        raise ValueError(f"chunk_tokens must be >= 1, got {chunk_tokens}")
+    chunks: List[List[GapSlice]] = []
+    current: List[GapSlice] = []
+    room = chunk_tokens
+    for rid, gap_len in gap_lens:
+        start = 0
+        remaining = gap_len
+        while remaining > 0:
+            if room == 0:
+                chunks.append(current)
+                current = []
+                room = chunk_tokens
+            take = min(remaining, room)
+            current.append((rid, start, take))
+            start += take
+            remaining -= take
+            room -= take
+    if current:
+        chunks.append(current)
+    return chunks
+
 
 class G0GapBuffer:
     """Bounded per-rid append/drain buffer of drafter catch-up pairs."""

@@ -77,12 +77,20 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
     def test_flat_costs_pick_largest_steps_with_perfect_acceptance(self):
         # (a) Flat cost surface: every extra correct draft is free, so the
         # goodput argmax is the largest candidate when acceptance is perfect.
+        # ADJUSTED for ladder switching (old behavior: one direct 1 -> 8
+        # jump): each switch moves at most max_switch_distance=2 candidate
+        # indices, so 1 -> 8 in [1, 2, 4, 8] now takes 1 -> 4 -> 8.
         cost_table = self._write_cost_table(
             [(1, g + 1, 0.01) for g in (1, 2, 4, 8)]
         )
         policy = PricedSpeculativeParams(
-            initial_steps=1, cfg=self._cfg([1, 2, 4, 8], cost_table=cost_table)
+            initial_steps=1,
+            cfg=self._cfg(
+                [1, 2, 4, 8], cost_table=cost_table, switch_cooldown_rounds=0
+            ),
         )
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["r0"]), 4)
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["r0"]), 8)
         self.assertEqual(policy.get_steps_for_batch(1, rids=["r0"]), 8)
 
     def test_cost_cliff_caps_steps_below_the_cliff(self):
@@ -116,6 +124,16 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
         )
         self.assertEqual(eager.get_steps_for_batch(1, rids=["r0"]), 3)
 
+    def _set_accept_rate_ema(self, policy, rid, rate):
+        """Seed a per-request accept-rate EMA WITHOUT touching the global
+        realized accept curve. ADJUSTED: on_verify_complete now also anchors
+        the acceptance model globally (its own tests live in
+        TestRealizedAnchor); these tests target the per-request chain path,
+        which only exists un-anchored."""
+        state = policy._touch(rid)
+        state.accept_rate_ema = rate
+        state.last_update_round = policy._round_ct
+
     def test_per_request_evidence_shifts_the_decision(self):
         # (d) Same policy, same costs: a low-acceptance request pins g=1, a
         # high-confidence request justifies g=4.
@@ -125,8 +143,8 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
             cfg=self._cfg([1, 4], cost_table=cost_table, switch_cooldown_rounds=0),
         )
 
-        # Realized rejections drive the low request's accept-rate EMA to 0.
-        policy.on_verify_complete([0], batch_size=1, rids=["lo"], num_steps=4)
+        # A rejection-heavy history pins the low request's accept rate at 0.
+        self._set_accept_rate_ema(policy, "lo", 0.0)
         self.assertEqual(policy.get_steps_for_batch(1, rids=["lo"]), 1)
 
         # High per-position confidences make the deep chain worth its cost.
@@ -134,6 +152,7 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
         self.assertEqual(policy.get_steps_for_batch(1, rids=["hi"]), 4)
 
         # Back to the low request: the policy drops down again.
+        self._set_accept_rate_ema(policy, "lo", 0.0)  # refresh the stamp
         self.assertEqual(policy.get_steps_for_batch(1, rids=["lo"]), 1)
 
     def test_confidences_take_priority_over_accept_rate_ema(self):
@@ -142,8 +161,8 @@ class TestGoodputDecision(PricedSpecParamsTestBase):
             initial_steps=1, cfg=self._cfg([1, 4], cost_table=cost_table)
         )
         # Bad realized history, then fresh high confidences: source priority
-        # says the most recent confidences win.
-        policy.on_verify_complete([0], batch_size=1, rids=["r0"], num_steps=4)
+        # inside the chain says the most recent confidences win.
+        self._set_accept_rate_ema(policy, "r0", 0.0)
         policy.observe_draft_confidences(["r0"], [[0.99, 0.99, 0.99, 0.99]])
         self.assertEqual(policy.get_steps_for_batch(1, rids=["r0"]), 4)
 
@@ -279,7 +298,11 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
             initial_steps=1,
             cfg=self._cfg([1, 4], cost_table=cost_table, switch_cooldown_rounds=8),
         )
-        policy.on_verify_complete([0], batch_size=1, rids=["lo"], num_steps=4)
+        # ADJUSTED: seed the low request's EMA directly — on_verify_complete
+        # now also anchors the acceptance model globally, which would remove
+        # the per-request flip pressure this test needs.
+        state = policy._touch("lo")
+        state.accept_rate_ema = 0.0
         policy.observe_draft_confidences(["hi"], [[0.99] * 4])
         switches = 0
         last = policy.current_steps
@@ -305,6 +328,28 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
         # (1, g=4) unseen: expect 10 ms * (4+1)/(1+1) = 25 ms, not 1.0 s.
         self.assertAlmostEqual(policy._step_cost(1, 4), 0.025, places=3)
 
+    def test_same_g_evidence_ignores_a_cheaper_table_claim(self):
+        # Evidence beats optimism: once g=4 has a realized-gap EMA at ANY
+        # bucket (here 64), the table's cheaper claim at a nearby bucket
+        # (70) must not resurrect the config (the conc-64 probe tax: ~4% of
+        # rounds re-probed an already-refuted config at ~3x step cost).
+        cost_table = self._write_cost_table([(70, 5, 0.001)])
+        policy = PricedSpeculativeParams(
+            initial_steps=4, cfg=self._cfg([1, 4], cost_table=cost_table)
+        )
+        policy._cost_ema[(64, 4)] = 0.05
+        self.assertEqual(policy._step_cost(70, 4), 0.05)
+
+    def test_optimism_remains_for_a_never_visited_g(self):
+        # g=1 has no EMA evidence at any bucket: the table's optimistic
+        # claim still prices it, so exploration stays possible.
+        cost_table = self._write_cost_table([(70, 2, 0.001)])
+        policy = PricedSpeculativeParams(
+            initial_steps=4, cfg=self._cfg([1, 4], cost_table=cost_table)
+        )
+        policy._cost_ema[(64, 4)] = 0.05
+        self.assertEqual(policy._step_cost(70, 1), 0.001)
+
     def test_non_consecutive_rounds_do_not_feed_the_cost_ema(self):
         cost_table = self._write_cost_table([(1, 2, 1.0), (1, 5, 1.0)])
         cfg = self._cfg([1, 4], cost_table=cost_table)
@@ -317,6 +362,232 @@ class TestOnlineCostCorrection(PricedSpecParamsTestBase):
             policy.get_steps_for_batch(1, rids=["r0"], round_idx=3)
 
         self.assertEqual(policy._cost_ema, {})
+
+
+class TestEvidenceDecay(PricedSpecParamsTestBase):
+    """Stale per-request evidence decays toward the prior (g=0 rounds
+    generate no confidences and no accepts, so frozen pessimistic evidence
+    otherwise makes g=0 absorbing — observed at concurrency 4 on GH200)."""
+
+    def _decay_policy(self, **overrides):
+        cfg = self._cfg([1, 4], prior_accept_rate=0.7, evidence_decay=0.97)
+        cfg.update(overrides)
+        return PricedSpeculativeParams(initial_steps=1, cfg=cfg)
+
+    def test_stale_pessimistic_evidence_reverts_to_prior_level(self):
+        policy = self._decay_policy()
+        state = policy._touch("r0")
+        state.accept_rate_ema = 0.0
+        state.last_update_round = policy._round_ct
+        prior_e = policy._chain_correct_drafts("never_seen", 4)
+        # Fresh evidence reads undecayed.
+        self.assertAlmostEqual(policy._chain_correct_drafts("r0", 4), 0.0)
+        # ~3 time constants unupdated (tau = -1/ln(0.97) ~= 32.8 rounds).
+        policy._round_ct += 100
+        e_stale = policy._chain_correct_drafts("r0", 4)
+        self.assertGreater(e_stale, 0.85 * prior_e)
+        self.assertLess(e_stale, prior_e)
+
+    def test_confidence_evidence_also_decays(self):
+        policy = self._decay_policy()
+        policy.observe_draft_confidences(["r0"], [[0.0, 0.0, 0.0, 0.0]])
+        prior_e = policy._chain_correct_drafts("never_seen", 4)
+        self.assertAlmostEqual(policy._chain_correct_drafts("r0", 4), 0.0)
+        policy._round_ct += 100
+        self.assertGreater(
+            policy._chain_correct_drafts("r0", 4), 0.85 * prior_e
+        )
+
+    def test_fresh_update_resets_the_stamp(self):
+        policy = self._decay_policy()
+        state = policy._touch("r0")
+        state.accept_rate_ema = 0.0
+        state.last_update_round = policy._round_ct
+        policy._round_ct += 100
+        self.assertGreater(policy._chain_correct_drafts("r0", 4), 1.0)
+        # A fresh rejection re-stamps (helper ema_alpha=1.0: EMA = latest).
+        policy.on_verify_complete([0], batch_size=1, rids=["r0"], num_steps=4)
+        self.assertAlmostEqual(policy._chain_correct_drafts("r0", 4), 0.0)
+
+    def test_g0_is_not_absorbing_under_decay(self):
+        # The conc-4 failure shape: pessimistic evidence parks the policy at
+        # g=0, where no fresh evidence is ever generated. Decay must revert
+        # the aggregate expectation so speculation gets retried.
+        cost_table = self._write_cost_table([(4, 1, 0.01), (4, 5, 0.012)])
+        cfg = self._cfg(
+            [0, 4],
+            cost_table=cost_table,
+            prior_accept_rate=0.7,
+            evidence_decay=0.9,
+            switch_cooldown_rounds=0,
+        )
+        policy = PricedSpeculativeParams(initial_steps=0, cfg=cfg)
+        rids = ["a", "b", "c", "d"]
+        for rid in rids:
+            state = policy._touch(rid)
+            state.accept_rate_ema = 0.0
+            state.last_update_round = policy._round_ct
+        chosen = [policy.get_steps_for_batch(4, rids=rids) for _ in range(40)]
+        # Fresh pessimism holds g=0...
+        self.assertEqual(chosen[0], 0)
+        # ...but unrefreshed evidence reverts and speculation is retried.
+        self.assertEqual(chosen[-1], 4)
+
+    def test_evidence_decay_of_one_disables_decay(self):
+        policy = self._decay_policy(evidence_decay=1.0)
+        state = policy._touch("r0")
+        state.accept_rate_ema = 0.0
+        state.last_update_round = policy._round_ct
+        policy._round_ct += 10**6
+        self.assertAlmostEqual(policy._chain_correct_drafts("r0", 4), 0.0)
+
+
+class TestRealizedAnchor(PricedSpecParamsTestBase):
+    """Confidence chains anchored to realized acceptance.
+
+    The conc-1 GH200 failure: raw per-position confidence products
+    overstate deep-chain returns (measured E[correct|8] - E[correct|4] was
+    +0.15 while a 0.9^d chain predicts much more), saturating the policy at
+    k=8 when the measured optimum was k=4 (k=8 measured -9% vs k=4)."""
+
+    def _anchor_cfg(self, **overrides):
+        # Measured GH200 conc-1 step costs: cost(B=1, g=4) = 9.4e-3 s
+        # (ndt 5), cost(B=1, g=8) = 10.65e-3 s (ndt 9).
+        cost_table = self._write_cost_table([(1, 5, 9.4e-3), (1, 9, 10.65e-3)])
+        return self._cfg(
+            [4, 8], cost_table=cost_table, switch_cooldown_rounds=0, **overrides
+        )
+
+    def _feed_realized(self, policy):
+        # Helper ema_alpha=1.0: the EMA equals the latest batch mean.
+        # E_global(8) = 1.06 and E_global(4) = 0.91 (the measured curve).
+        policy.on_verify_complete(
+            [2] * 3 + [1] * 47,
+            batch_size=50,
+            rids=[f"g8-{i}" for i in range(50)],
+            num_steps=8,
+        )
+        policy.on_verify_complete(
+            [1] * 91 + [0] * 9,
+            batch_size=100,
+            rids=[f"g4-{i}" for i in range(100)],
+            num_steps=4,
+        )
+
+    def test_unanchored_chain_free_runs_to_deep_g(self):
+        # Fallback before any realized data: the raw 0.95^d chain says
+        # E(8) ~= 6.4, so g=8 wins — exactly the bias being fixed.
+        policy = PricedSpeculativeParams(initial_steps=4, cfg=self._anchor_cfg())
+        policy.observe_draft_confidences(["r0"], [[0.95] * 8])
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["r0"]), 8)
+
+    def test_anchored_chain_no_longer_wins_deep_g(self):
+        # With the realized curve in place: goodput(4) = (0.91 + 1)/9.4e-3
+        # ~= 203 tok/s > goodput(8) = (1.06 + 1)/10.65e-3 ~= 193 tok/s, and
+        # a 0.95^8 confidence chain may only modulate around that anchor.
+        policy = PricedSpeculativeParams(initial_steps=4, cfg=self._anchor_cfg())
+        self._feed_realized(policy)
+        policy.observe_draft_confidences(["r0"], [[0.95] * 8])
+        self.assertEqual(policy.get_steps_for_batch(1, rids=["r0"]), 4)
+
+    def test_single_request_expectation_equals_the_anchor(self):
+        # A lone request IS the batch mean: its chain ratio is exactly 1, so
+        # the expectation is the anchor itself however confident the chain.
+        policy = PricedSpeculativeParams(initial_steps=4, cfg=self._cfg([4]))
+        policy.on_verify_complete([1], batch_size=1, rids=["a"], num_steps=4)
+        policy.observe_draft_confidences(["r0"], [[0.99] * 4])
+        self.assertAlmostEqual(
+            policy._expected_correct_drafts_batch(1, ["r0"], 4), 1.0, places=9
+        )
+
+    def test_modulation_is_clamped_around_the_anchor(self):
+        policy = PricedSpeculativeParams(
+            initial_steps=4, cfg=self._cfg([4], confidence_modulation=2.0)
+        )
+        policy.on_verify_complete([1, 1], batch_size=2, rids=["a", "b"], num_steps=4)
+        # chain("hi") ~= 3.9, chain("lo") = 0 -> mean ~= 1.95: hi's ratio
+        # hits the +clamp (2.0), lo's ratio 0 hits the -clamp (0.5).
+        policy.observe_draft_confidences(
+            ["hi", "lo"], [[0.99] * 4, [0.0] * 4]
+        )
+        self.assertAlmostEqual(
+            policy._expected_correct_drafts_batch(2, ["hi", "lo"], 4),
+            1.0 * (2.0 + 0.5),
+            places=9,
+        )
+
+    def test_anchor_interpolates_to_unsampled_g(self):
+        # Only g=4 has run. g=8's anchor must come from the implied
+        # per-position rate of the realized g=4 chain (~0.49), giving a
+        # modest deep-chain increment — not a free-running product.
+        policy = PricedSpeculativeParams(initial_steps=4, cfg=self._anchor_cfg())
+        policy.on_verify_complete(
+            [1] * 91 + [0] * 9,
+            batch_size=100,
+            rids=[f"g4-{i}" for i in range(100)],
+            num_steps=4,
+        )
+        e4 = policy._anchored_correct_drafts(4)
+        e8 = policy._anchored_correct_drafts(8)
+        self.assertAlmostEqual(e4, 0.91, places=9)
+        self.assertGreater(e8, e4)
+        self.assertLess(e8, 1.1)
+
+    def test_no_realized_data_means_no_anchor(self):
+        policy = PricedSpeculativeParams(initial_steps=4, cfg=self._cfg([4]))
+        self.assertIsNone(policy._anchored_correct_drafts(4))
+
+
+class TestLadderSwitching(PricedSpecParamsTestBase):
+    def test_distant_optimum_is_reached_via_the_ladder(self):
+        # From g=0 in [0, 1, 2, 3, 4, 8] a huge goodput gap to 8 moves at
+        # most max_switch_distance=2 indices per switch: 0 -> 2 -> 4 -> 8.
+        # Makes the 0 -> 8 cliff (one catch-up extend over every request's
+        # whole gap, the conc-256 OOM) structurally impossible.
+        cost_table = self._write_cost_table(
+            [(1, g + 1, 0.01) for g in (0, 1, 2, 3, 4, 8)]
+        )
+        policy = PricedSpeculativeParams(
+            initial_steps=0,
+            cfg=self._cfg(
+                [0, 1, 2, 3, 4, 8],
+                cost_table=cost_table,
+                switch_cooldown_rounds=0,
+            ),
+        )
+        seq = [policy.get_steps_for_batch(1, rids=["r0"]) for _ in range(4)]
+        self.assertEqual(seq, [2, 4, 8, 8])
+
+    def test_cooldown_gates_each_rung(self):
+        cost_table = self._write_cost_table(
+            [(1, g + 1, 0.01) for g in (0, 1, 2, 3, 4, 8)]
+        )
+        policy = PricedSpeculativeParams(
+            initial_steps=0,
+            cfg=self._cfg(
+                [0, 1, 2, 3, 4, 8],
+                cost_table=cost_table,
+                switch_cooldown_rounds=2,
+            ),
+        )
+        seq = [policy.get_steps_for_batch(1, rids=["r0"]) for _ in range(6)]
+        self.assertEqual(seq, [2, 2, 4, 4, 8, 8])
+
+    def test_max_switch_distance_one_walks_adjacent_rungs(self):
+        cost_table = self._write_cost_table(
+            [(1, g + 1, 0.01) for g in (0, 1, 2)]
+        )
+        policy = PricedSpeculativeParams(
+            initial_steps=0,
+            cfg=self._cfg(
+                [0, 1, 2],
+                cost_table=cost_table,
+                switch_cooldown_rounds=0,
+                max_switch_distance=1,
+            ),
+        )
+        seq = [policy.get_steps_for_batch(1, rids=["r0"]) for _ in range(3)]
+        self.assertEqual(seq, [1, 2, 2])
 
 
 class TestCostTable(PricedSpecParamsTestBase):
@@ -401,6 +672,13 @@ class TestConfigValidation(PricedSpecParamsTestBase):
             ("warmup_rounds", -1),
             ("max_tracked_requests", 0),
             ("cost_table", 7),
+            ("g0_catch_up_chunk_tokens", 0),
+            ("g0_catch_up_chunk_tokens", 1.5),
+            ("evidence_decay", 0.0),
+            ("evidence_decay", 1.5),
+            ("confidence_modulation", 0.5),
+            ("max_switch_distance", 0),
+            ("max_switch_distance", 1.5),
         ):
             with self.assertRaises(ValueError):
                 load_priced_config({**base, key: bad})
@@ -413,6 +691,10 @@ class TestConfigValidation(PricedSpecParamsTestBase):
         self.assertEqual(cfg.ema_alpha, 0.2)
         self.assertEqual(cfg.warmup_rounds, 20)
         self.assertEqual(cfg.max_tracked_requests, 8192)
+        self.assertEqual(cfg.g0_catch_up_chunk_tokens, 4096)
+        self.assertEqual(cfg.evidence_decay, 0.97)
+        self.assertEqual(cfg.confidence_modulation, 2.0)
+        self.assertEqual(cfg.max_switch_distance, 2)
 
     def test_config_file_round_trip(self):
         import json

@@ -155,6 +155,13 @@ class AdaptiveController:
         default bound (never reached)."""
         return getattr(self.params, "g0_max_gap", 1024)
 
+    @property
+    def g0_catch_up_chunk_tokens(self) -> int:
+        """Token budget per drafter catch-up extend when draining g=0 gaps.
+        Only the priced policy can select g=0; others fall back to the
+        default budget (never reached)."""
+        return getattr(self.params, "g0_catch_up_chunk_tokens", 4096)
+
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
 

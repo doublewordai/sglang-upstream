@@ -64,7 +64,10 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs_func,
     fill_bonus_tokens,
 )
-from sglang.srt.speculative.g0_gap_buffer import G0GapBuffer
+from sglang.srt.speculative.g0_gap_buffer import (
+    G0GapBuffer,
+    partition_catch_up_chunks,
+)
 from sglang.srt.speculative.spec_telemetry import (
     capture_draft_confidence,
     get_spec_telemetry,
@@ -862,32 +865,47 @@ class EagleDraftWorker(BaseDraftWorker):
         gap_lens: List[int],
         gap_tokens: torch.Tensor,
         gap_hidden_states: Optional[torch.Tensor],
+        tail_gap_lens: Optional[List[int]] = None,
     ):
         """Re-sync the drafter KV cache over tokens decoded during g=0 rounds.
 
         g=0 rounds never invoke the drafter, so its KV cache misses the last
-        ``gap_lens[i]`` positions of each selected request. This runs one
-        eager arbitrary-length draft extend (the ``_draft_extend_for_prefill``
-        shape, not the fixed-shape decode draft-extend) over those positions,
-        consuming the buffered (token, target hidden state) pairs.
+        gap positions of each selected request. This runs one eager
+        arbitrary-length draft extend (the ``_draft_extend_for_prefill``
+        shape, not the fixed-shape decode draft-extend) over a slice of those
+        positions, consuming the buffered (token, target hidden state) pairs.
+        The caller chunks large drains into multiple sequential calls (token
+        budget ``g0_catch_up_chunk_tokens``); slices of one request must
+        arrive in position order across calls (drafter KV writes are
+        sequential per request).
 
         Args:
-            batch: The current decode batch (pre-round ``seq_lens``: the gap
-                of request ``i`` is positions ``[seq_lens_i - gap, seq_lens_i)``).
-            sel_indices: Batch-row indices of requests with a non-empty gap.
-            gap_lens: Per-selected-request gap length, same order.
+            batch: The current decode batch (pre-round ``seq_lens``: with
+                ``tail = tail_gap_lens[i]`` (0 when absent), the slice of
+                request ``i`` covers positions
+                ``[seq_lens_i - tail - gap, seq_lens_i - tail)``).
+            sel_indices: Batch-row indices of requests with a non-empty slice.
+            gap_lens: Per-selected-request slice length, same order.
             gap_tokens: Flat ``[sum(gap_lens)]`` drafter input tokens.
             gap_hidden_states: Flat ``[sum(gap_lens), hidden]`` target hidden
                 states (None for STANDALONE, whose draft has no hidden input).
+            tail_gap_lens: Per-selected-request count of gap tokens that
+                remain AFTER this slice (deferred to later chunks). None or
+                all-zero when the slice reaches the request's current end.
 
         Returns:
             (topk_p, topk_index, hidden_states) for the selected rows — the
-            drafter's next-draft inputs at each request's current position.
+            drafter's next-draft inputs at each request's slice end. Only
+            meaningful for rows with ``tail_gap_lens[i] == 0`` (the request's
+            current position); interior-slice rows must be discarded.
         """
         device = self.device
+        if tail_gap_lens is None:
+            tail_gap_lens = [0] * len(sel_indices)
         sel = torch.tensor(sel_indices, dtype=torch.int64, device=device)
         gaps = torch.tensor(gap_lens, dtype=torch.int64, device=device)
-        seq_lens = batch.seq_lens[sel]
+        tails = torch.tensor(tail_gap_lens, dtype=torch.int64, device=device)
+        seq_lens = batch.seq_lens[sel] - tails
         prefix_lens = seq_lens - gaps
         req_pool_indices = batch.req_pool_indices[sel]
         num_gap_tokens = int(sum(gap_lens))
@@ -909,7 +927,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if batch.seq_lens_cpu is not None:
             sel_cpu = torch.tensor(sel_indices, dtype=torch.int64)
-            seq_lens_cpu = batch.seq_lens_cpu[sel_cpu]
+            tails_cpu = torch.tensor(tail_gap_lens, dtype=torch.int64)
+            seq_lens_cpu = batch.seq_lens_cpu[sel_cpu] - tails_cpu
             seq_lens_sum = int(seq_lens_cpu.sum())
             extend_prefix_lens_cpu = [
                 int(l) - g for l, g in zip(seq_lens_cpu.tolist(), gap_lens)
@@ -1049,6 +1068,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             self._g0_gap_buffer = G0GapBuffer(
                 max_gap=self.adaptive_controller.g0_max_gap
+            )
+            # Token budget per catch-up drafter extend: the drain is chunked
+            # into sequential extends so re-entering speculation with a large
+            # running batch cannot OOM on extend activations.
+            self._g0_catch_up_chunk_tokens = (
+                self.adaptive_controller.g0_catch_up_chunk_tokens
             )
 
         # Some dummy tensors
@@ -1415,26 +1440,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not drained:
             return
 
-        sel_indices: List[int] = []
-        gap_lens: List[int] = []
-        tokens = []
-        hiddens = []
-        for i, rid in enumerate(rids):
-            entries = drained.get(rid)
-            if not entries:
-                continue
-            sel_indices.append(i)
-            gap_lens.append(len(entries))
-            for token, hidden in entries:
-                tokens.append(token)
-                if hidden is not None:
-                    hiddens.append(hidden)
-        if not sel_indices:
+        # Chunk the drain to a per-extend token budget: one eager extend over
+        # every running request's accumulated gap allocates activations
+        # proportional to the total gap and OOMs at high concurrency
+        # (observed at 256 running requests on GH200). Multiple sequential
+        # extends are fine — correctness over latency. Slices of one request
+        # stay in position order across chunks (drafter KV writes are
+        # sequential per request).
+        batch_row_by_rid = {rid: i for i, rid in enumerate(rids)}
+        drained_gap_lens = [
+            (rid, len(drained[rid])) for rid in rids if drained.get(rid)
+        ]
+        if not drained_gap_lens:
             return
+        chunks = partition_catch_up_chunks(
+            drained_gap_lens, self._g0_catch_up_chunk_tokens
+        )
 
-        gap_tokens = torch.stack(tokens).to(torch.int64)
-        gap_hidden_states = torch.stack(hiddens) if hiddens else None
-
+        spec_info: EagleDraftInput = batch.spec_info
+        num_total_gap_tokens = sum(g for _, g in drained_gap_lens)
         with (
             self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
@@ -1443,25 +1467,64 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
         ):
-            topk_p, topk_index, hidden_states = (
-                self.draft_worker._draft_extend_for_g0_catch_up(
-                    batch, sel_indices, gap_lens, gap_tokens, gap_hidden_states
-                )
-            )
+            for chunk in chunks:
+                sel_indices: List[int] = []
+                gap_lens: List[int] = []
+                tail_gap_lens: List[int] = []
+                tokens = []
+                hiddens = []
+                final_rows: List[int] = []
+                for row, (rid, start, length) in enumerate(chunk):
+                    entries = drained[rid]
+                    sel_indices.append(batch_row_by_rid[rid])
+                    gap_lens.append(length)
+                    tail = len(entries) - (start + length)
+                    tail_gap_lens.append(tail)
+                    if tail == 0:
+                        final_rows.append(row)
+                    for token, hidden in entries[start : start + length]:
+                        tokens.append(token)
+                        if hidden is not None:
+                            hiddens.append(hidden)
 
-        spec_info: EagleDraftInput = batch.spec_info
-        sel = torch.tensor(sel_indices, dtype=torch.int64, device=self.device)
-        spec_info.topk_p[sel] = topk_p.to(spec_info.topk_p.dtype)
-        spec_info.topk_index[sel] = topk_index.to(spec_info.topk_index.dtype)
-        if spec_info.hidden_states is not None and hidden_states is not None:
-            spec_info.hidden_states[sel] = hidden_states.to(
-                spec_info.hidden_states.dtype
-            )
+                gap_tokens = torch.stack(tokens).to(torch.int64)
+                gap_hidden_states = torch.stack(hiddens) if hiddens else None
+                topk_p, topk_index, hidden_states = (
+                    self.draft_worker._draft_extend_for_g0_catch_up(
+                        batch,
+                        sel_indices,
+                        gap_lens,
+                        gap_tokens,
+                        gap_hidden_states,
+                        tail_gap_lens,
+                    )
+                )
+
+                # Only slices that reach a request's current end carry its
+                # next-draft inputs; interior-slice outputs are discarded.
+                if not final_rows:
+                    continue
+                rows = torch.tensor(final_rows, dtype=torch.int64, device=self.device)
+                sel = torch.tensor(
+                    [sel_indices[row] for row in final_rows],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                spec_info.topk_p[sel] = topk_p[rows].to(spec_info.topk_p.dtype)
+                spec_info.topk_index[sel] = topk_index[rows].to(
+                    spec_info.topk_index.dtype
+                )
+                if spec_info.hidden_states is not None and hidden_states is not None:
+                    spec_info.hidden_states[sel] = hidden_states[rows].to(
+                        spec_info.hidden_states.dtype
+                    )
 
         log_info_on_rank0(
             logger,
-            f"g0 catch-up: drafter extended over {sum(gap_lens)} gap tokens "
-            f"for {len(sel_indices)}/{len(rids)} requests",
+            f"g0 catch-up: drafter extended over {num_total_gap_tokens} gap "
+            f"tokens for {len(drained_gap_lens)}/{len(rids)} requests in "
+            f"{len(chunks)} chunk(s) "
+            f"(budget {self._g0_catch_up_chunk_tokens} tokens/extend)",
         )
 
     def on_verify_complete_cpu(
