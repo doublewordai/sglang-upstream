@@ -550,6 +550,7 @@ class PricedSpeculativeParams:
             for steps in self._available_steps
         }
         best = max(self._available_steps, key=lambda s: goodputs[s])
+        self._debug_decision(batch_size, rids, goodputs, best)
         if best == current or current not in goodputs:
             return
         # Hysteresis: runtime state swaps have cost, so only move when the
@@ -577,6 +578,52 @@ class PricedSpeculativeParams:
                 f"(predicted goodput {goodputs[current]:.3f} -> "
                 f"{goodputs[best]:.3f} tokens/s)"
             )
+
+    def _debug_decision(
+        self,
+        batch_size: int,
+        rids: list[str] | None,
+        goodputs: dict[int, float],
+        best: int,
+    ) -> None:
+        """Every 16th decision, log the estimator internals the argmax used
+        (side="d" records in the spec telemetry stream) — the only way to
+        attribute mispricing to a specific estimator on hardware."""
+        self._debug_ct = getattr(self, "_debug_ct", 0) + 1
+        if self._debug_ct % 16 != 1:
+            return
+        try:
+            from sglang.srt.speculative.spec_telemetry import get_spec_telemetry
+
+            telem = get_spec_telemetry()
+        except ImportError:
+            telem = None
+        if telem is None:
+            return
+        telem._write(
+            {
+                "side": "d",
+                "B": batch_size,
+                "cur": self.current_steps,
+                "best": best,
+                "gp": {str(g): round(v, 3) for g, v in goodputs.items()},
+                "cost_ms": {
+                    str(g): round(1e3 * self._step_cost(batch_size, g), 3)
+                    for g in self._available_steps
+                },
+                "E": {
+                    str(g): round(
+                        self._expected_correct_drafts_batch(batch_size, rids, g), 3
+                    )
+                    for g in self._available_steps
+                },
+                "anchor": {
+                    str(g): round(v, 3)
+                    for g, v in self._realized_correct_ema.items()
+                },
+                "target_rate": round(self._decay_target_rate(), 3),
+            }
+        )
 
     def _goodput(
         self, batch_size: int, rids: list[str] | None, steps: int
