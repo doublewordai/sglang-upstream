@@ -162,6 +162,34 @@ class AdaptiveController:
         default budget (never reached)."""
         return getattr(self.params, "g0_catch_up_chunk_tokens", 4096)
 
+    def get_state(self, steps: int) -> SpecRuntimeState | None:
+        """The pre-built runtime state for *steps*, or None when missing."""
+        return self._states.get(steps)
+
+    def early_exit_plan(self, batch_size: int) -> tuple[list[int], float] | None:
+        """(allowed stop depths, stop price) for an in-round early-exit
+        draft this round, or None when early exit does not apply: policy is
+        not priced / knob off / batch too large / worker not parked at the
+        deepest candidate / no intermediate candidate depth to stop at.
+
+        Stop depths are the candidates with built runtime states strictly
+        inside (0, k_max): a stop always lands on a depth whose verify
+        graph and draft-extend resources exist.
+        """
+        if self.policy_name != "priced":
+            return None
+        params = self.params
+        if not params.early_exit_active(batch_size):
+            return None
+        available = params.available_steps
+        k_max = max(available)
+        if self.worker.speculative_num_steps != k_max:
+            return None
+        stop_depths = [g for g in available if 1 <= g < k_max]
+        if not stop_depths:
+            return None
+        return stop_depths, params.early_exit_stop_price(batch_size)
+
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
 

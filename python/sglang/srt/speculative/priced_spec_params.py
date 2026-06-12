@@ -99,6 +99,10 @@ _SWITCH_LOG_EVERY = 50
 
 _COST_TABLE_COLUMNS = ("batch_size", "num_draft_tokens", "step_seconds")
 
+# Flat early-exit stop price (expected correct drafts per drafter step) used
+# when the policy has no cost data to derive one from.
+_EARLY_EXIT_FALLBACK_STOP_PRICE = 0.2
+
 
 def _log_info_on_rank0(msg: str) -> None:
     """Rank-0 logging with a plain-logger fallback.
@@ -147,6 +151,18 @@ class PricedPolicyConfig:
     # Max candidate-index distance a single switch may move through the
     # sorted candidate list (ladder switching).
     max_switch_distance: int = 2
+    # In-round early-exit drafting: at small batch the worker drafts eagerly
+    # at the deepest candidate and may stop the loop at any intermediate
+    # candidate depth when the marginal step no longer pays. Off by default
+    # (opt-in: it changes the engine's draft execution path).
+    early_exit: bool = False
+    # Largest batch size early exit applies to. Past it the per-step host
+    # sync dominates and the captured draft graph wins.
+    early_exit_max_batch: int = 4
+    # Explicit flat stop price (expected correct drafts one more drafter
+    # step must yield). None derives it each round from the cost surface
+    # and current goodput (see early_exit_stop_price).
+    early_exit_stop_price: float | None = None
 
 
 def load_priced_config(cfg: dict) -> PricedPolicyConfig:
@@ -251,6 +267,40 @@ def load_priced_config(cfg: dict) -> PricedPolicyConfig:
             f"got {max_switch_distance!r}"
         )
     out.max_switch_distance = max_switch_distance
+
+    early_exit = cfg.get("early_exit", out.early_exit)
+    if not isinstance(early_exit, bool):
+        raise ValueError(
+            f"priced policy: early_exit must be a bool, got {early_exit!r}"
+        )
+    out.early_exit = early_exit
+
+    early_exit_max_batch = cfg.get("early_exit_max_batch", out.early_exit_max_batch)
+    if (
+        not isinstance(early_exit_max_batch, int)
+        or isinstance(early_exit_max_batch, bool)
+        or early_exit_max_batch < 1
+    ):
+        raise ValueError(
+            "priced policy: early_exit_max_batch must be an int >= 1, "
+            f"got {early_exit_max_batch!r}"
+        )
+    out.early_exit_max_batch = early_exit_max_batch
+
+    early_exit_stop_price = cfg.get(
+        "early_exit_stop_price", out.early_exit_stop_price
+    )
+    if early_exit_stop_price is not None:
+        if (
+            not isinstance(early_exit_stop_price, (int, float))
+            or isinstance(early_exit_stop_price, bool)
+            or early_exit_stop_price <= 0.0
+        ):
+            raise ValueError(
+                "priced policy: early_exit_stop_price must be a float > 0 "
+                f"or null (derive per round), got {early_exit_stop_price!r}"
+            )
+        out.early_exit_stop_price = float(early_exit_stop_price)
 
     return out
 
@@ -520,6 +570,57 @@ class PricedSpeculativeParams:
             state.last_confidences = conf
             state.last_update_round = self._round_ct
 
+    # -- In-round early-exit drafting --
+
+    @property
+    def available_steps(self) -> list[int]:
+        """Candidates whose runtime states exist (sorted ascending)."""
+        return list(self._available_steps)
+
+    def early_exit_active(self, batch_size: int) -> bool:
+        """Whether in-round early-exit drafting governs this batch size.
+
+        When True, intermediate depths are reached by stopping inside the
+        round; the step decision only parks between speculation-off and the
+        deepest candidate (see ``_maybe_switch``).
+        """
+        return (
+            self._cfg.early_exit
+            and batch_size <= self._cfg.early_exit_max_batch
+            and max(self._available_steps) >= 2
+        )
+
+    def early_exit_stop_price(self, batch_size: int) -> float:
+        """Price (expected correct drafts) one more drafter step must beat.
+
+        Derivation: one extra drafter step costs ``slope`` seconds — the
+        per-step slope of the round-cost surface at this batch size,
+        measured between the cheapest and deepest available configurations
+        (EMA-corrected, table-seeded ``_step_cost``). At the current
+        goodput the same wall time is worth ``slope * goodput`` committed
+        tokens, so the step pays iff its expected additional correct
+        drafts reach that. An explicit ``early_exit_stop_price`` config
+        value short-circuits the derivation; without any cost data the
+        flat default applies.
+        """
+        if self._cfg.early_exit_stop_price is not None:
+            return self._cfg.early_exit_stop_price
+        if not self._cost_table and not self._cost_ema:
+            return _EARLY_EXIT_FALLBACK_STOP_PRICE
+        g_hi = max(self._available_steps)
+        g_lo = min(self._available_steps)
+        if g_hi <= g_lo:
+            return _EARLY_EXIT_FALLBACK_STOP_PRICE
+        slope = (
+            self._step_cost(batch_size, g_hi) - self._step_cost(batch_size, g_lo)
+        ) / (g_hi - g_lo)
+        if slope <= 0.0:
+            return _EARLY_EXIT_FALLBACK_STOP_PRICE
+        goodput = self._goodput(batch_size, None, self.current_steps)
+        if goodput <= 0.0:
+            return _EARLY_EXIT_FALLBACK_STOP_PRICE
+        return slope * goodput
+
     # -- Decision internals --
 
     def _maybe_switch(self, batch_size: int, rids: list[str] | None) -> None:
@@ -538,18 +639,30 @@ class PricedSpeculativeParams:
         # it. Distant configs are reached over successive cooldown windows
         # (0 -> 2 -> 4 -> 8), keeping every runtime-state swap incremental
         # and bounding the g=0 catch-up gap a single re-entry must drain.
+        available = self._available_steps
+        if self.early_exit_active(batch_size):
+            # In-round early exit reaches intermediate depths by stopping
+            # the draft loop, not by runtime-state swaps: the swap decision
+            # only weighs speculation-off against the deepest candidate.
+            # `current` stays comparable so the policy can still leave an
+            # intermediate state it parked at before early exit applied.
+            deepest = max(self._available_steps)
+            available = sorted(
+                {s for s in self._available_steps if s in (0, deepest)}
+                | {current}
+            )
         try:
-            current_idx = self._available_steps.index(current)
+            current_idx = available.index(current)
         except ValueError:  # defensive; current is kept inside available
             current_idx = min(
-                range(len(self._available_steps)),
-                key=lambda i: abs(self._available_steps[i] - current),
+                range(len(available)),
+                key=lambda i: abs(available[i] - current),
             )
         goodputs = {
             steps: self._goodput(batch_size, rids, steps)
-            for steps in self._available_steps
+            for steps in available
         }
-        best = max(self._available_steps, key=lambda s: goodputs[s])
+        best = max(available, key=lambda s: goodputs[s])
         self._debug_decision(batch_size, rids, goodputs, best)
         if best == current or current not in goodputs:
             return
@@ -557,12 +670,12 @@ class PricedSpeculativeParams:
         # predicted goodput gain clears the margin.
         if goodputs[best] <= goodputs[current] * (1.0 + self._cfg.switch_margin):
             return
-        best_idx = self._available_steps.index(best)
+        best_idx = available.index(best)
         max_distance = self._cfg.max_switch_distance
         step_idx = current_idx + max(
             -max_distance, min(max_distance, best_idx - current_idx)
         )
-        best = self._available_steps[step_idx]
+        best = available[step_idx]
         if best == current:
             return
         self.current_steps = best
@@ -926,6 +1039,46 @@ class PricedSpeculativeParams:
         else:
             self._reqs.move_to_end(rid)
         return state
+
+
+def early_exit_should_stop(marginal_gain: float, stop_price: float) -> bool:
+    """In-round early-exit stop rule at one allowed depth: stop when the
+    expected marginal correct drafts of one more drafter step fall short of
+    the price. Ties continue (the step exactly pays for itself)."""
+    return marginal_gain < stop_price
+
+
+def decide_early_exit_depth(
+    marginal_gains: "list[float] | tuple[float, ...]",
+    stop_depths: "list[int] | tuple[int, ...] | set[int]",
+    k_max: int,
+    stop_price: float,
+) -> int:
+    """Depth the early-exit draft loop stops at (the worker loop's pure twin).
+
+    ``marginal_gains[d - 1]`` is the expected marginal correct drafts of
+    running one more drafter forward when ``d`` drafts are already
+    determined: the batch sum of ``chain_prob(d) * a_next``, where
+    ``chain_prob(d)`` is the probability the first ``d`` drafts all commit
+    and ``a_next`` is the proxy for the not-yet-drafted position (the
+    ``d``-th draft's own probability — for ``d == 1`` that makes the gain
+    the chain probability squared, since no drafter forward has run yet).
+
+    The rule is evaluated only at depths in *stop_depths* (>= 1 and
+    < ``k_max`` — the candidate depths with a built verify state), in
+    increasing order, so a raw stop point between candidates lands on the
+    nearest allowed depth at or past it. Returns the first depth whose
+    gain fails ``stop_price``, else ``k_max``; the result is always >= 1
+    and <= ``k_max``.
+    """
+    for depth in sorted(set(stop_depths)):
+        if depth < 1 or depth >= k_max:
+            continue
+        if depth <= len(marginal_gains) and early_exit_should_stop(
+            marginal_gains[depth - 1], stop_price
+        ):
+            return depth
+    return k_max
 
 
 def _geometric_expected(accept_rate: float, steps: int) -> float:

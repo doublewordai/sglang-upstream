@@ -65,6 +65,7 @@ class SpecTelemetry:
         confidences: Optional[List[List[float]]] = None,
         worker_round_idx: Optional[int] = None,
         conf_lag: Optional[int] = None,
+        early_exit: bool = False,
     ) -> int:
         """Log the worker-side half of a decode round. Returns the step index
         used to join with the processor-side half.
@@ -77,6 +78,11 @@ class SpecTelemetry:
         ``confidences`` belong to (the zero-sync staged read delivers the
         previous round's values; see the module docstring). ``None``/0 means
         same-round confidences.
+
+        ``early_exit`` marks an in-round early-exit drafting round
+        (``"ee": 1``): ``k``/``ndt`` are the EXECUTED depth (the depth the
+        draft loop stopped at), not a runtime-state configuration, and
+        ``confidences`` are same-round (the stop checks already synced them).
         """
         step_idx = self._step_ct
         self._step_ct += 1
@@ -89,6 +95,8 @@ class SpecTelemetry:
             "ndt": num_draft_tokens,
             "sls": seq_lens_sum,
         }
+        if early_exit:
+            record["ee"] = 1
         if worker_round_idx is not None:
             record["ri"] = worker_round_idx
         if confidences is not None:

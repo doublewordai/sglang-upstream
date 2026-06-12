@@ -68,6 +68,7 @@ from sglang.srt.speculative.g0_gap_buffer import (
     G0GapBuffer,
     partition_catch_up_chunks,
 )
+from sglang.srt.speculative.priced_spec_params import early_exit_should_stop
 from sglang.srt.speculative.spec_telemetry import (
     capture_draft_confidence,
     get_spec_telemetry,
@@ -164,6 +165,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
+        # Per-depth analogs of the prealloc chain constants, for early-exit
+        # rounds that verify at a depth below the parked num_steps. Keyed by
+        # depth; built lazily (the candidate depths are only known once the
+        # AdaptiveController exists) and allocated outside any capture.
+        self._early_exit_chain_consts: dict = {}
 
         # Persistent confidence buffer written in-place by draft_forward so
         # captured draft graphs refresh it on replay (graph-pool tensors
@@ -674,6 +680,277 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
+
+    def _chain_consts_for_depth(
+        self, depth: int, bs: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Runtime-invariant (parent_list, top_scores_index) for a depth-deep
+        topk=1 chain — the per-depth analog of the constants the k_max fast
+        path slices (see _rebuild_topk1_chain_buffers). Cached per depth so
+        early-exit rounds allocate nothing after the first stop at a depth."""
+        consts = self._early_exit_chain_consts.get(depth)
+        if consts is None:
+            max_bs = self._topk1_parents_prealloc.shape[0]
+            parent_width = depth if depth > 1 else 0
+            consts = (
+                torch.arange(
+                    -1, parent_width - 1, dtype=torch.long, device=self.device
+                ).repeat(max_bs, 1),
+                torch.arange(depth, dtype=torch.long, device=self.device).repeat(
+                    max_bs, 1
+                ),
+            )
+            self._early_exit_chain_consts[depth] = consts
+        parent_list, top_scores_index = consts
+        return parent_list[:bs], top_scores_index[:bs]
+
+    def draft_early_exit(
+        self, batch: ScheduleBatch, stop_depths: List[int], stop_price: float
+    ) -> Tuple[torch.Tensor, int, List[List[float]]]:
+        """Eager step-wise draft with in-round early exit (topk=1 chains).
+
+        Runs the draft loop one drafter forward at a time — never the
+        captured draft graph (the same eager path draft() falls back to
+        when graphs can't run) — and may stop at an allowed depth when the
+        marginal step no longer pays (see _draft_forward_early_exit).
+
+        Returns ``(draft_tokens, depth, confidences)``: ``draft_tokens`` is
+        ``[bs, depth]`` chain tokens, ``depth`` = g_v in
+        ``[1, speculative_num_steps]``, and ``confidences`` are this
+        round's per-request per-position draft probabilities (host floats,
+        rows aligned with batch.reqs) — already synced by the stop checks,
+        so recording them is one tiny extra D2H.
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        forward_batch, _can_cuda_graph = draft_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        # Eager multi-step draft: init all step backends up front (we may
+        # use fewer than speculative_num_steps of them).
+        self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.mark_forward_metadata_ready()
+
+        n_inner = self.speculative_num_steps - 1
+        canary_outside_ctx = (
+            c.with_ops_outside_graph(
+                single_forward_indices=list(range(n_inner)),
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+        with canary_outside_ctx:
+            draft_tokens, depth = self._draft_forward_early_exit(
+                forward_batch, stop_depths, stop_price
+            )
+
+        bs = batch.seq_lens.shape[0]
+        confidences = self._draft_conf_buffer[:bs, :depth].tolist()
+        return draft_tokens, depth, confidences
+
+    def _draft_forward_early_exit(
+        self,
+        forward_batch: ForwardBatch,
+        stop_depths: List[int],
+        stop_price: float,
+    ) -> Tuple[torch.Tensor, int]:
+        """draft_forward's eager early-exit twin (topk=1, softmax path only).
+
+        The stop rule prices the NEXT drafter forward: with ``d`` drafts
+        already determined, one more forward determines draft ``d + 1``,
+        whose expected marginal correct drafts are approximated by
+        ``sum_i chain_probs_i * last_probs_i`` — the chain probability that
+        the first ``d`` drafts all commit times the last position's own
+        probability as the next-position proxy (for ``d == 1`` no forward
+        has run this round and the proxy is the chain itself). Checks run
+        only at depths in *stop_depths* (candidate depths with a built
+        verify state), so stopping always lands on the nearest allowed
+        depth at or past the raw stop point, and each check costs one D2H
+        sync of a single float (the batch-summed gain). Stopping at depth
+        ``d`` means only forwards ``0..d-2`` ran; the per-step Triton/torch
+        bookkeeping is identical to draft_forward's chain fast path. The
+        pure twin of this loop is
+        ``priced_spec_params.decide_early_exit_depth``.
+        """
+        assert self.topk == 1, "early-exit drafting is chain (topk=1) only"
+        assert self._draft_conf_buffer is not None
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        out_cache_loc = per_step_draft_out_cache_loc(
+            forward_batch.out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(
+            topk_p, "draft_forward_early_exit: NaN in initial topk_p from spec_info"
+        )
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        bs = topk_p.shape[0]
+        # Column 0: probability of the first draft token (sampled in draft
+        # extend, carried in via spec_info.topk_p) — same as draft_forward.
+        self._draft_conf_buffer[:bs, 0].copy_(topk_p[:, 0])
+        # chain_probs[r] = P(the first d drafts of request r all commit);
+        # last_probs[r] = the d-th draft's own probability (a_next proxy).
+        last_probs = topk_p[:, 0].to(torch.float32)
+        chain_probs = last_probs.clone()
+
+        stop_depth_set = set(stop_depths)
+        num_steps = self.speculative_num_steps
+        depth = num_steps
+        token_list: List[torch.Tensor] = []
+        scores = None
+        for i in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            token_list.append(tree_info[1])
+
+            # We don't need to run the last forward (same as draft_forward).
+            if i == num_steps - 1:
+                break
+
+            # Stop check BEFORE paying the next forward. d = i + 1 drafts
+            # are determined; this is the depth we keep if we stop here.
+            d = i + 1
+            if d in stop_depth_set:
+                marginal_gain = float((chain_probs * last_probs).sum().item())
+                if early_exit_should_stop(marginal_gain, stop_price):
+                    depth = d
+                    break
+
+            # Set inputs
+            forward_batch.input_ids = input_ids
+            if (
+                self.draft_runner.model_config.hf_config.architectures[0]
+                == "Qwen3MoeForCausalLMMTP"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            spec_info.hidden_states = hidden_states
+
+            canary_index_ctx = (
+                c.with_active_single_forward_manager(i)
+                if (c := self.draft_runner.canary_manager) is not None
+                else contextlib.nullcontext()
+            )
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
+                logits_output = self.draft_runner.forward(forward_batch).logits_output
+            maybe_detect_nan(
+                logits_output.next_token_logits, f"draft_forward_early_exit step {i}"
+            )
+            maybe_detect_inf(
+                logits_output.next_token_logits, f"draft_forward_early_exit step {i}"
+            )
+            # The stop rule needs real probabilities, so this loop always
+            # takes the softmax path (the argmax shortcut sets topk_p = 1
+            # and would make every chain probability meaningless).
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            self._draft_conf_buffer[: topk_p.shape[0], i + 1].copy_(topk_p[:, 0])
+            last_probs = topk_p[:, 0].to(torch.float32)
+            chain_probs = chain_probs * last_probs
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                f"draft_forward_early_exit step {i}: topk_index OOB vs "
+                f"vocab_size={logits_output.next_token_logits.shape[-1]}",
+            )
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
+
+        # token_list holds exactly `depth` per-step [bs, 1] chain tokens.
+        draft_tokens = torch.cat(token_list, dim=1)
+        return draft_tokens, depth
+
+    def build_chain_verify_input(
+        self, batch: ScheduleBatch, draft_tokens: torch.Tensor, depth: int
+    ) -> EagleVerifyInput:
+        """Assemble the verify input for a depth-deep chain (early-exit rounds).
+
+        The tree mask / position buffers are fetched from the LIVE target
+        attention backend, so this must run with the depth-matched runtime
+        state's target resources applied (inside _early_exit_verify_scope
+        when depth < the parked num_steps).
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        num_draft_tokens = depth + 1
+        bs = draft_tokens.shape[0]
+        parent_list, top_scores_index = self._chain_consts_for_depth(depth, bs)
+
+        tree_mask_buf, position_buf = (
+            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+        )
+        # Same sizing rule as draft(): seq_lens_sum only sizes a
+        # non-preallocated tree mask; over-size is safe.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                max_context_len = (
+                    self.target_worker.model_runner.attn_backend.max_context_len
+                )
+                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+            else:
+                seq_lens_sum = 0
+
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            draft_input.bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            self.topk,
+            depth,
+            num_draft_tokens,
+            self.tree_mask_mode,
+            tree_mask_buf,
+            position_buf,
+        )
+
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=depth,
+            topk=self.topk,
+            draft_token_num=num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
         )
 
     def draft_extend(self):
@@ -1273,6 +1550,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
                 )
+
+            early_exit_plan = self._early_exit_round_plan(batch)
+            if early_exit_plan is not None:
+                stop_depths, stop_price = early_exit_plan
+                return self._forward_early_exit_decode(
+                    batch, rids, stop_depths, stop_price, on_publish
+                )
+
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1606,6 +1891,176 @@ class EAGLEWorkerV2(BaseSpecWorker):
             f"{len(chunks)} chunk(s) "
             f"(budget {self._g0_catch_up_chunk_tokens} tokens/extend)",
         )
+
+    def _early_exit_round_plan(
+        self, batch: ScheduleBatch
+    ) -> Optional[Tuple[List[int], float]]:
+        """(stop depths, stop price) when this decode round should run the
+        in-round early-exit draft; None runs the normal captured path.
+
+        Worker-side gates (the policy-side gates live in
+        AdaptiveController.early_exit_plan): topk=1 chains only; real draft
+        probabilities must be captured (SGLANG_SPEC_CAPTURE_CONFIDENCE —
+        without it the chain signal is the argmax path's all-ones); and
+        single-rank only — the stop decision is a data-dependent host
+        branch, so any cross-rank probability divergence would
+        desynchronize collective shapes (DP attention, TBO, TP > 1).
+        """
+        ac = self.adaptive_controller
+        if ac is None or self.topk != 1:
+            return None
+        if batch.forward_mode.is_idle():
+            return None
+        if self._draft_worker._draft_conf_buffer is None:
+            return None
+        sa = self.server_args
+        if sa.enable_dp_attention or sa.enable_two_batch_overlap or sa.tp_size > 1:
+            return None
+        if self.speculative_num_steps < 2:
+            return None
+        return ac.early_exit_plan(batch.seq_lens.shape[0])
+
+    @contextlib.contextmanager
+    def _early_exit_verify_scope(self, depth: int):
+        """Compose one round's verify + draft-extend from state[depth].
+
+        Swaps exactly the target-side resources (attn backend + verify
+        graph runner), the draft-extend backend/graph, and the step scalars
+        — NOT the draft-decode backend, the draft graph, or the topk=1
+        chain prealloc buffers, which stay parked at k_max (the next round
+        drafts at k_max again). server_args is also left untouched: the
+        scheduler's per-decode KV over-allocation is sized by
+        max_speculative_num_draft_tokens, which already covers every depth,
+        and prepare_for_decode's bonus-slot pre-claim plus the resolver's
+        ``accept_lens - 1`` commit are depth-independent — the only
+        stride-sensitive consumer is result.speculative_num_draft_tokens,
+        which verify() sets from the scoped scalar (= depth + 1).
+        """
+        state = self.adaptive_controller.get_state(depth)
+        assert state is not None, (
+            f"early exit stopped at depth {depth} without a runtime state"
+        )
+        dw = self._draft_worker
+        mr = self._target_worker.model_runner
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            dw.speculative_num_steps,
+            dw.speculative_num_draft_tokens,
+            dw.draft_extend_attn_backend,
+            dw.cuda_graph_runner_for_draft_extend,
+            mr.attn_backend,
+            mr.decode_cuda_graph_runner,
+        )
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.speculative_num_steps = state.speculative_num_steps
+        dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.draft_extend_attn_backend = state.draft_extend_attn_backend
+        dw.cuda_graph_runner_for_draft_extend = (
+            state.cuda_graph_runner_for_draft_extend
+        )
+        mr.attn_backend = state.target_attn_backend
+        mr.decode_cuda_graph_runner = state.target_graph_runner
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                dw.speculative_num_steps,
+                dw.speculative_num_draft_tokens,
+                dw.draft_extend_attn_backend,
+                dw.cuda_graph_runner_for_draft_extend,
+                mr.attn_backend,
+                mr.decode_cuda_graph_runner,
+            ) = backup
+
+    def _forward_early_exit_decode(
+        self,
+        batch: ScheduleBatch,
+        rids: Optional[List[str]],
+        stop_depths: List[int],
+        stop_price: float,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """One decode round with in-round early-exit drafting.
+
+        The draft loop runs eagerly at the parked k_max state and may stop
+        at a candidate depth g_v < k_max; verify and draft-extend then run
+        composed from state[g_v]'s target / extend resources while the
+        draft side stays at k_max (_early_exit_verify_scope). The result
+        carries speculative_num_draft_tokens = g_v + 1, so the resolve
+        stride, the KV commit bookkeeping, and the policy's
+        on_verify_complete (num_steps = stride - 1 = g_v, keying the
+        realized anchor at the depth that actually ran) all see the
+        executed depth.
+        """
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
+        ):
+            draft_tokens, depth, confidences = self.draft_worker.draft_early_exit(
+                batch, stop_depths, stop_price
+            )
+
+        scope = (
+            self._early_exit_verify_scope(depth)
+            if depth != self.speculative_num_steps
+            else contextlib.nullcontext()
+        )
+        with scope:
+            verify_input = self.draft_worker.build_chain_verify_input(
+                batch, draft_tokens, depth
+            )
+            assert verify_input.is_verify_input()
+            batch.spec_info = verify_input
+            batch_output = self.verify(batch)
+            # Publish before draft_extend so the fence is at verify-end.
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
+            ):
+                self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+        # Early-exit rounds already synced this round's confidences to host
+        # (the stop checks are D2H reads), so telemetry records them
+        # same-round (no conf_lag) and the policy is fed directly. The
+        # zero-sync staged read is bypassed; its staged state stays intact,
+        # exactly like a g=0 round, and is re-paired at the next normal
+        # round.
+        telem = get_spec_telemetry()
+        if telem is not None:
+            batch_output.spec_telemetry_step_idx = telem.on_decode_step(
+                num_reqs=batch.seq_lens.shape[0],
+                num_steps=depth,
+                num_draft_tokens=depth + 1,
+                seq_lens_sum=(
+                    int(batch.seq_lens_sum) if batch.seq_lens_sum is not None else -1
+                ),
+                confidences=confidences,
+                worker_round_idx=self._forward_round_ct,
+                early_exit=True,
+            )
+        if (
+            self.adaptive_controller is not None
+            and self.adaptive_controller.wants_draft_confidences
+            and rids is not None
+            and confidences is not None
+        ):
+            self.adaptive_controller.observe_draft_confidences(rids, confidences)
+
+        return batch_output
 
     def on_verify_complete_cpu(
         self,
