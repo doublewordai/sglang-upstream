@@ -433,7 +433,17 @@ class PricedSpeculativeParams:
 
         self._round_ct += 1
         if self._round_ct > self._cfg.warmup_rounds:
+            steps_before = self.current_steps
             self._maybe_switch(batch_size, rids)
+            if self.current_steps != steps_before:
+                # The next wall gap spans the runtime-state swap and the new
+                # graphs' warmup — charging it to either config poisons that
+                # config's cost EMA (probes self-poison their destination;
+                # observed parking at conc 1). Skip attribution for it.
+                self._last_round_idx = round_idx
+                self._last_round_t = now
+                self._last_round_cost_key = None
+                return self.current_steps
 
         self._last_round_idx = round_idx
         self._last_round_t = now
@@ -663,10 +673,15 @@ class PricedSpeculativeParams:
         ``evidence_decay`` per unupdated round, so g=0 phases — which
         generate no updates — cannot freeze pessimistic evidence forever.
         """
-        prior = self._cfg.prior_accept_rate
+        # Stale/absent evidence reverts to the realized-anchor-implied rate
+        # when realized data exists, NOT the config prior: an optimistic
+        # prior re-convinces the policy every decay time-constant that
+        # speculation pays, probe-loops, and burns throughput (observed at
+        # conc 256: 5.7%/round switch rate, half the no-spec throughput).
+        target = self._decay_target_rate()
         state = self._reqs.get(rid)
         if state is None:
-            return _geometric_expected(prior, steps)
+            return _geometric_expected(target, steps)
         decay = self._staleness_decay(state)
         if state.last_confidences:
             conf = state.last_confidences
@@ -675,14 +690,22 @@ class PricedSpeculativeParams:
             for d in range(steps):
                 a_hat = conf[d] if d < len(conf) else conf[-1]
                 a_hat = min(max(a_hat, 0.0), 1.0)
-                chain_prob *= prior + (a_hat - prior) * decay
+                chain_prob *= target + (a_hat - target) * decay
                 total += chain_prob
             return total
         if state.accept_rate_ema is not None:
             return _geometric_expected(
-                prior + (state.accept_rate_ema - prior) * decay, steps
+                target + (state.accept_rate_ema - target) * decay, steps
             )
-        return _geometric_expected(prior, steps)
+        return _geometric_expected(target, steps)
+
+    def _decay_target_rate(self) -> float:
+        """Per-position rate that stale evidence reverts to: implied by the
+        realized accept curve at its deepest sampled g, else the prior."""
+        if self._realized_correct_ema:
+            g = max(self._realized_correct_ema)
+            return _implied_accept_rate(self._realized_correct_ema[g], g)
+        return self._cfg.prior_accept_rate
 
     def _staleness_decay(self, state: _RequestState) -> float:
         """Multiplier in (0, 1] pulling stale evidence toward the prior.
@@ -735,26 +758,33 @@ class PricedSpeculativeParams:
         if ema is not None:
             return ema
 
-        # Unseen bucket: derive an estimate from observed EMAs (token-ratio
-        # scaling within the bucket, else same-g nearest bucket).
+        # Unseen bucket: derive an estimate from observed EMAs. Same-g
+        # evidence at another bucket comes FIRST — it is config-honest.
+        # Token-linear scaling within the bucket is only a fallback: at
+        # small batch the verify width is nearly free (latency-bound), so
+        # scaling k=0 cost by (g+1) wildly overprices wide configs
+        # (observed at conc 4: derived 30 ms vs 9.6 ms measured for k=4,
+        # parking the policy at k=0 against a +26% optimum).
         derived: float | None = None
         if self._cost_ema:
-            same_bucket = [
-                (g, c) for (b, g), c in self._cost_ema.items() if b == bucket
+            same_g = [
+                (b, c) for (b, g), c in self._cost_ema.items() if g == steps
             ]
-            if same_bucket:
-                g_near, c_near = min(same_bucket, key=lambda gc: abs(gc[0] - steps))
-                derived = c_near * (steps + 1) / (g_near + 1)
+            if same_g:
+                log_b = math.log(max(bucket, 1))
+                _, c_near = min(
+                    same_g, key=lambda bc: abs(math.log(max(bc[0], 1)) - log_b)
+                )
+                derived = c_near
             else:
-                same_g = [
-                    (b, c) for (b, g), c in self._cost_ema.items() if g == steps
+                same_bucket = [
+                    (g, c) for (b, g), c in self._cost_ema.items() if b == bucket
                 ]
-                if same_g:
-                    log_b = math.log(max(bucket, 1))
-                    _, c_near = min(
-                        same_g, key=lambda bc: abs(math.log(max(bc[0], 1)) - log_b)
+                if same_bucket:
+                    g_near, c_near = min(
+                        same_bucket, key=lambda gc: abs(gc[0] - steps)
                     )
-                    derived = c_near
+                    derived = c_near * (steps + 1) / (g_near + 1)
 
         # Evidence beats optimism: once this g has a realized-gap EMA at ANY
         # bucket, the derived estimate stands alone — re-applying the table's
