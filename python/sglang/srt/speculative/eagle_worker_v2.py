@@ -39,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
@@ -56,7 +60,22 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
+from sglang.srt.speculative.eagle_info_v2 import (
+    assign_extend_cache_locs_func,
+    fill_bonus_tokens,
+)
+from sglang.srt.speculative.g0_gap_buffer import (
+    G0GapBuffer,
+    partition_catch_up_chunks,
+)
+from sglang.srt.speculative.priced_spec_params import (
+    early_exit_should_skip,
+    early_exit_should_stop,
+)
+from sglang.srt.speculative.spec_telemetry import (
+    capture_draft_confidence,
+    get_spec_telemetry,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -149,6 +168,39 @@ class EagleDraftWorker(BaseDraftWorker):
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
+        # Per-depth analogs of the prealloc chain constants, for early-exit
+        # rounds that verify at a depth below the parked num_steps. Keyed by
+        # depth; built lazily (the candidate depths are only known once the
+        # AdaptiveController exists) and allocated outside any capture.
+        self._early_exit_chain_consts: dict = {}
+
+        # Persistent confidence buffer written in-place by draft_forward so
+        # captured draft graphs refresh it on replay (graph-pool tensors
+        # cannot be read back safely; a fixed-address buffer can).
+        # Rows: requests (capture-padded); cols: draft step. Sized once at
+        # init — allocating inside a capture would land it in the graph pool.
+        self._draft_conf_buffer = None
+        # One-round-stale, zero-sync confidence readback: each call to
+        # read_draft_confidences stages the GPU buffer into this pinned host
+        # buffer with a non-blocking copy and delivers the PREVIOUS call's
+        # staged values (paired with that call's rids). Confidences only
+        # inform the NEXT round's decision, so the staleness is free, while
+        # a blocking .cpu() read taxed every round (~1-2 ms of a ~9 ms round
+        # at batch size 1 on GH200).
+        self._conf_staging_buffer = None
+        self._conf_copy_event = None
+        self._staged_conf_rids: Optional[List[str]] = None
+        self._staged_conf_shape: Optional[Tuple[int, int]] = None
+        if capture_draft_confidence():
+            self._draft_conf_buffer = torch.zeros(
+                (8192, 16), dtype=torch.float32, device=server_args.device
+            )
+            self._conf_staging_buffer = torch.zeros(
+                (8192, 16), dtype=torch.float32, pin_memory=True
+            )
+            self._conf_copy_event = torch.get_device_module(
+                server_args.device
+            ).Event()
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
@@ -530,6 +582,11 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
+        if self._draft_conf_buffer is not None:
+            # Column 0: probability of the first draft token (sampled in
+            # draft extend, carried in via spec_info.topk_p).
+            self._draft_conf_buffer[: topk_p.shape[0], 0].copy_(topk_p[:, 0])
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -580,12 +637,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.topk == 1 and not _is_hip:
+            if self.topk == 1 and not _is_hip and self._draft_conf_buffer is None:
                 # topk=1 → degenerate single-path tree; `topk_p` is unused
                 # downstream, so skip softmax and just argmax over logits.
                 # Gated to CUDA: on ROCm the argmax tie-break diverges from
                 # the softmax+max path on FP8 logits and corrupts MTP draft
                 # selection (DSV3.2 MTP GSM8K, see #26358).
+                # Confidence capture needs the real probabilities, so it
+                # takes the softmax path.
                 topk_index = torch.argmax(
                     logits_output.next_token_logits, dim=-1, keepdim=True
                 )
@@ -593,6 +652,8 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 probs = torch.softmax(logits_output.next_token_logits, dim=-1)
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self._draft_conf_buffer is not None:
+                self._draft_conf_buffer[: topk_p.shape[0], i + 1].copy_(topk_p[:, 0])
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -624,8 +685,324 @@ class EagleDraftWorker(BaseDraftWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
+    def _chain_consts_for_depth(
+        self, depth: int, bs: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Runtime-invariant (parent_list, top_scores_index) for a depth-deep
+        topk=1 chain — the per-depth analog of the constants the k_max fast
+        path slices (see _rebuild_topk1_chain_buffers). Cached per depth so
+        early-exit rounds allocate nothing after the first stop at a depth."""
+        consts = self._early_exit_chain_consts.get(depth)
+        if consts is None:
+            max_bs = self._topk1_parents_prealloc.shape[0]
+            parent_width = depth if depth > 1 else 0
+            consts = (
+                torch.arange(
+                    -1, parent_width - 1, dtype=torch.long, device=self.device
+                ).repeat(max_bs, 1),
+                torch.arange(depth, dtype=torch.long, device=self.device).repeat(
+                    max_bs, 1
+                ),
+            )
+            self._early_exit_chain_consts[depth] = consts
+        parent_list, top_scores_index = consts
+        return parent_list[:bs], top_scores_index[:bs]
+
+    def draft_early_exit(
+        self, batch: ScheduleBatch, stop_depths: List[int], stop_price: float
+    ) -> Tuple[torch.Tensor, int, List[List[float]]]:
+        """Eager step-wise draft with in-round early exit (topk=1 chains).
+
+        Runs the draft loop one drafter forward at a time — never the
+        captured draft graph (the same eager path draft() falls back to
+        when graphs can't run) — and may stop at an allowed depth when the
+        marginal step no longer pays (see _draft_forward_early_exit).
+
+        Returns ``(draft_tokens, depth, confidences)``: ``draft_tokens`` is
+        ``[bs, depth]`` chain tokens, ``depth`` = g_v in
+        ``[1, speculative_num_steps]``, and ``confidences`` are this
+        round's per-request per-position draft probabilities (host floats,
+        rows aligned with batch.reqs) — already synced by the stop checks,
+        so recording them is one tiny extra D2H.
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        forward_batch, _can_cuda_graph = draft_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        # Eager multi-step draft: init all step backends up front (we may
+        # use fewer than speculative_num_steps of them).
+        self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.mark_forward_metadata_ready()
+
+        n_inner = self.speculative_num_steps - 1
+        canary_outside_ctx = (
+            c.with_ops_outside_graph(
+                single_forward_indices=list(range(n_inner)),
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+        with canary_outside_ctx:
+            draft_tokens, depth = self._draft_forward_early_exit(
+                forward_batch, stop_depths, stop_price
+            )
+
+        bs = batch.seq_lens.shape[0]
+        confidences = self._draft_conf_buffer[:bs, :depth].tolist()
+        return draft_tokens, depth, confidences
+
+    def _draft_forward_early_exit(
+        self,
+        forward_batch: ForwardBatch,
+        stop_depths: List[int],
+        stop_price: float,
+    ) -> Tuple[torch.Tensor, int]:
+        """draft_forward's eager early-exit twin (topk=1, softmax path only).
+
+        The stop rule prices the NEXT drafter forward: with ``d`` drafts
+        already determined, one more forward determines draft ``d + 1``,
+        whose expected marginal correct drafts are approximated by
+        ``sum_i chain_probs_i * last_probs_i`` — the chain probability that
+        the first ``d`` drafts all commit times the last position's own
+        probability as the next-position proxy (for ``d == 1`` no forward
+        has run this round and the proxy is the chain itself). Checks run
+        only at depths in *stop_depths* (candidate depths with a built
+        verify state), so stopping always lands on the nearest allowed
+        depth at or past the raw stop point, and each check costs one D2H
+        sync of a single float (the batch-summed gain). Stopping at depth
+        ``d`` means only forwards ``0..d-2`` ran; the per-step Triton/torch
+        bookkeeping is identical to draft_forward's chain fast path. The
+        pure twin of this loop is
+        ``priced_spec_params.decide_early_exit_depth``.
+        """
+        assert self.topk == 1, "early-exit drafting is chain (topk=1) only"
+        assert self._draft_conf_buffer is not None
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        out_cache_loc = per_step_draft_out_cache_loc(
+            forward_batch.out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(
+            topk_p, "draft_forward_early_exit: NaN in initial topk_p from spec_info"
+        )
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        bs = topk_p.shape[0]
+        # Column 0: probability of the first draft token (sampled in draft
+        # extend, carried in via spec_info.topk_p) — same as draft_forward.
+        self._draft_conf_buffer[:bs, 0].copy_(topk_p[:, 0])
+        # chain_probs[r] = P(the first d drafts of request r all commit);
+        # last_probs[r] = the d-th draft's own probability (a_next proxy).
+        last_probs = topk_p[:, 0].to(torch.float32)
+        chain_probs = last_probs.clone()
+
+        stop_depth_set = set(stop_depths)
+        num_steps = self.speculative_num_steps
+        depth = num_steps
+        token_list: List[torch.Tensor] = []
+        scores = None
+        for i in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            token_list.append(tree_info[1])
+
+            # We don't need to run the last forward (same as draft_forward).
+            if i == num_steps - 1:
+                break
+
+            # Stop check BEFORE paying the next forward. d = i + 1 drafts
+            # are determined; this is the depth we keep if we stop here.
+            d = i + 1
+            if d in stop_depth_set:
+                marginal_gain = float((chain_probs * last_probs).sum().item())
+                if early_exit_should_stop(marginal_gain, stop_price):
+                    depth = d
+                    break
+
+            # Set inputs
+            forward_batch.input_ids = input_ids
+            if (
+                self.draft_runner.model_config.hf_config.architectures[0]
+                == "Qwen3MoeForCausalLMMTP"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            spec_info.hidden_states = hidden_states
+
+            canary_index_ctx = (
+                c.with_active_single_forward_manager(i)
+                if (c := self.draft_runner.canary_manager) is not None
+                else contextlib.nullcontext()
+            )
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
+                logits_output = self.draft_runner.forward(forward_batch).logits_output
+            maybe_detect_nan(
+                logits_output.next_token_logits, f"draft_forward_early_exit step {i}"
+            )
+            maybe_detect_inf(
+                logits_output.next_token_logits, f"draft_forward_early_exit step {i}"
+            )
+            # The stop rule needs real probabilities, so this loop always
+            # takes the softmax path (the argmax shortcut sets topk_p = 1
+            # and would make every chain probability meaningless).
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            self._draft_conf_buffer[: topk_p.shape[0], i + 1].copy_(topk_p[:, 0])
+            last_probs = topk_p[:, 0].to(torch.float32)
+            chain_probs = chain_probs * last_probs
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                f"draft_forward_early_exit step {i}: topk_index OOB vs "
+                f"vocab_size={logits_output.next_token_logits.shape[-1]}",
+            )
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
+
+        # token_list holds exactly `depth` per-step [bs, 1] chain tokens.
+        draft_tokens = torch.cat(token_list, dim=1)
+        return draft_tokens, depth
+
+    def build_chain_verify_input(
+        self, batch: ScheduleBatch, draft_tokens: torch.Tensor, depth: int
+    ) -> EagleVerifyInput:
+        """Assemble the verify input for a depth-deep chain (early-exit rounds).
+
+        The tree mask / position buffers are fetched from the LIVE target
+        attention backend, so this must run with the depth-matched runtime
+        state's target resources applied (inside _early_exit_verify_scope
+        when depth < the parked num_steps).
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        num_draft_tokens = depth + 1
+        bs = draft_tokens.shape[0]
+        parent_list, top_scores_index = self._chain_consts_for_depth(depth, bs)
+
+        tree_mask_buf, position_buf = (
+            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+        )
+        # Same sizing rule as draft(): seq_lens_sum only sizes a
+        # non-preallocated tree mask; over-size is safe.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                max_context_len = (
+                    self.target_worker.model_runner.attn_backend.max_context_len
+                )
+                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+            else:
+                seq_lens_sum = 0
+
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            draft_input.bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            self.topk,
+            depth,
+            num_draft_tokens,
+            self.tree_mask_mode,
+            tree_mask_buf,
+            position_buf,
+        )
+
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=depth,
+            topk=self.topk,
+            draft_token_num=num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+
     def draft_extend(self):
         pass
+
+    def read_draft_confidences(
+        self, rids: Optional[List[str]], num_reqs: int, num_steps: int
+    ) -> Optional[Tuple[Optional[List[str]], List[List[float]]]]:
+        """Stage this round's confidence buffer; deliver the previous round's.
+
+        Zero-sync by construction: the GPU confidence buffer is staged into a
+        pinned host buffer with a non-blocking copy (row slice only, so the
+        D2H stays genuinely async), and the return value is the PREVIOUS
+        call's already-landed staged values, paired with the rids passed to
+        that call. Confidences only inform the NEXT round's decision, so the
+        one-round staleness is free.
+
+        Returns ``(rids_prev, values_prev)`` — ``rids_prev`` is ``None`` when
+        the previous caller passed no rids — or ``None`` when nothing is
+        deliverable: capture off, first call, ``num_steps == 0``, or the
+        staged copy has not landed yet. Landing is checked with a
+        non-blocking event query; a not-yet-landed copy skips the delivery
+        (never waits) and the policy's staleness decay absorbs the gap.
+
+        ``num_steps == 0`` rounds produce no fresh confidences: no copy, no
+        sync, no delivery; the staged state is left intact, so after a
+        g>0 -> g=0 transition the last staged values are still delivered once
+        at the next g>0 round (the caller re-pairs them against live rids).
+        """
+        if self._draft_conf_buffer is None or num_steps <= 0:
+            return None
+        delivered = None
+        if self._staged_conf_shape is not None and self._conf_copy_event.query():
+            num_reqs_prev, num_steps_prev = self._staged_conf_shape
+            delivered = (
+                self._staged_conf_rids,
+                self._conf_staging_buffer[:num_reqs_prev, :num_steps_prev].tolist(),
+            )
+        num_reqs = min(num_reqs, self._conf_staging_buffer.shape[0])
+        self._conf_staging_buffer[:num_reqs].copy_(
+            self._draft_conf_buffer[:num_reqs], non_blocking=True
+        )
+        self._conf_copy_event.record()
+        self._staged_conf_rids = list(rids) if rids is not None else None
+        self._staged_conf_shape = (
+            num_reqs,
+            min(num_steps, self._draft_conf_buffer.shape[1]),
+        )
+        return delivered
 
     def _draft_extend_for_prefill(
         self,
@@ -788,9 +1165,11 @@ class EagleDraftWorker(BaseDraftWorker):
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if self.topk == 1 and not _is_hip:
+        if self.topk == 1 and not _is_hip and self._draft_conf_buffer is None:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
+            # MTP draft selection on FP8 logits. Confidence capture needs the
+            # real probabilities (this topk_p seeds draft_forward column 0),
+            # so it takes the softmax path.
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
@@ -811,6 +1190,142 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+
+    def _draft_extend_for_g0_catch_up(
+        self,
+        batch: ScheduleBatch,
+        sel_indices: List[int],
+        gap_lens: List[int],
+        gap_tokens: torch.Tensor,
+        gap_hidden_states: Optional[torch.Tensor],
+        tail_gap_lens: Optional[List[int]] = None,
+    ):
+        """Re-sync the drafter KV cache over tokens decoded during g=0 rounds.
+
+        g=0 rounds never invoke the drafter, so its KV cache misses the last
+        gap positions of each selected request. This runs one eager
+        arbitrary-length draft extend (the ``_draft_extend_for_prefill``
+        shape, not the fixed-shape decode draft-extend) over a slice of those
+        positions, consuming the buffered (token, target hidden state) pairs.
+        The caller chunks large drains into multiple sequential calls (token
+        budget ``g0_catch_up_chunk_tokens``); slices of one request must
+        arrive in position order across calls (drafter KV writes are
+        sequential per request).
+
+        Args:
+            batch: The current decode batch (pre-round ``seq_lens``: with
+                ``tail = tail_gap_lens[i]`` (0 when absent), the slice of
+                request ``i`` covers positions
+                ``[seq_lens_i - tail - gap, seq_lens_i - tail)``).
+            sel_indices: Batch-row indices of requests with a non-empty slice.
+            gap_lens: Per-selected-request slice length, same order.
+            gap_tokens: Flat ``[sum(gap_lens)]`` drafter input tokens.
+            gap_hidden_states: Flat ``[sum(gap_lens), hidden]`` target hidden
+                states (None for STANDALONE, whose draft has no hidden input).
+            tail_gap_lens: Per-selected-request count of gap tokens that
+                remain AFTER this slice (deferred to later chunks). None or
+                all-zero when the slice reaches the request's current end.
+
+        Returns:
+            (topk_p, topk_index, hidden_states) for the selected rows — the
+            drafter's next-draft inputs at each request's slice end. Only
+            meaningful for rows with ``tail_gap_lens[i] == 0`` (the request's
+            current position); interior-slice rows must be discarded.
+        """
+        device = self.device
+        if tail_gap_lens is None:
+            tail_gap_lens = [0] * len(sel_indices)
+        sel = torch.tensor(sel_indices, dtype=torch.int64, device=device)
+        gaps = torch.tensor(gap_lens, dtype=torch.int64, device=device)
+        tails = torch.tensor(tail_gap_lens, dtype=torch.int64, device=device)
+        seq_lens = batch.seq_lens[sel] - tails
+        prefix_lens = seq_lens - gaps
+        req_pool_indices = batch.req_pool_indices[sel]
+        num_gap_tokens = int(sum(gap_lens))
+
+        # Flat per-token positions [prefix_i, prefix_i + gap_i) per request.
+        row_per_tok = torch.repeat_interleave(
+            torch.arange(len(sel_indices), dtype=torch.int64, device=device), gaps
+        )
+        extend_start_loc = torch.cumsum(gaps, dim=0) - gaps
+        positions = prefix_lens[row_per_tok] + (
+            torch.arange(num_gap_tokens, dtype=torch.int64, device=device)
+            - extend_start_loc[row_per_tok]
+        )
+        # The gap positions are committed KV (the target wrote them during the
+        # g=0 rounds), so their slots are still mapped in req_to_token.
+        out_cache_loc = self.req_to_token_pool.req_to_token[
+            req_pool_indices[row_per_tok], positions
+        ].to(torch.int64)
+
+        if batch.seq_lens_cpu is not None:
+            sel_cpu = torch.tensor(sel_indices, dtype=torch.int64)
+            tails_cpu = torch.tensor(tail_gap_lens, dtype=torch.int64)
+            seq_lens_cpu = batch.seq_lens_cpu[sel_cpu] - tails_cpu
+            seq_lens_sum = int(seq_lens_cpu.sum())
+            extend_prefix_lens_cpu = [
+                int(l) - g for l, g in zip(seq_lens_cpu.tolist(), gap_lens)
+            ]
+        else:
+            seq_lens_cpu = None
+            seq_lens_sum = None
+            extend_prefix_lens_cpu = None
+
+        capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        spec_info = EagleDraftInput(
+            hidden_states=gap_hidden_states,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+            capture_hidden_mode=capture_hidden_mode,
+        )
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=len(sel_indices),
+            input_ids=gap_tokens,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=seq_lens_sum,
+            orig_seq_lens=(
+                batch.orig_seq_lens[sel] if batch.orig_seq_lens is not None else None
+            ),
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            extend_prefix_lens=prefix_lens.to(torch.int32),
+            extend_seq_lens=gaps.to(torch.int32),
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=gap_lens,
+            extend_start_loc=extend_start_loc.to(torch.int32),
+            extend_num_tokens=num_gap_tokens,
+            return_logprob=False,
+            spec_algorithm=self.speculative_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=capture_hidden_mode,
+        )
+
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
+            )
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+        with canary_ctx:
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
+        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_g0_catch_up")
+        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_g0_catch_up")
+
+        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        return topk_p, topk_index, logits_output.hidden_states
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -861,10 +1376,50 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+        # Counts every forward_batch_generation round (prefill + decode);
+        # consecutive indices let the priced policy attribute wall gaps
+        # between back-to-back decode rounds to the previous round's cost.
+        self._forward_round_ct = 0
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
+            )
+
+        # g=0 (speculation-off) support: per-request (token, hidden state)
+        # buffering so the drafter can catch up when speculation turns back on.
+        self._g0_gap_buffer: Optional[G0GapBuffer] = None
+        self._g0_defer_prefill = False
+        self._g0_prompt_tail_tokens = 512
+        # Counts requests whose drafter prefill-extend was deferred (skipped
+        # while parked at g=0); logged every 500.
+        self._g0_defer_prefill_req_ct = 0
+        if (
+            self.adaptive_controller is not None
+            and 0 in self.adaptive_controller.candidate_steps
+        ):
+            if server_args.enable_dp_attention:
+                raise ValueError(
+                    "Adaptive g=0 (candidate_steps containing 0) is not "
+                    "supported with DP attention: the drafter catch-up extend "
+                    "runs outside the MLP-sync protocol."
+                )
+            self._g0_gap_buffer = G0GapBuffer(
+                max_gap=self.adaptive_controller.g0_max_gap
+            )
+            # Token budget per catch-up drafter extend: the drain is chunked
+            # into sequential extends so re-entering speculation with a large
+            # running batch cannot OOM on extend activations.
+            self._g0_catch_up_chunk_tokens = (
+                self.adaptive_controller.g0_catch_up_chunk_tokens
+            )
+            # Deferred drafter prefill: requests admitted while the worker is
+            # parked at g=0 skip the drafter prefill-extend; their prompt
+            # tail is seeded into the gap buffer and the catch-up rebuilds
+            # the drafter KV on re-entry to k>0.
+            self._g0_defer_prefill = self.adaptive_controller.g0_defer_prefill
+            self._g0_prompt_tail_tokens = (
+                self.adaptive_controller.g0_prompt_tail_tokens
             )
 
         # Some dummy tensors
@@ -927,7 +1482,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        self._forward_round_ct += 1
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # Prefill rounds resync the drafter from scratch (draft extend
+            # below, or the gap-buffer re-seed when deferred), so any
+            # buffered g=0 gap for these requests is stale.
+            if self._g0_gap_buffer is not None:
+                self._g0_gap_buffer.drop(req.rid for req in batch.reqs)
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
@@ -943,6 +1504,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # Deferred drafter prefill: while the worker is PARKED at g=0
+            # (steps == 0 runtime state, not an early-exit scoped round —
+            # prefill never runs inside that scope) the drafter prefill-
+            # extend is a standing tax for capability the parked phase never
+            # uses. Skip it and seed the g=0 gap buffer with the prompt tail
+            # instead; the existing catch-up rebuilds the drafter KV on
+            # re-entry to k>0. Multimodal prefills (mm_input_embeds) keep the
+            # immediate extend: the catch-up path has no embedding override.
+            if (
+                self._g0_defer_prefill
+                and self.speculative_num_steps == 0
+                and not batch.forward_mode.is_idle()
+                and batch_output.logits_output.mm_input_embeds is None
+            ):
+                batch_output.next_draft_input = self._defer_drafter_prefill(
+                    batch, batch_output
+                )
+                return batch_output
 
             # Draft prefill
             with (
@@ -963,7 +1543,34 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # The priced policy needs per-request identity; keep the EMA
+            # path free of the O(bs) rid-list build. g=0 gap bookkeeping is
+            # also keyed by rid.
+            rids = None
+            if self.adaptive_controller is not None and (
+                self.adaptive_controller.needs_request_context
+                or self._g0_gap_buffer is not None
+            ):
+                rids = [req.rid for req in batch.reqs]
+            self.activate_step_by_batch(
+                batch.seq_lens.shape[0],
+                rids=rids,
+                round_idx=self._forward_round_ct,
+            )
+
+            if self.speculative_num_steps == 0:
+                # g=0: speculation off for this round — no drafter anywhere,
+                # plain 1-token target decode shaped like a spec result.
+                return self._forward_g0_decode(batch, rids, on_publish)
+
+            if (
+                self._g0_gap_buffer is not None
+                and not self._g0_gap_buffer.is_empty()
+                and not batch.forward_mode.is_idle()
+            ):
+                # Re-entering g >= 1 after g=0 rounds: the drafter must catch
+                # up over the gap tokens before it can draft again.
+                self._catch_up_drafter_after_g0(batch, rids)
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -978,6 +1585,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
                 )
+
+            early_exit_plan = self._early_exit_round_plan(batch)
+            if early_exit_plan is not None:
+                stop_depths, stop_price = early_exit_plan
+                # Pre-draft DEPTH-0 decision: when 0 is an allowed stop (a
+                # g=0 runtime state exists) and the first draft token's
+                # confidences — computed by the previous round's draft
+                # extend, so available before any drafter pass — say even
+                # the first kept draft won't pay, skip drafting entirely
+                # and run the round through the g=0 machinery.
+                if 0 in stop_depths and self._should_skip_drafting(
+                    batch, stop_price
+                ):
+                    return self._forward_depth0_decode(batch, rids, on_publish)
+                draft_stop_depths = [d for d in stop_depths if d >= 1]
+                if draft_stop_depths:
+                    return self._forward_early_exit_decode(
+                        batch, rids, draft_stop_depths, stop_price, on_publish
+                    )
+                # 0 was the only allowed stop and the batch proceeds: fall
+                # through to the normal captured draft path at the parked
+                # k_max (no intermediate depth to stop at in-draft).
+
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1003,19 +1633,709 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            # This round's confidences are only readable after draft; they
+            # feed the NEXT round's priced decision, so a one-round-stale
+            # delivery is free. The read stages this round's GPU values
+            # (non-blocking D2H into a pinned buffer) and hands back the
+            # PREVIOUS g>0 round's staged values paired with that round's
+            # rids — no GPU sync on the per-round path (a blocking read
+            # taxed ~1-2 ms of every ~9 ms round at batch size 1). Single
+            # read shared with telemetry; gated behind
+            # SGLANG_SPEC_CAPTURE_CONFIDENCE (read returns None otherwise).
+            telem = get_spec_telemetry()
+            policy_wants_confidences = (
+                self.adaptive_controller is not None
+                and self.adaptive_controller.wants_draft_confidences
+            )
+            conf_rids = None
+            confidences = None
+            if telem is not None or policy_wants_confidences:
+                staged = self.draft_worker.read_draft_confidences(
+                    rids, batch.seq_lens.shape[0], self.speculative_num_steps
+                )
+                if staged is not None:
+                    conf_rids, confidences = staged
+            if telem is not None:
+                batch_output.spec_telemetry_step_idx = telem.on_decode_step(
+                    num_reqs=batch.seq_lens.shape[0],
+                    num_steps=self.speculative_num_steps,
+                    num_draft_tokens=self.speculative_num_draft_tokens,
+                    seq_lens_sum=(
+                        int(batch.seq_lens_sum) if batch.seq_lens_sum is not None else -1
+                    ),
+                    confidences=confidences,
+                    # The staged values describe the PREVIOUS g>0 decode
+                    # round, not this record (see spec_telemetry docstring).
+                    conf_lag=1 if confidences is not None else None,
+                    worker_round_idx=self._forward_round_ct,
+                )
+            if (
+                policy_wants_confidences
+                and confidences is not None
+                and conf_rids is not None
+                and rids is not None
+            ):
+                # Re-pair the stale delivery against the live batch: requests
+                # that finished (or were evicted) since the values were staged
+                # are dropped; the policy's staleness decay covers any gap.
+                live_rids = set(rids)
+                pairs = [
+                    (rid, conf)
+                    for rid, conf in zip(conf_rids, confidences)
+                    if rid in live_rids
+                ]
+                if pairs:
+                    self.adaptive_controller.observe_draft_confidences(
+                        [rid for rid, _ in pairs],
+                        [conf for _, conf in pairs],
+                    )
+
             return batch_output
 
+    def _defer_drafter_prefill(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> EagleDraftInput:
+        """Skip the drafter prefill-extend for a prefill admitted while the
+        worker is parked at g=0; seed the gap buffer with the prompt tail.
+
+        Per request, the last ``g0_prompt_tail_tokens`` drafter rows of this
+        extend — entry ``p`` pairs the input token of position ``p + 1``
+        (the EAGLE one-left shift; the last row's token is the bonus token,
+        or the next prompt token for a non-final chunk) with the target's
+        FULL-capture hidden state of position ``p`` — are stored as the
+        request's initial gap. They are exactly the rows the immediate
+        drafter extend would have consumed, so the g=0 catch-up
+        (``_catch_up_drafter_after_g0``) drains them like decode gaps: at
+        re-entry the buffer holds the contiguous tail
+        ``[seq_len - gap, seq_len)`` (prompt tail + any g=0 decode rounds)
+        and the extend anchors there, with the drafter's rotary positions
+        set from the absolute position indices.
+
+        The accepted trade: drafter KV for prompt positions older than the
+        kept tail is NEVER built, and later drafter attention over those
+        slots reads unwritten/stale drafter-pool values. That degrades
+        draft quality for deferred requests (acceptance after re-entry may
+        be lower than for a fully prefilled request; the policy's
+        accept-EMA absorbs it) but never output correctness — the target
+        verifies every draft against its own clean KV.
+
+        The in-progress chunked request's non-final chunks are not seeded:
+        the next chunk's prefill drops the buffer anyway (its final chunk
+        seeds the tail). Returns the relay ``next_draft_input`` with real
+        bonus tokens and placeholder drafter fields (topk_p / topk_index /
+        hidden_states); the catch-up refreshes them in place before any
+        draft consumes them.
+        """
+        next_token_ids = batch_output.next_token_ids
+        target_hidden_states = batch_output.logits_output.hidden_states
+        tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+        tail_cap = min(
+            self._g0_prompt_tail_tokens, self._g0_gap_buffer.g0_max_gap
+        )
+
+        pt = 0
+        for i, extend_len in enumerate(batch.extend_lens):
+            req = batch.reqs[i]
+            if (
+                req is batch.chunked_req
+                and batch.chunked_req_next_prompt_token is not None
+            ):
+                # Non-final chunk: the next chunk re-seeds; don't hold
+                # hidden-state clones that are guaranteed to be dropped.
+                pt += extend_len
+                continue
+            n = min(tail_cap, extend_len)
+            # Drafter input tokens for the last n positions of this extend:
+            # one-left-shifted prompt tokens, tail token last. Match the
+            # dtype of the g=0 decode rounds' next_token_ids rows — the
+            # catch-up stacks seed and decode entries into one tensor.
+            gap_tokens = torch.cat(
+                (
+                    batch.input_ids[pt + extend_len - n + 1 : pt + extend_len],
+                    tail_tokens[i].reshape(1),
+                )
+            ).to(next_token_ids.dtype)
+            token_rows = [gap_tokens[j] for j in range(n)]
+            hidden_rows = None
+            if target_hidden_states is not None:
+                # Clone the tail slice out of the batch-wide FULL capture so
+                # the buffer doesn't pin the whole prefill's hidden tensor.
+                hidden_clone = target_hidden_states[
+                    pt + extend_len - n : pt + extend_len
+                ].clone()
+                hidden_rows = [hidden_clone[j] for j in range(n)]
+            self._g0_gap_buffer.seed_gap(
+                req.rid,
+                [
+                    (token_rows[j], hidden_rows[j] if hidden_rows else None)
+                    for j in range(n)
+                ],
+                tail_cap,
+            )
+            self._g0_defer_prefill_req_ct += 1
+            if self._g0_defer_prefill_req_ct % 500 == 0:
+                log_info_on_rank0(
+                    logger,
+                    "g0 deferred prefill: skipped the drafter prefill-extend "
+                    f"for {self._g0_defer_prefill_req_ct} requests so far "
+                    f"(prompt-tail cap {tail_cap} tokens/request)",
+                )
+            pt += extend_len
+
+        # Relay stub: real bonus tokens (the g=0 decode rounds consume them);
+        # zero drafter fields with the relay's shapes/dtypes — the catch-up
+        # extend overwrites them in place before any draft reads them.
+        bs = next_token_ids.shape[0]
+        hidden_size = EagleDraftInput.hidden_size_for(self.draft_worker)
+        return EagleDraftInput(
+            topk_p=torch.zeros(
+                (bs, self.topk), dtype=torch.float32, device=self.device
+            ),
+            topk_index=torch.zeros(
+                (bs, self.topk), dtype=torch.int64, device=self.device
+            ),
+            hidden_states=(
+                torch.zeros(
+                    (bs, hidden_size),
+                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                    device=self.device,
+                )
+                if hidden_size is not None
+                else None
+            ),
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
+    def _forward_g0_decode(
+        self,
+        batch: ScheduleBatch,
+        rids: Optional[List[str]],
+        on_publish=None,
+        early_exit: bool = False,
+    ) -> GenerationBatchResult:
+        """One g=0 (speculation-off) decode round.
+
+        A degenerate spec round: the drafter is never invoked, the target
+        runs a standard 1-token-per-request plain decode forward (through the
+        g=0 runtime state's plain-decode graph), and the result is shaped
+        exactly like a spec result — ``accept_lens = ones(bs)``,
+        ``speculative_num_draft_tokens = 1``, stride-1 ``next_token_ids`` —
+        so every downstream consumer is untouched.
+
+        Runs in two situations: the worker is parked at g=0 (the policy's
+        state-swap decision), or an early-exit round took the pre-draft
+        depth-0 skip — then the caller scopes state[0]'s target resources
+        in (``_early_exit_verify_scope(0)``) and passes ``early_exit=True``
+        so telemetry marks the round (``"ee": 1``); everything below
+        depends only on those scoped resources, never on the parked
+        configuration.
+
+        KV: the scheduler's spec-v2 ``prepare_for_decode`` already pre-claimed
+        the bonus slot (``kv_committed_len += 1``) and the resolve side adds
+        ``accept_lens - 1 = 0``, so each request claims exactly its 1 new slot.
+
+        The target forward still captures the last-position hidden state per
+        request (aux hidden states for EAGLE3): the drafter needs the
+        (token, hidden) pair of every skipped position to catch up when
+        speculation turns back on, so they are buffered per request here.
+        """
+        is_idle = batch.forward_mode.is_idle()
+        bs = batch.seq_lens.shape[0]
+        # Non-idle decode batches always carry an EagleDraftInput by the
+        # spec-v2 relay contract (stash/gather in overlap, direct carry
+        # otherwise); idle batches may carry None.
+        draft_input: Optional[EagleDraftInput] = batch.spec_info
+        seq_lens_sum_before = batch.seq_lens_sum
+
+        if not is_idle:
+            # The previous round's bonus token is this round's input token.
+            batch.input_ids = draft_input.bonus_tokens.to(torch.int64)
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + 1,
+                batch_size=bs,
+                draft_token_num=1,
+                device=batch.device,
+            )
+
+        # Plain-decode convention: seq_lens INCLUDE the token being decoded
+        # (positions = seq_lens - 1), unlike the spec-v2 pre-round convention.
+        # Rebind, never mutate in place: the scheduler's isolation snapshot
+        # holds the old tensors and restores them after the forward.
+        batch.seq_lens = batch.seq_lens + 1
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu = batch.seq_lens_cpu + 1
+        if batch.seq_lens_sum is not None:
+            batch.seq_lens_sum = batch.seq_lens_sum + bs
+        new_seq_lens = batch.seq_lens
+
+        # A genuinely plain decode forward: the target backends and the g=0
+        # plain-decode graph must not see spec_info.
+        batch.spec_info = None
+        batch.capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        batch_output = self.target_worker.forward_batch_generation(batch)
+        batch.spec_info = draft_input
+
+        # Shape the result like a spec round: 1 accept token (the bonus) per
+        # request, stride-1 token layout.
+        batch_output.accept_lens = torch.ones(
+            (bs,), dtype=torch.int32, device=self.device
+        )
+        batch_output.new_seq_lens = new_seq_lens
+        batch_output.speculative_num_draft_tokens = 1
+        # Publish at target-end, mirroring the verify-end fence.
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        if is_idle or draft_input is None:
+            capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
+            )
+            batch_output.next_draft_input = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
+                dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                topk=self.topk,
+                capture_hidden_mode=capture_mode,
+            )
+            return batch_output
+
+        # Carry the drafter-side fields forward unchanged (the drafter did
+        # not run); they are refreshed by the catch-up extend on re-entry.
+        next_draft_input = EagleDraftInput(
+            topk_p=draft_input.topk_p,
+            topk_index=draft_input.topk_index,
+            hidden_states=draft_input.hidden_states,
+            bonus_tokens=batch_output.next_token_ids.to(torch.int32),
+        )
+        batch_output.next_draft_input = next_draft_input
+
+        # Buffer this round's (token, hidden state) pair per request for the
+        # drafter catch-up. Clone the hidden states out of the decode graph's
+        # static output buffer — it is overwritten on the next replay, but
+        # the gap pairs must survive until catch-up.
+        if rids is None:
+            rids = [req.rid for req in batch.reqs]
+        hidden_states = batch_output.logits_output.hidden_states
+        hidden_rows = None
+        if hidden_states is not None:
+            hidden_clone = hidden_states.clone()
+            hidden_rows = [hidden_clone[i] for i in range(bs)]
+        tokens = batch_output.next_token_ids
+        token_rows = [tokens[i] for i in range(bs)]
+        self._g0_gap_buffer.retain(rids)
+        # Deferred-prefill mode never runs the drafter during a parked phase
+        # (the mid-phase force-flush is the tax deferral avoids): the cap is
+        # enforced by dropping each request's oldest entries instead, and the
+        # catch-up anchors at the kept contiguous tail. Drafter KV below the
+        # kept range stays unbuilt — draft quality only, never correctness.
+        needs_flush = self._g0_gap_buffer.append_round(
+            rids, token_rows, hidden_rows, drop_oldest=self._g0_defer_prefill
+        )
+        if needs_flush:
+            # A request hit g0_max_gap: bound the buffer by syncing the
+            # drafter now. batch.seq_lens already holds the post-round
+            # lengths, so this is the same routine as the re-entry catch-up;
+            # the refreshed drafter fields land in next_draft_input and are
+            # relayed to the next round.
+            batch.spec_info = next_draft_input
+            self._catch_up_drafter_after_g0(batch, rids)
+            batch.spec_info = draft_input
+
+        telem = get_spec_telemetry()
+        if telem is not None:
+            batch_output.spec_telemetry_step_idx = telem.on_decode_step(
+                num_reqs=bs,
+                num_steps=0,
+                num_draft_tokens=1,
+                seq_lens_sum=(
+                    int(seq_lens_sum_before)
+                    if seq_lens_sum_before is not None
+                    else -1
+                ),
+                confidences=None,
+                worker_round_idx=self._forward_round_ct,
+                early_exit=early_exit,
+            )
+
+        return batch_output
+
+    def _catch_up_drafter_after_g0(
+        self, batch: ScheduleBatch, rids: Optional[List[str]]
+    ) -> None:
+        """Drain the g=0 gap buffers and run a drafter catch-up extend.
+
+        Refreshes ``batch.spec_info``'s (topk_p, topk_index, hidden_states)
+        rows in place for the caught-up requests so the next draft round
+        starts from each request's current position. ``batch.seq_lens`` must
+        already cover the gap (the gap of request *i* is its last
+        ``num_buffered`` positions). Requests with no buffered gap (i.e.
+        immediately prefill-extended during the g=0 phase) keep their fresh
+        drafter fields.
+
+        Deferred-prefill seeds drain through here unchanged: a deferred
+        request's buffer is its prompt tail plus its g=0 decode entries — a
+        contiguous tail of drafter positions ending at the current position
+        — so the per-slice anchoring below covers both kinds of entries
+        with the same arithmetic. Drafter KV for positions below the kept
+        tail is never rebuilt (quality-only; see ``_defer_drafter_prefill``).
+        """
+        if rids is None:
+            rids = [req.rid for req in batch.reqs]
+        drained = self._g0_gap_buffer.drain(rids)
+        if not drained:
+            return
+
+        # Chunk the drain to a per-extend token budget: one eager extend over
+        # every running request's accumulated gap allocates activations
+        # proportional to the total gap and OOMs at high concurrency
+        # (observed at 256 running requests on GH200). Multiple sequential
+        # extends are fine — correctness over latency. Slices of one request
+        # stay in position order across chunks (drafter KV writes are
+        # sequential per request).
+        batch_row_by_rid = {rid: i for i, rid in enumerate(rids)}
+        drained_gap_lens = [
+            (rid, len(drained[rid])) for rid in rids if drained.get(rid)
+        ]
+        if not drained_gap_lens:
+            return
+        chunks = partition_catch_up_chunks(
+            drained_gap_lens, self._g0_catch_up_chunk_tokens
+        )
+
+        spec_info: EagleDraftInput = batch.spec_info
+        num_total_gap_tokens = sum(g for _, g in drained_gap_lens)
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            for chunk in chunks:
+                sel_indices: List[int] = []
+                gap_lens: List[int] = []
+                tail_gap_lens: List[int] = []
+                tokens = []
+                hiddens = []
+                final_rows: List[int] = []
+                for row, (rid, start, length) in enumerate(chunk):
+                    entries = drained[rid]
+                    sel_indices.append(batch_row_by_rid[rid])
+                    gap_lens.append(length)
+                    tail = len(entries) - (start + length)
+                    tail_gap_lens.append(tail)
+                    if tail == 0:
+                        final_rows.append(row)
+                    for token, hidden in entries[start : start + length]:
+                        tokens.append(token)
+                        if hidden is not None:
+                            hiddens.append(hidden)
+
+                gap_tokens = torch.stack(tokens).to(torch.int64)
+                gap_hidden_states = torch.stack(hiddens) if hiddens else None
+                topk_p, topk_index, hidden_states = (
+                    self.draft_worker._draft_extend_for_g0_catch_up(
+                        batch,
+                        sel_indices,
+                        gap_lens,
+                        gap_tokens,
+                        gap_hidden_states,
+                        tail_gap_lens,
+                    )
+                )
+
+                # Only slices that reach a request's current end carry its
+                # next-draft inputs; interior-slice outputs are discarded.
+                if not final_rows:
+                    continue
+                rows = torch.tensor(final_rows, dtype=torch.int64, device=self.device)
+                sel = torch.tensor(
+                    [sel_indices[row] for row in final_rows],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                spec_info.topk_p[sel] = topk_p[rows].to(spec_info.topk_p.dtype)
+                spec_info.topk_index[sel] = topk_index[rows].to(
+                    spec_info.topk_index.dtype
+                )
+                if spec_info.hidden_states is not None and hidden_states is not None:
+                    spec_info.hidden_states[sel] = hidden_states[rows].to(
+                        spec_info.hidden_states.dtype
+                    )
+
+        log_info_on_rank0(
+            logger,
+            f"g0 catch-up: drafter extended over {num_total_gap_tokens} gap "
+            f"tokens for {len(drained_gap_lens)}/{len(rids)} requests in "
+            f"{len(chunks)} chunk(s) "
+            f"(budget {self._g0_catch_up_chunk_tokens} tokens/extend)",
+        )
+
+    def _early_exit_round_plan(
+        self, batch: ScheduleBatch
+    ) -> Optional[Tuple[List[int], float]]:
+        """(stop depths, stop price) when this decode round should run the
+        in-round early-exit draft; None runs the normal captured path.
+
+        Worker-side gates (the policy-side gates live in
+        AdaptiveController.early_exit_plan): topk=1 chains only; real draft
+        probabilities must be captured (SGLANG_SPEC_CAPTURE_CONFIDENCE —
+        without it the chain signal is the argmax path's all-ones); and
+        single-rank only — the stop decision is a data-dependent host
+        branch, so any cross-rank probability divergence would
+        desynchronize collective shapes (DP attention, TBO, TP > 1).
+        """
+        ac = self.adaptive_controller
+        if ac is None or self.topk != 1:
+            return None
+        if batch.forward_mode.is_idle():
+            return None
+        if self._draft_worker._draft_conf_buffer is None:
+            return None
+        sa = self.server_args
+        if sa.enable_dp_attention or sa.enable_two_batch_overlap or sa.tp_size > 1:
+            return None
+        if self.speculative_num_steps < 2:
+            return None
+        return ac.early_exit_plan(batch.seq_lens.shape[0])
+
+    def _should_skip_drafting(
+        self, batch: ScheduleBatch, stop_price: float
+    ) -> bool:
+        """Pre-draft DEPTH-0 decision for an early-exit round.
+
+        Reads the first draft token's per-request confidence
+        (``spec_info.topk_p[:, 0]``, written by the previous round's draft
+        extend — or by this round's g=0 catch-up extend, which runs before
+        this check) and applies the priced skip rule. The ``.tolist()`` is
+        a blocking D2H sync of at most ``early_exit_max_batch`` floats —
+        the only blocking sync on the pre-draft path.
+        """
+        if self._g0_gap_buffer is None:
+            return False
+        draft_input: Optional[EagleDraftInput] = batch.spec_info
+        if draft_input is None or draft_input.topk_p is None:
+            return False
+        bs = batch.seq_lens.shape[0]
+        first_draft_probs = draft_input.topk_p[:bs, 0].tolist()
+        return early_exit_should_skip(first_draft_probs, stop_price)
+
+    def _forward_depth0_decode(
+        self,
+        batch: ScheduleBatch,
+        rids: Optional[List[str]],
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """One skipped (depth-0) round inside an early-exit phase.
+
+        The pre-draft signal said even the first drafter pass won't pay, so
+        the round runs the existing g=0 machinery — plain 1-token target
+        decode, g=0-shaped result (accept_lens ones, stride 1), and gap
+        buffering of the (token, hidden) pair for the drafter catch-up —
+        composed from state[0]'s target resources while the worker stays
+        parked at k_max (scoped rebind, no runtime-state swap). The next
+        k>0 round's catch-up trigger (gap buffer non-empty) drains the gap
+        exactly as a parked-g=0 phase re-entry does; the buffer and
+        catch-up are keyed by rid and handle per-round interleaving the
+        same as per-phase. Telemetry records k=0/ndt=1 with ``"ee": 1``;
+        on_verify_complete sees num_steps = 0 (no anchor update — E[0] is
+        0 definitionally); cost attribution is re-keyed to executed depth
+        0 via observe_round_executed_steps.
+        """
+        self.adaptive_controller.observe_round_executed_steps(0)
+        with self._early_exit_verify_scope(0):
+            return self._forward_g0_decode(batch, rids, on_publish, early_exit=True)
+
+    @contextlib.contextmanager
+    def _early_exit_verify_scope(self, depth: int):
+        """Compose one round's verify + draft-extend from state[depth].
+
+        Swaps exactly the target-side resources (attn backend + verify
+        graph runner), the draft-extend backend/graph, and the step scalars
+        — NOT the draft-decode backend, the draft graph, or the topk=1
+        chain prealloc buffers, which stay parked at k_max (the next round
+        drafts at k_max again). ``depth == 0`` scopes a pre-draft skipped
+        round: state[0]'s target side is the plain-decode backend/graph and
+        its draft-extend members are None, exactly the environment a
+        parked-g=0 round runs in (the in-round flush catch-up uses the
+        draft runner's base attention backend, which no state ever swaps).
+        server_args is also left untouched: the
+        scheduler's per-decode KV over-allocation is sized by
+        max_speculative_num_draft_tokens, which already covers every depth,
+        and prepare_for_decode's bonus-slot pre-claim plus the resolver's
+        ``accept_lens - 1`` commit are depth-independent — the only
+        stride-sensitive consumer is result.speculative_num_draft_tokens,
+        which verify() sets from the scoped scalar (= depth + 1).
+        """
+        state = self.adaptive_controller.get_state(depth)
+        assert state is not None, (
+            f"early exit stopped at depth {depth} without a runtime state"
+        )
+        dw = self._draft_worker
+        mr = self._target_worker.model_runner
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            dw.speculative_num_steps,
+            dw.speculative_num_draft_tokens,
+            dw.draft_extend_attn_backend,
+            dw.cuda_graph_runner_for_draft_extend,
+            mr.attn_backend,
+            mr.decode_cuda_graph_runner,
+        )
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.speculative_num_steps = state.speculative_num_steps
+        dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.draft_extend_attn_backend = state.draft_extend_attn_backend
+        dw.cuda_graph_runner_for_draft_extend = (
+            state.cuda_graph_runner_for_draft_extend
+        )
+        mr.attn_backend = state.target_attn_backend
+        mr.decode_cuda_graph_runner = state.target_graph_runner
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                dw.speculative_num_steps,
+                dw.speculative_num_draft_tokens,
+                dw.draft_extend_attn_backend,
+                dw.cuda_graph_runner_for_draft_extend,
+                mr.attn_backend,
+                mr.decode_cuda_graph_runner,
+            ) = backup
+
+    def _forward_early_exit_decode(
+        self,
+        batch: ScheduleBatch,
+        rids: Optional[List[str]],
+        stop_depths: List[int],
+        stop_price: float,
+        on_publish=None,
+    ) -> GenerationBatchResult:
+        """One decode round with in-round early-exit drafting.
+
+        The draft loop runs eagerly at the parked k_max state and may stop
+        at a candidate depth g_v < k_max; verify and draft-extend then run
+        composed from state[g_v]'s target / extend resources while the
+        draft side stays at k_max (_early_exit_verify_scope). The result
+        carries speculative_num_draft_tokens = g_v + 1, so the resolve
+        stride, the KV commit bookkeeping, and the policy's
+        on_verify_complete (num_steps = stride - 1 = g_v, keying the
+        realized anchor at the depth that actually ran) all see the
+        executed depth.
+        """
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
+        ):
+            draft_tokens, depth, confidences = self.draft_worker.draft_early_exit(
+                batch, stop_depths, stop_price
+            )
+
+        # Cost attribution must key the EXECUTED depth: the policy keyed
+        # this round at decision time from the parked current_steps
+        # (k_max); a stop at g_v < k_max would otherwise bill its wall gap
+        # to the full-depth configuration.
+        self.adaptive_controller.observe_round_executed_steps(depth)
+
+        scope = (
+            self._early_exit_verify_scope(depth)
+            if depth != self.speculative_num_steps
+            else contextlib.nullcontext()
+        )
+        with scope:
+            verify_input = self.draft_worker.build_chain_verify_input(
+                batch, draft_tokens, depth
+            )
+            assert verify_input.is_verify_input()
+            batch.spec_info = verify_input
+            batch_output = self.verify(batch)
+            # Publish before draft_extend so the fence is at verify-end.
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
+            ):
+                self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+        # Early-exit rounds already synced this round's confidences to host
+        # (the stop checks are D2H reads), so telemetry records them
+        # same-round (no conf_lag) and the policy is fed directly. The
+        # zero-sync staged read is bypassed; its staged state stays intact,
+        # exactly like a g=0 round, and is re-paired at the next normal
+        # round.
+        telem = get_spec_telemetry()
+        if telem is not None:
+            batch_output.spec_telemetry_step_idx = telem.on_decode_step(
+                num_reqs=batch.seq_lens.shape[0],
+                num_steps=depth,
+                num_draft_tokens=depth + 1,
+                seq_lens_sum=(
+                    int(batch.seq_lens_sum) if batch.seq_lens_sum is not None else -1
+                ),
+                confidences=confidences,
+                worker_round_idx=self._forward_round_ct,
+                early_exit=True,
+            )
+        if (
+            self.adaptive_controller is not None
+            and self.adaptive_controller.wants_draft_confidences
+            and rids is not None
+            and confidences is not None
+        ):
+            self.adaptive_controller.observe_draft_confidences(rids, confidences)
+
+        return batch_output
+
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req,
+                batch_size=batch_size,
+                rids=rids,
+                num_steps=num_steps,
             )
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(
+        self,
+        batch_size: int,
+        rids: list[str] | None = None,
+        round_idx: int | None = None,
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+            self.adaptive_controller.activate_step_by_batch(
+                batch_size, rids=rids, round_idx=round_idx
+            )
 
     # -- Adaptive speculative decoding protocol --
 
@@ -1034,10 +2354,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker.init_cuda_graphs()
+            if speculative_num_steps >= 1:
+                self._draft_worker.init_attention_backend()
+                self._draft_worker.init_cuda_graphs()
+                draft_attn_backend = self._draft_worker.draft_attn_backend
+                draft_cuda_graph_runner = self._draft_worker.cuda_graph_runner
+                draft_extend_attn_backend = (
+                    self._draft_worker.draft_extend_attn_backend
+                )
+                draft_extend_cuda_graph_runner = (
+                    self._draft_worker.cuda_graph_runner_for_draft_extend
+                )
+            else:
+                # g=0 (speculation-off): no drafter resources at all. The
+                # catch-up extend on re-entry uses the draft runner's base
+                # attention backend (the eager prefill draft-extend path),
+                # which is never swapped by adaptive states.
+                draft_attn_backend = None
+                draft_cuda_graph_runner = None
+                draft_extend_attn_backend = None
+                draft_extend_cuda_graph_runner = None
 
-            # Build target attention backend and CUDA graph runner
+            # Build target attention backend and CUDA graph runner. For
+            # steps=0 the graph runner captures a plain decode graph
+            # (ForwardMode.DECODE, 1 token per request, LAST hidden capture).
             target_model_runner = self._target_worker.model_runner
             backup_init = target_model_runner.init_new_workspace
             try:
@@ -1062,12 +2402,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             state = SpecRuntimeState(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
-                draft_attn_backend=self._draft_worker.draft_attn_backend,
-                cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                draft_attn_backend=draft_attn_backend,
+                cuda_graph_runner=draft_cuda_graph_runner,
                 target_attn_backend=target_attn_backend,
                 target_graph_runner=target_graph_runner,
-                draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                draft_extend_attn_backend=draft_extend_attn_backend,
+                cuda_graph_runner_for_draft_extend=draft_extend_cuda_graph_runner,
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)

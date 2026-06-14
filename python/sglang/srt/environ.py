@@ -723,6 +723,10 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
+    # Speculative decoding telemetry (see speculative/spec_telemetry.py)
+    SGLANG_SPEC_TELEMETRY_DIR = EnvStr(None)
+    SGLANG_SPEC_CAPTURE_CONFIDENCE = EnvBool(False)
+
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
 

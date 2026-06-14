@@ -40,19 +40,33 @@ class BaseSpecWorker(ABC):
         pass
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        *rids* and *num_steps* (the active draft steps the result was
+        produced with) feed per-request policies; EMA-style policies
+        ignore them.
         """
         pass
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(
+        self,
+        batch_size: int,
+        rids: list[str] | None = None,
+        round_idx: int | None = None,
+    ) -> None:
         """Activate the optimal adaptive step for the current batch size.
 
         Default no-op. Adaptive-aware workers override this to switch
-        the runtime state before each draft round.
+        the runtime state before each draft round. *rids* and *round_idx*
+        (a monotonically increasing worker forward-round index) feed
+        per-request priced policies; EMA-style policies ignore them.
         """
         pass

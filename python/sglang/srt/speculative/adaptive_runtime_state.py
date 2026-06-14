@@ -1,7 +1,12 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Optional, Protocol
 
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.speculative.adaptive_spec_params import (
+    AdaptiveSpeculativeParams,
+    read_adaptive_policy_name,
+)
+from sglang.srt.speculative.priced_spec_params import early_exit_stop_depths
+from sglang.srt.speculative.spec_telemetry import capture_draft_confidence
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -24,6 +29,10 @@ class SpecRuntimeState:
     stage has shape-dependent resources (attention backends and CUDA graphs)
     that must match the current configuration.  Switching adaptive steps
     means swapping the entire state atomically.
+
+    ``speculative_num_steps == 0`` is the speculation-off state: all
+    draft-side members are None and the target members are plain-decode
+    resources (1 token per request, ForwardMode.DECODE).
     """
 
     # -- Configuration (determines shapes for all stages) --
@@ -41,6 +50,38 @@ class SpecRuntimeState:
     # -- Extend stage: draft model KV cache catch-up after verify --
     draft_extend_attn_backend: "AttentionBackend | None"
     cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None"
+
+
+class SpeculativeStepPolicy(Protocol):
+    """Minimal interface AdaptiveController needs from a step policy.
+
+    Implemented by ``AdaptiveSpeculativeParams`` (acceptance-EMA, the
+    default) and ``PricedSpeculativeParams`` (goodput-priced). *rids*,
+    *round_idx*, and *num_steps* are richer priced-policy inputs; the EMA
+    policy accepts and ignores them.
+    """
+
+    @property
+    def candidate_steps(self) -> list[int]: ...
+
+    def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None: ...
+
+    def get_steps_for_batch(
+        self,
+        batch_size: int,
+        rids: list[str] | None = None,
+        round_idx: int | None = None,
+    ) -> int: ...
+
+    def on_verify_complete(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
+    ) -> int | None: ...
+
+    def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
 
 
 class AdaptiveSpecWorker(Protocol):
@@ -73,15 +114,117 @@ class AdaptiveController:
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
-        self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
-            cfg_path=config_path,
-        )
+        self.policy_name = read_adaptive_policy_name(config_path)
+        self.params: SpeculativeStepPolicy
+        if self.policy_name == "priced":
+            from sglang.srt.speculative.priced_spec_params import (
+                PricedSpeculativeParams,
+            )
+
+            self.params = PricedSpeculativeParams(
+                initial_steps=worker.speculative_num_steps,
+                cfg_path=config_path,
+            )
+        else:
+            self.params = AdaptiveSpeculativeParams(
+                initial_steps=worker.speculative_num_steps,
+                cfg_path=config_path,
+            )
         self._states: dict[int, SpecRuntimeState] = {}
+
+    @property
+    def needs_request_context(self) -> bool:
+        """Whether the worker should pass rids/round_idx into the per-round
+        activate decision (priced policy only)."""
+        return self.policy_name == "priced"
+
+    @property
+    def wants_draft_confidences(self) -> bool:
+        """Whether the worker should read back draft confidences each round
+        and feed them to the policy. Gated on the capture env so the EMA
+        policy (and uninstrumented priced runs) never pay the GPU sync."""
+        return self.policy_name == "priced" and capture_draft_confidence()
 
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
+
+    @property
+    def g0_max_gap(self) -> int:
+        """Per-request drafter-gap cap for g=0 (speculation-off) phases.
+        Only the priced policy can select g=0; others fall back to the
+        default bound (never reached)."""
+        return getattr(self.params, "g0_max_gap", 1024)
+
+    @property
+    def g0_catch_up_chunk_tokens(self) -> int:
+        """Token budget per drafter catch-up extend when draining g=0 gaps.
+        Only the priced policy can select g=0; others fall back to the
+        default budget (never reached)."""
+        return getattr(self.params, "g0_catch_up_chunk_tokens", 4096)
+
+    @property
+    def g0_defer_prefill(self) -> bool:
+        """Whether requests admitted while the worker is parked at g=0 skip
+        the drafter prefill-extend (prompt-tail gap seeding + catch-up on
+        re-entry). Only the priced policy can select g=0; others fall back
+        to off (never reached)."""
+        return bool(getattr(self.params, "g0_defer_prefill", False))
+
+    @property
+    def g0_prompt_tail_tokens(self) -> int:
+        """Max trailing prompt positions buffered per deferred-prefill
+        request. Only meaningful when ``g0_defer_prefill`` is on."""
+        return getattr(self.params, "g0_prompt_tail_tokens", 512)
+
+    def get_state(self, steps: int) -> SpecRuntimeState | None:
+        """The pre-built runtime state for *steps*, or None when missing."""
+        return self._states.get(steps)
+
+    def early_exit_plan(self, batch_size: int) -> tuple[list[int], float] | None:
+        """(allowed stop depths, stop price) for an in-round early-exit
+        draft this round, or None when early exit does not apply: policy is
+        not priced / knob off / batch too large / worker not parked at the
+        deepest candidate / no candidate depth below k_max to stop at.
+
+        Stop depths are the candidates with built runtime states strictly
+        below k_max (``early_exit_stop_depths``): a stop always lands on a
+        depth whose verify graph and draft-extend resources exist. Depth 0
+        is included only when a g=0 state exists — it marks the pre-draft
+        skip decision (no drafter at all for the round), which the worker
+        evaluates against the same stop price before invoking the drafter.
+        """
+        if self.policy_name != "priced":
+            return None
+        params = self.params
+        if not params.early_exit_active(batch_size):
+            return None
+        available = params.available_steps
+        k_max = max(available)
+        if self.worker.speculative_num_steps != k_max:
+            return None
+        _cfg = getattr(self.params, "_cfg", None)
+        allow_skip = bool(getattr(_cfg, "early_exit_skip", False))
+        min_stop = int(getattr(_cfg, "early_exit_min_stop_depth", 1) or 1)
+        stop_depths = early_exit_stop_depths(
+            available, allow_skip=allow_skip, min_stop_depth=min_stop
+        )
+        if not stop_depths:
+            return None
+        return stop_depths, params.early_exit_stop_price(batch_size)
+
+    def observe_round_executed_steps(self, executed_steps: int) -> None:
+        """Tell the policy the depth the current round actually executed.
+
+        Early-exit rounds run shallower than the parked configuration the
+        policy keyed its cost attribution to (an in-draft stop at
+        g_v < k_max, or a pre-draft depth-0 skip); the policy re-keys the
+        round's wall-gap attribution to the executed depth. No-op for
+        policies without per-round cost attribution (EMA).
+        """
+        observe = getattr(self.params, "observe_round_executed_steps", None)
+        if observe is not None:
+            observe(executed_steps)
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
@@ -107,23 +250,51 @@ class AdaptiveController:
             )
             self._states[steps] = state
 
+        if self.policy_name == "priced":
+            # Decisions only over candidates whose runtime states exist.
+            self.params.set_available_steps(sorted(self._states))
+
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
-        target = self.params.get_steps_for_batch(batch_size)
+    def activate_step_by_batch(
+        self,
+        batch_size: int,
+        rids: list[str] | None = None,
+        round_idx: int | None = None,
+    ) -> None:
+        target = self.params.get_steps_for_batch(
+            batch_size, rids=rids, round_idx=round_idx
+        )
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
+        """Feed verify results; switch runtime state if the policy warrants it."""
         new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
+            num_correct_drafts_per_req,
+            batch_size,
+            rids=rids,
+            num_steps=num_steps,
         )
         if new_step is not None:
             self._activate(new_step)
+
+    def observe_draft_confidences(
+        self, rids: list[str], confidences: Optional[list[list[float]]]
+    ) -> None:
+        """Hand the just-finished round's per-request draft confidences to the
+        policy (used as acceptance estimates for the next round's decision).
+        Only meaningful when ``wants_draft_confidences`` is True."""
+        if confidences is None or self.policy_name != "priced":
+            return
+        self.params.observe_draft_confidences(rids, confidences)
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

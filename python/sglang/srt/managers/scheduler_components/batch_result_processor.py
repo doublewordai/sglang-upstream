@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_telemetry import get_spec_telemetry
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -538,18 +539,31 @@ class SchedulerBatchResultProcessor:
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
-        # Feed the adaptive controller now that accept_lens is on CPU,
-        # instead of doing a synchronous GPU→CPU copy in the worker hot path.
-        # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
-
-        predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+
+        # Feed the adaptive controller now that accept_lens is on CPU,
+        # instead of doing a synchronous GPU→CPU copy in the worker hot path.
+        # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        # rids and the active draft steps (stride - 1) feed per-request
+        # policies (priced); EMA-style policies ignore them.
+        self.model_worker.on_verify_complete_cpu(
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            rids=[req.rid for req in batch.reqs],
+            num_steps=stride - 1,
+        )
+
+        if result.spec_telemetry_step_idx is not None and (
+            (telem := get_spec_telemetry()) is not None
+        ):
+            telem.on_verify_result(
+                result.spec_telemetry_step_idx, result.num_correct_drafts_per_req_cpu
+            )
+
+        predict_tokens = []
 
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(

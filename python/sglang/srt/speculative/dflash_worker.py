@@ -359,7 +359,11 @@ class DFlashWorker:
         return getattr(self.target_worker, name)
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
     ) -> None:
         pass
 

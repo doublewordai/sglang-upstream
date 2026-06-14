@@ -80,6 +80,24 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
+SUPPORTED_ADAPTIVE_POLICIES = ("ema", "priced")
+
+
+def read_adaptive_policy_name(cfg_path: str | None) -> str:
+    """Read the top-level ``"policy"`` key. Absent path/key means ``"ema"``."""
+    if cfg_path is None:
+        return "ema"
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    policy = cfg.get("policy", "ema")
+    if policy not in SUPPORTED_ADAPTIVE_POLICIES:
+        raise ValueError(
+            f'speculative_adaptive_config: "policy" must be one of '
+            f"{SUPPORTED_ADAPTIVE_POLICIES}, got {policy!r}"
+        )
+    return policy
+
+
 def _load_adaptive_config(
     cfg_path: str | None,
 ) -> tuple[dict, dict[int, dict]]:
@@ -92,6 +110,14 @@ def _load_adaptive_config(
             cfg = json.load(f)
     else:
         cfg = DEFAULT_ADAPTIVE_CONFIG
+
+    policy = cfg.get("policy", "ema")
+    if policy != "ema":
+        raise ValueError(
+            f"EMA adaptive config loader got policy={policy!r}; "
+            "non-EMA policies must be routed before loading "
+            "(see read_adaptive_policy_name)."
+        )
 
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
@@ -121,7 +147,18 @@ def _load_adaptive_config(
 def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
 ) -> list[int]:
-    """Union of every BS slot's candidate steps; sizes the runtime buffers."""
+    """Candidate steps the config can reach; sizes the runtime buffers.
+
+    EMA policy: union of every BS slot's candidate steps.
+    Priced policy: the single top-level candidate_steps list.
+    """
+    if read_adaptive_policy_name(cfg_path) == "priced":
+        from sglang.srt.speculative.priced_spec_params import load_priced_config
+
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        return list(load_priced_config(cfg).candidate_steps)
+
     _, bs_entries = _load_adaptive_config(cfg_path)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
@@ -267,15 +304,27 @@ class AdaptiveSpeculativeParams:
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
 
-    def get_steps_for_batch(self, batch_size: int) -> int:
+    def get_steps_for_batch(
+        self,
+        batch_size: int,
+        rids: list[str] | None = None,
+        round_idx: int | None = None,
+    ) -> int:
+        # rids/round_idx are priced-policy inputs (see priced_spec_params);
+        # the EMA policy keys decisions on batch size alone.
         return self._route(batch_size).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        rids: list[str] | None = None,
+        num_steps: int | None = None,
     ) -> int | None:
         """Feed verify results to the matching BS slot's EMA.
 
         Returns the new step if a switch is warranted, else ``None``.
+        *rids*/*num_steps* are priced-policy inputs, unused here.
         """
         params = self._route(batch_size)
         if params.update(num_correct_drafts_per_req):

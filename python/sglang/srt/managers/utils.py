@@ -46,6 +46,11 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # Join key for spec telemetry (see speculative/spec_telemetry.py): the
+    # worker-side record for this round; the result processor logs the
+    # matching accept counts under the same index.
+    spec_telemetry_step_idx: Optional[int] = None
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
