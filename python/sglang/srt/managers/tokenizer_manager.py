@@ -88,7 +88,9 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     TokenizerMetricsCollector,
+    format_priority_bucket,
     resolve_collector_class,
+    resolve_priority_metrics_buckets,
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -304,6 +306,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
+        self.priority_metrics_buckets = resolve_priority_metrics_buckets(
+            server_args.priority_metrics_buckets
+        )
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -2372,9 +2377,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if custom_labels:
             labels.update(custom_labels)
         if self.enable_priority_scheduling:
-            priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
+            # Raw priorities are unbounded label values (deployments may use
+            # timestamps or deadlines as priorities); only stamp them when
+            # --priority-metrics-buckets bounds the cardinality (or explicitly
+            # opts into raw values with 'all').
+            if self.priority_metrics_buckets is not None:
+                priority = getattr(state.obj, "priority", None)
+                labels["priority"] = format_priority_bucket(
+                    priority, self.priority_metrics_buckets
+                )
         if (
             not state.ttft_observed
             and self.disaggregation_mode != DisaggregationMode.PREFILL

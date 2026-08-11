@@ -15,13 +15,14 @@
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -59,6 +60,47 @@ class QueueCount:
             else None
         )
         return cls(total=len(reqs), by_priority=by_priority)
+
+
+PRIORITY_BUCKETS_ALL = "all"
+
+
+def resolve_priority_metrics_buckets(
+    raw: Optional[Sequence[str]],
+) -> Union[None, str, List[int]]:
+    """Normalize the --priority-metrics-buckets server arg.
+
+    Returns None (no per-request priority labels), PRIORITY_BUCKETS_ALL (label
+    with raw values), or sorted integer boundaries.
+    """
+    if not raw:
+        return None
+    if list(raw) == [PRIORITY_BUCKETS_ALL]:
+        return PRIORITY_BUCKETS_ALL
+    return sorted(int(b) for b in raw)
+
+
+def format_priority_bucket(
+    priority: Optional[int], buckets: Union[str, Sequence[int]]
+) -> str:
+    """Label value for a request priority under the resolved bucket config.
+
+    Raw priorities are unbounded (deployments may use timestamps or deadlines
+    as priorities), so emitting them as label values grows Prometheus series
+    without limit; with integer boundaries this returns 'le_<b>' for the
+    smallest boundary b >= priority and 'gt_<last>' above the top boundary,
+    keeping cardinality bounded. With PRIORITY_BUCKETS_ALL it returns the raw
+    value (only safe when priorities are a small fixed set). Requests without
+    a priority label as 'none'. `buckets` boundaries must be sorted ascending.
+    """
+    if priority is None:
+        return "none"
+    if buckets == PRIORITY_BUCKETS_ALL:
+        return str(priority)
+    idx = bisect.bisect_left(buckets, priority)
+    if idx == len(buckets):
+        return f"gt_{buckets[-1]}"
+    return f"le_{buckets[idx]}"
 
 
 @dataclass
@@ -259,7 +301,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
-        self._known_priorities: Set[int] = set()
+        self.priority_metrics_buckets = resolve_priority_metrics_buckets(
+            getattr(server_args, "priority_metrics_buckets", None)
+            if server_args is not None
+            else None
+        )
+        self._known_priorities: Set[str] = set()
 
         # =================================================================
         # Basics
@@ -1088,18 +1135,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         gauge.labels(**self.labels).set(data)
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
-        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
-        # NOTE: When priority scheduling is enabled, the total is recorded under
-        # priority="" (the default label value). Per-priority breakdowns are recorded
-        # with priority="<int>". Grafana queries should use priority="" for totals.
+        # Log a QueueCount to gauge: total under default labels and, when
+        # --priority-metrics-buckets is set, a per-bucket breakdown under
+        # priority="<bucket>". The total is recorded under priority="" (the
+        # default label value); Grafana queries should use priority="" for
+        # totals. Raw priorities are only emitted as label values under the
+        # explicit 'all' opt-in — they are unbounded in general, and every
+        # distinct value becomes a permanent Prometheus series.
         gauge.labels(**self.labels).set(data.total)
-        if data.by_priority is not None:
-            self._known_priorities.update(data.by_priority.keys())
-            for priority in self._known_priorities:
-                value = data.by_priority.get(priority, 0)
-                labels = dict(self.labels)
-                labels["priority"] = str(priority)
-                gauge.labels(**labels).set(value)
+        if data.by_priority is None or self.priority_metrics_buckets is None:
+            return
+        bucketed: Dict[str, int] = defaultdict(int)
+        for priority, count in data.by_priority.items():
+            bucket = format_priority_bucket(priority, self.priority_metrics_buckets)
+            bucketed[bucket] += count
+        self._known_priorities.update(bucketed.keys())
+        for bucket in self._known_priorities:
+            labels = dict(self.labels)
+            labels["priority"] = bucket
+            gauge.labels(**labels).set(bucketed.get(bucket, 0))
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
