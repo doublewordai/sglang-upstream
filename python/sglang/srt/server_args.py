@@ -1070,6 +1070,17 @@ class ServerArgs:
         Optional[List[float]],
         "The buckets of end-to-end request latency, specified as a list of floats.",
     ] = None
+    priority_metrics_buckets: A[
+        Optional[List[str]],
+        "Controls the 'priority' metric label when priority scheduling is enabled. "
+        "When unset (default), request metrics carry no per-request priority label: "
+        "raw priorities are unbounded (deployments may use timestamps or deadlines "
+        "as priorities) and every distinct value becomes a permanent Prometheus "
+        "series. Set to a list of integer boundaries to bin priorities into "
+        "'le_<b>'/'gt_<b>' ranges with bounded cardinality, or to the single value "
+        "'all' to label with raw priority values (only safe when priorities are a "
+        "small fixed set).",
+    ] = None
     prompt_tokens_buckets: A[
         Optional[List[str]],
         "The buckets rule of prompt tokens. "
@@ -6725,6 +6736,20 @@ class ServerArgs:
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
 
+        if self.priority_metrics_buckets is not None:
+            assert (
+                len(self.priority_metrics_buckets) > 0
+            ), "--priority-metrics-buckets must not be empty when set"
+            if self.priority_metrics_buckets != ["all"]:
+                try:
+                    boundaries = sorted({int(b) for b in self.priority_metrics_buckets})
+                except ValueError:
+                    raise ValueError(
+                        "--priority-metrics-buckets must be integer boundaries or "
+                        f"the single value 'all', got {self.priority_metrics_buckets}"
+                    )
+                self.priority_metrics_buckets = [str(b) for b in boundaries]
+
         # Check scheduling policy
         if self.enable_priority_scheduling:
             assert self.schedule_policy in [
@@ -6734,8 +6759,9 @@ class ServerArgs:
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
-                    "Requests without explicit priority will have priority=None, "
-                    "resulting in priority='None' string labels in Prometheus metrics."
+                    "Requests without explicit priority will have priority=None "
+                    "(labeled priority='none' in Prometheus metrics when "
+                    "--priority-metrics-buckets is set)."
                 )
         else:
             if self.disable_priority_preemption:
