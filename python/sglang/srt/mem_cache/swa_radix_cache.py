@@ -736,6 +736,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
                 self.full_protected_size_ -= len(node.value)
+                _retired = getattr(node, "_cor609_retired", None)
+                if _retired:
+                    for _slots in _retired:
+                        self.token_to_kv_pool_allocator.free(_slots)
+                    node._cor609_retired = None
             node.full_lock_ref -= 1
 
             if dec_lock_swa:
@@ -1050,6 +1055,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self._split_node(leaf.key, leaf, split_at)
         return leaf
 
+    def _cor609_free_or_defer(self, node, slots):
+        # COR-609: Branch 1/2 tombstone-revival frees the node's OLD full-attention
+        # KV. When the node is still full-locked, running requests' req_to_token
+        # rows point at those exact slots, so freeing them now leaks live KV into
+        # the next allocation (cross-request contamination). Defer the free until
+        # the full lock drops; siblings keep reading the old slots until then, and
+        # new matchers use the revived node.value.
+        if node.full_lock_ref > 0:
+            buf = getattr(node, "_cor609_retired", None)
+            if buf is None:
+                buf = []
+                node._cor609_retired = buf
+            buf.append(slots.clone())
+        else:
+            self.token_to_kv_pool_allocator.free(slots)
+
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
@@ -1139,7 +1160,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     if swa_evicted_seqlen <= total_prefix_length:
                         # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
                         # Free full tokens in the original tree node.
-                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
+                        self._cor609_free_or_defer(node, node.value[:prefix_len])
                         # Overwrite the new value in request to the tree node.
                         node.value = value[:prefix_len].clone()
                         node.swa_tombstone = False
@@ -1148,8 +1169,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
-                        self.token_to_kv_pool_allocator.free(
-                            node.value[start_update_idx:prefix_len]
+                        self._cor609_free_or_defer(
+                            node, node.value[start_update_idx:prefix_len]
                         )
                         self._split_node(node.key, node, start_update_idx)
                         # Here node is the new node after split, so we can overwrite the value to the new node.
