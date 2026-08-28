@@ -1024,6 +1024,9 @@ class Envs:
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
+    # Megakernel MoE (doublewordai/megakernel): per-rank decode token capacity
+    SGLANG_MEGAKERNEL_NUM_MAX_TOKENS_PER_RANK = EnvInt(64)
+
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
