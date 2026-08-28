@@ -14,8 +14,9 @@
 """MoE expert-parallel layer backed by the megakernel (github.com/doublewordai/megakernel).
 
 One kernel launch per layer performs the dispatch, the fused GEMM1 + SwiGLU, GEMM2 and the combine
-over CXI, so no token dispatcher and no MoE runner are involved.  Supports GLM-5.2 FP8 block-quantized
-experts at EP16 on GH200 nodes; ``MoeLayer`` checks the geometry.
+over CXI, so no token dispatcher and no MoE runner are involved.  One transport and one kernel object
+serve every MoE layer of the process.  Supports GLM-5.2 FP8 block-quantized experts at EP16 on GH200
+nodes; ``Megakernel`` checks the geometry.
 """
 
 from __future__ import annotations
@@ -32,14 +33,14 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 
-_transport = None
+_kernel = None
 
 
-def _get_transport(hidden_size: int, top_k: int, num_local_experts: int):
-    """One CXI transport per process, shared by every MoE layer."""
-    global _transport
-    if _transport is None:
-        from megakernel import Transport
+def _get_kernel(hidden_size: int, top_k: int, num_local_experts: int, intermediate_size: int):
+    """One CXI transport and one kernel object per process, shared by every MoE layer."""
+    global _kernel
+    if _kernel is None:
+        from megakernel import Megakernel, Transport
 
         tp = get_tp_group()
 
@@ -48,7 +49,7 @@ def _get_transport(hidden_size: int, top_k: int, num_local_experts: int):
             dist.all_gather_object(out, obj, group=tp.cpu_group)
             return out
 
-        _transport = Transport(
+        transport = Transport(
             world_size=tp.world_size,
             rank=tp.rank_in_group,
             local_rank=torch.cuda.current_device(),
@@ -58,7 +59,8 @@ def _get_transport(hidden_size: int, top_k: int, num_local_experts: int):
             max_tokens_per_rank=envs.SGLANG_MEGAKERNEL_NUM_MAX_TOKENS_PER_RANK.get(),
             all_gather=all_gather,
         )
-    return _transport
+        _kernel = Megakernel(transport, intermediate_size)
+    return _kernel
 
 
 class MegakernelMoE(FusedMoE):
@@ -93,22 +95,23 @@ class MegakernelMoE(FusedMoE):
         )
         assert num_fused_shared_experts == 0, "the megakernel routes only the routed experts"
         assert activation == "silu", "the megakernel fuses SwiGLU"
-        self._layer = None
+        self._kernel = None
 
     def prepare_megakernel_weights(self) -> None:
         """Called from Fp8MoEMethod.process_weights_after_loading: interleave gate/up rows in
-        place (see megakernel.weights) and bring up the transport and per-layer buffers."""
-        from megakernel import MoeLayer, interleave_gate_up_inplace
+        place (see megakernel.weights) and bring up the shared transport and kernel."""
+        from megakernel import interleave_gate_up_inplace
 
         interleave_gate_up_inplace(self.w13_weight.data, self.w13_weight_scale_inv.data)
         w2_scale = self.w2_weight_scale_inv.data
         if w2_scale.dtype != torch.float32 or not w2_scale.is_contiguous():
             self.w2_weight_scale_inv.data = w2_scale.contiguous().float()
-        transport = _get_transport(self.hidden_size, self.top_k, self.num_local_experts)
-        self._layer = MoeLayer(transport, self.intermediate_size_per_partition)
+        self._kernel = _get_kernel(
+            self.hidden_size, self.top_k, self.num_local_experts, self.intermediate_size_per_partition
+        )
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        assert self._layer is not None, "prepare_megakernel_weights() must run after weight loading"
+        assert self._kernel is not None, "prepare_megakernel_weights() must run after weight loading"
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
         if num_tokens > 0:
@@ -122,7 +125,7 @@ class MegakernelMoE(FusedMoE):
             x_scale = torch.empty(1, self.hidden_size // 128, dtype=torch.float32, device=device)
             topk_ids = torch.full((1, self.top_k), -1, dtype=torch.int32, device=device)
             topk_weights = torch.zeros(1, self.top_k, dtype=torch.float32, device=device)
-        return self._layer.forward(
+        return self._kernel.forward(
             x_q,
             x_scale,
             topk_ids,
