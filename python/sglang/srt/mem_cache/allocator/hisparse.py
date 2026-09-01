@@ -84,6 +84,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    def logical_available_size(self) -> int:
+        """Free logical indices. Retained prefixes hold logical indices (backed
+        by host rows) while owning no device tokens, so pool accounting that
+        subtracts the radix cache's evictable size must use this pool."""
+        return self.logical_attn_allocator.available_size()
+
     def get_kvcache(self):
         return self._kvcache
 
@@ -386,6 +392,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
+
+    def logical_available_size(self) -> int:
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(

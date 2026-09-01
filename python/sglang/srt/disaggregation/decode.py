@@ -1269,6 +1269,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            if self.scheduler.enable_hisparse:
+                logger.info(
+                    "hisparse prealloc rid=%s input_len=%d prefix_len=%d "
+                    "total_prefix_len=%d dst_tokens=%d dst_pages=%d page_size=%d",
+                    decode_req.req.rid,
+                    origin_input_len,
+                    prefix_len,
+                    total_prefix_len,
+                    len(kv_indices),
+                    len(page_indices),
+                    kv_transfer_page_size,
+                )
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1425,6 +1437,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
                 available_size = logical_allocator.available_size()
+            # Retained prefixes hold logical indices and are evicted on demand.
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                available_size += self.tree_cache.evictable_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1520,6 +1535,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return swa_allocatable_tokens
 
+    def _prealloc_available_size(self) -> int:
+        """Free tokens in the pool pre-alloc draws from."""
+        if self.scheduler.enable_hisparse:
+            return self.token_to_kv_pool_allocator.logical_available_size()
+        return self.token_to_kv_pool_allocator.available_size()
+
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
@@ -1575,18 +1596,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         # Evict cached entries if the pool doesn't have enough free pages.
+        # HiSparse pre-alloc takes logical indices only, so that pool (not the
+        # smaller device pool) decides whether retained prefixes must go.
         if (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
-            and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
+            and self._prealloc_available_size() < required_alloc_tokens
         ):
-            num_to_evict = (
-                required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
-            )
+            num_to_evict = required_alloc_tokens - self._prealloc_available_size()
             result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
-            if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
+            if self._prealloc_available_size() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
-                    f"available {self.token_to_kv_pool_allocator.available_size()} "
+                    f"available {self._prealloc_available_size()} "
                     f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
                     f"evictable_size={self.tree_cache.evictable_size()}, "
                     f"protected_size={self.tree_cache.protected_size()}, "

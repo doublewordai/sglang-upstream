@@ -216,8 +216,16 @@ class SchedulerPoolStatsObserver:
     def _get_token_info(self) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        pool_size = self.max_total_num_tokens
+        if self.enable_hisparse:
+            # Retained prefixes hold logical indices (host-backed rows), not
+            # device tokens, so the evictable size is charged against the
+            # logical pool. Device/host tiers are reported by
+            # _get_hisparse_token_info.
+            pool_size = self.token_to_kv_pool_allocator.size
+            available_size = self.token_to_kv_pool_allocator.logical_available_size()
+        num_used = pool_size - (available_size + evictable_size)
+        token_usage = num_used / pool_size
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,
