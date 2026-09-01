@@ -1000,7 +1000,14 @@ class NixlKVManager(CommonKVManager):
             return
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
-        decode_only_spec_dec = n_dst > n_src
+        # With layer ids on both peers the entries are paired explicitly, so
+        # decode entries prefill does not hold (other PP stages' layers, or a
+        # draft model's) are simply left unpaired. Only the positional pairing
+        # has to treat a longer decode list as decode-only speculative decoding.
+        paired_by_layer_id = bool(self.kv_args.kv_layer_ids) and bool(
+            peer_info.dst_kv_layer_ids
+        )
+        decode_only_spec_dec = n_dst > n_src and not paired_by_layer_id
 
         if peer_info.requires_dcp_relayout:
             dst_indices = resolve_dcp_dst_entry_indices(
