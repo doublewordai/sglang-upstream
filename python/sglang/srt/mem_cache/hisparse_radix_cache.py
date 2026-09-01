@@ -151,18 +151,21 @@ class HiSparseRadixCache(RadixCache):
         if host_len > max(key_len, adopted):
             coord.free_unretained_rows(rows_all[max(key_len, adopted) :])
 
-        # 4. Free the logical indices exactly as upstream (the allocator's
-        #    retention hook releases side-table rows for tree-evicted indices;
-        #    the ranges freed here carry none).
+        # 4. Release device resources FIRST (frees the device-buffer slots and
+        #    zeroes the mapping rows, so the logical frees below cannot
+        #    double-free device slots through free_hisparse). Host bytes now
+        #    belong to the tree.
+        coord.release_for_retention(req)
+
+        # 5. Free the logical indices exactly as upstream. The allocator's
+        #    retention hook releases side-table rows for any freed index that
+        #    step 3 retained (the dedup range) — consistent, not a leak.
         self.token_to_kv_pool_allocator.free_segments(
             [
                 (full_kv[prot:freed_end], prot),
                 (full_kv[key_len:], key_len),
             ]
         )
-
-        # 5. Release device resources; host bytes now belong to the tree.
-        coord.release_for_retention(req)
 
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
