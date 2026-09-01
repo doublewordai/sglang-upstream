@@ -53,17 +53,29 @@ class HiSparseRadixCache(RadixCache):
     """RadixCache whose retained values' KV lives in the hisparse host pool."""
 
     def __init__(self, params):
-        super().__init__(params)
         self.coordinator: "HiSparseCoordinator" = None
+        super().__init__(params)
 
     def attach_coordinator(self, coordinator: "HiSparseCoordinator") -> None:
         self.coordinator = coordinator
         coordinator.init_retention()
 
+    def owns_hisparse_release(self) -> bool:
+        return True
+
+    def reset(self):
+        super().reset()
+        # flush_cache resets the tree, then the allocator rebuilds its free
+        # lists without the retention hook: drop the side table here or every
+        # retained host row leaks and its next retain_rows asserts.
+        if self.coordinator is not None:
+            self.coordinator.reset_retention()
+
     # ------------------------------------------------------------------
 
     def retained_prefix_len(self, prefix_indices: torch.Tensor) -> int:
-        """Longest head of a matched prefix whose host rows are retained.
+        """Longest page-aligned head of a matched prefix whose host rows are
+        retained.
 
         A prefix inserted by a still-running request (cache_unfinished_req)
         shares logical indices with that request but has no side-table rows
@@ -76,13 +88,17 @@ class HiSparseRadixCache(RadixCache):
             prefix_indices.to(device="cpu", dtype=torch.int64)
         ]
         missing = (rows < 0).nonzero()
-        return int(missing[0]) if missing.numel() > 0 else prefix_indices.numel()
+        keep = int(missing[0]) if missing.numel() > 0 else prefix_indices.numel()
+        return keep - keep % self.page_size
 
     def cache_finished_req(
         self, req: "Req", is_insert: bool = True, *, kv_len_to_handle: int
     ):
         coord = self.coordinator
         assert coord is not None, "attach_coordinator() must run before serving"
+        # The decode server admits transferred KV directly (admit_request_direct);
+        # a request still in staging DMA would need abort_staging_request instead.
+        assert not req.hisparse_staging, "retention does not cover staging requests"
         idx = req.req_pool_idx
 
         if self.disable_finished_insert:
@@ -117,13 +133,21 @@ class HiSparseRadixCache(RadixCache):
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
-        assert key_len <= host_len, (
-            f"host mirror shorter than the insert range: {key_len=} {host_len=}"
+        assert (
+            key_len <= host_len
+        ), f"host mirror shorter than the insert range: {key_len=} {host_len=}"
+        # The adopted prefix is mirrored by construction (adopt_prefix seeds
+        # the host table with the tree's rows), so the key can never end
+        # inside the locked prefix; freeing [key_len:] below would otherwise
+        # free logical indices the tree still serves.
+        assert key_len >= prot, (
+            f"radix key shorter than the protected prefix: {key_len=} {prot=} "
+            f"{safe_len=} {adopted=}"
         )
 
         # 2. Insert; freed_end = length already present in the tree.
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
+            priority = req.priority or 0
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )

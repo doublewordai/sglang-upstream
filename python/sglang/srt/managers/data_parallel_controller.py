@@ -814,38 +814,47 @@ class DataParallelController:
     def prefix_affinity_scheduler(self, req: Req):
         """Cache-aware dispatch: send a request to the DP rank that most likely
         still holds its prompt prefix; otherwise to the least-loaded rank."""
-        if self.maybe_external_dp_rank_routing(req):
-            return
         if not self._active_workers:
             raise RuntimeError("No active DP workers are available for routing.")
         keys = self.prefix_index.prefix_keys(req.input_ids)
-        target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
-        if target is None:
-            target = self._least_loaded_rank(self._active_workers)
+        # An externally routed request still lands (and leaves its prefix) on
+        # its rank, so the index and the speculative load must see it too.
+        if self.maybe_external_dp_rank_routing(req):
+            target = req.routed_dp_rank
+        else:
+            target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
+            if target is None:
+                target = self._least_loaded_rank(self._active_workers)
+            sock_send(self.workers[target], req)
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
-        self.dp_budget.total_requests[target] += 1
+        if target < self.dp_budget.dp_size:
+            self.dp_budget.total_requests[target] += 1
         self.prefix_index.record(rank=target, keys=keys)
-        sock_send(self.workers[target], req)
+
+    def _rank_load(self, rank: int) -> int:
+        """Ranks activated beyond the launch dp_size have no budget slot yet
+        (elastic EP); treat them as idle rather than indexing past the list."""
+        loads = self.dp_budget.total_requests
+        return loads[rank] if rank < len(loads) else 0
 
     def _least_loaded_rank(self, ranks: List[int]) -> int:
-        loads = self.dp_budget.total_requests
-        return min(ranks, key=lambda r: loads[r])
+        return min(ranks, key=self._rank_load)
 
     def _prefix_affinity_rank(
         self, *, keys: List[int], input_len: int
     ) -> Optional[int]:
         """The least-loaded rank among those sharing the longest prefix match,
-        or None when the match is too short or that rank is too far behind the
-        least-loaded one (the same rule sgl-router's cache-aware policy applies
-        across workers)."""
+        or None when the match is too short or that rank is too far ahead of
+        the least-loaded one (the same rule sgl-router's cache-aware policy
+        applies across workers)."""
         ranks, matched_tokens = self.prefix_index.longest_match(keys)
         ranks = [r for r in ranks if r in self._active_workers]
         if not ranks or matched_tokens < self.prefix_affinity_threshold * input_len:
             return None
         target = self._least_loaded_rank(ranks)
-        loads = self.dp_budget.total_requests
         least = self._least_loaded_rank(self._active_workers)
-        if loads[target] - loads[least] > self.prefix_affinity_max_imbalance:
+        imbalance = self._rank_load(target) - self._rank_load(least)
+        if imbalance > self.prefix_affinity_max_imbalance:
             return None
         return target
 

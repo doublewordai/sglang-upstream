@@ -958,6 +958,16 @@ class HiSparseCoordinator:
         )
         self.token_to_kv_pool_allocator.register_retention_cb(self.on_logical_free)
 
+    def reset_retention(self) -> None:
+        """Drop every retained row (tree reset / flush_cache). The allocator's
+        clear() rebuilds its free lists without the retention hook, so the
+        rows must be returned to the host pool here."""
+        rows = self.logical_to_host_row[self.logical_to_host_row >= 0]
+        if rows.numel() > 0:
+            self.mem_pool_host.free(rows)
+        self.logical_to_host_row.fill_(-1)
+        self.req_adopted_len.zero_()
+
     def on_logical_free(self, free_index: torch.Tensor) -> None:
         """Allocator hook: a logical index leaving the allocator takes its
         retained host row (if any) with it."""

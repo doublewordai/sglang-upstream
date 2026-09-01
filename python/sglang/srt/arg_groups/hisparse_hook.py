@@ -105,6 +105,12 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "on a PD decode server with --disaggregation-decode-enable-radix-cache "
         "(host-resident prefix retention via HiSparseRadixCache)."
     )
+    # Retention adopts host rows through the DSA coordinator's side table; the
+    # DSv4 allocator keeps its own (c4) pools and never registers that hook.
+    assert not (hisparse_retention and is_v4_hisparse), (
+        "Hisparse prefix retention (--disaggregation-decode-enable-radix-cache "
+        "with --enable-hisparse) supports DSA models only, not DeepSeek V4."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

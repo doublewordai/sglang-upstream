@@ -398,6 +398,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def owns_hisparse_release(self) -> bool:
+        """True when cache_finished_req releases a request's hisparse host rows
+        and device slots itself (prefix retention); callers must then skip
+        HiSparseCoordinator.request_finished / retract_req, which would free
+        host rows the tree adopted from a retained prefix."""
+        return False
+
     def supports_streaming_session(self) -> bool:
         return False
 

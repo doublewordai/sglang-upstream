@@ -2106,7 +2106,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
+                if (
+                    self.scheduler.enable_hisparse
+                    and not self.tree_cache.owns_hisparse_release()
+                ):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
@@ -2130,7 +2133,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                    if self.scheduler.enable_hisparse:
+                    if (
+                        self.scheduler.enable_hisparse
+                        and not self.tree_cache.owns_hisparse_release()
+                    ):
                         self.scheduler.hisparse_coordinator.request_finished(
                             decode_req.req
                         )

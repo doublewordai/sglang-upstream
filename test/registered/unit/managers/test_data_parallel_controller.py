@@ -30,7 +30,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.dp_prefix_affinity import PrefixAffinityIndex
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _BASE_LOAD = msgspec.structs.replace(
@@ -264,7 +264,11 @@ class TestTotalRequestsScheduler(CustomTestCase):
 
 
 def _make_prefix_affinity_controller(
-    dp_size: int, *, block_tokens: int = 4, threshold: float = 0.5, max_imbalance: int = 16
+    dp_size: int,
+    *,
+    block_tokens: int = 4,
+    threshold: float = 0.5,
+    max_imbalance: int = 16,
 ) -> DataParallelController:
     ctl = _make_controller(dp_size)
     ctl.prefix_index = PrefixAffinityIndex(
@@ -352,15 +356,35 @@ class TestPrefixAffinityScheduler(CustomTestCase):
         self.assertEqual(_dispatched_rank(ctl), 0)
         ctl._active_workers = [1, 2]
         ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
-        self.assertIn(_dispatched_rank(ctl), (1, 2))
+        self.assertEqual(_dispatched_rank(ctl), 1)
 
-    def test_routed_dp_rank_bypasses_index_and_budget(self):
+    def test_routed_dp_rank_is_recorded_but_not_rerouted(self):
+        """An externally routed request still lands on its rank and leaves
+        its prefix there: the index and speculative load must reflect it, or
+        the next turn of that conversation is sent to a different rank."""
         ctl = _make_prefix_affinity_controller(dp_size=4)
         ctl.dp_budget.total_requests = [5, 3, 1, 4]
         ctl.prefix_affinity_scheduler(_req(routed_dp_rank=3, input_ids=list(range(8))))
         self.assertEqual(_dispatched_rank(ctl), 3)
-        self.assertEqual(ctl.dp_budget.total_requests, [5, 3, 1, 4])
-        self.assertEqual(ctl.prefix_index.longest_match(ctl.prefix_index.prefix_keys(list(range(8)))), ([], 0))
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 3, 1, 5])
+        ctl.dp_budget.total_requests = [0, 0, 0, 5]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(12))))
+        self.assertEqual(_dispatched_rank(ctl), 3)
+
+    def test_rank_activated_beyond_budget_counts_as_idle(self):
+        """Elastic EP activates ranks past the launch dp_size before the budget
+        grows; indexing the load list by such a rank raised IndexError."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.workers.append(MagicMock(name="worker_2"))
+        ctl.status.append(True)
+        ctl._active_workers = [0, 1, 2]
+        ctl.prefix_index = PrefixAffinityIndex(
+            dp_size=3, block_tokens=4, max_blocks_per_rank=64
+        )
+        ctl.dp_budget.total_requests = [1, 1]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 2)
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 1])
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
