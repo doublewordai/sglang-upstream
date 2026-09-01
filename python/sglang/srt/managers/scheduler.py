@@ -1135,6 +1135,11 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+        from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+        if isinstance(self.tree_cache, HiSparseRadixCache):
+            self.tree_cache.attach_coordinator(self.hisparse_coordinator)
+
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False

@@ -94,6 +94,14 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    def _hisparse_retention(self) -> bool:
+        """True when the tree cache owns hisparse resource release
+        (HiSparseRadixCache: cache_finished_req retains host rows and calls
+        release_for_retention itself)."""
+        from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+        return isinstance(self.tree_cache, HiSparseRadixCache)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -104,7 +112,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if get_memory().enable_hisparse:
+                if get_memory().enable_hisparse and not self._hisparse_retention():
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
@@ -1082,7 +1090,7 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
+                if get_memory().enable_hisparse and not self._hisparse_retention():
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None

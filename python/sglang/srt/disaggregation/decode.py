@@ -1591,27 +1591,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         if self.scheduler.enable_hisparse:
-            # HiSparse is incompatible with decode-side L1 radix cache. Keep
-            # this path on the upstream full-allocation semantics.
-            assert prefix_len == 0
-
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
+            # With HiSparseRadixCache a matched (retained) prefix keeps its
+            # host rows: adopt them and allocate/transfer only the delta.
             coordinator = self.scheduler.hisparse_coordinator
+            if prefix_len > 0:
+                assert total_prefix_len == prefix_len, (
+                    "hisparse retention does not compose with decode-side "
+                    "HiCache loadback (L2/L3 prefix gap)"
+                )
+                coordinator.adopt_prefix(req, prefix_indices)
+            else:
+                coordinator.req_adopted_len[req.req_pool_idx] = 0
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
                 req=req,
                 fill_len=fill_len,
+                prefix_len=prefix_len,
+                prefix_indices=prefix_indices,
                 uses_swa_tail=self._uses_swa_tail_prealloc(),
                 swa_tail_len=self._swa_tail_len(fill_len),
             )
-            # Allocate host indices for the RDMA transfer target.
+            # Allocate host indices for the RDMA transfer target (delta only).
+            prefix_host = coordinator.host_token_len(prefix_len)
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
+                prefix_host,
+                coordinator.host_token_len(fill_len) - prefix_host,
             )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
@@ -1671,6 +1680,8 @@ def alloc_for_decode_prealloc_hisparse(
     *,
     req: Req,
     fill_len: int,
+    prefix_len: int = 0,
+    prefix_indices: Optional[torch.Tensor] = None,
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
@@ -1679,11 +1690,16 @@ def alloc_for_decode_prealloc_hisparse(
     else:
         req.kv.kv_allocated_len = fill_len
     device = allocator.device
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+    if prefix_len > 0:
+        assert not uses_swa_tail, "retained prefix + SWA tail is unsupported"
+        last = int(prefix_indices[-1])
+    else:
+        last = -1
+    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
     seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
-    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    last_loc = torch.tensor([last], dtype=torch.int64, device=device)
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -1702,7 +1718,7 @@ def alloc_for_decode_prealloc_hisparse(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
-            extend_num_tokens=fill_len,
+            extend_num_tokens=fill_len - prefix_len,
         )
     return kv_loc
 

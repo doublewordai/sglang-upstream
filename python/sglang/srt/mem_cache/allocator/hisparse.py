@@ -255,10 +255,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         return
 
+    def register_retention_cb(self, cb) -> None:
+        """Prefix retention (radix-over-hisparse): called with every logical
+        index batch leaving the allocator, so retained host rows are freed
+        exactly when their logical index is."""
+        self._retention_cb = cb
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
+            if getattr(self, "_retention_cb", None) is not None:
+                self._retention_cb(free_index)
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
         else:

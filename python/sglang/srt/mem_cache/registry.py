@@ -83,6 +83,16 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
 
     if (
+        get_memory().enable_hisparse
+        and not ctx.disable_radix_cache
+        and server_args.disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_radix_cache
+    ):
+        from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+        return HiSparseRadixCache(params)
+
+    if (
         ctx.disable_radix_cache
         and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):

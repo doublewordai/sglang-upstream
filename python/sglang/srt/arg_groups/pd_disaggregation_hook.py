@@ -54,10 +54,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
-            if server_args.enable_hisparse:
+            if server_args.enable_hisparse and server_args.disable_radix_cache:
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with --enable-hisparse"
+                    "--disaggregation-decode-enable-radix-cache with "
+                    "--enable-hisparse uses the HiSparseRadixCache (host-"
+                    "resident prefix retention); do not also pass "
+                    "--disable-radix-cache"
                 )
             if server_args.disaggregation_transfer_backend == "fake":
                 raise ValueError(
