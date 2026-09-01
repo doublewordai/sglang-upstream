@@ -27,6 +27,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.dp_prefix_affinity import PrefixAffinityIndex
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -260,6 +261,106 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+def _make_prefix_affinity_controller(
+    dp_size: int, *, block_tokens: int = 4, threshold: float = 0.5, max_imbalance: int = 16
+) -> DataParallelController:
+    ctl = _make_controller(dp_size)
+    ctl.prefix_index = PrefixAffinityIndex(
+        dp_size=dp_size, block_tokens=block_tokens, max_blocks_per_rank=64
+    )
+    ctl.prefix_affinity_threshold = threshold
+    ctl.prefix_affinity_max_imbalance = max_imbalance
+    return ctl
+
+
+def _dispatched_rank(ctl: DataParallelController) -> int:
+    ranks = [i for i, w in enumerate(ctl.workers) if w.send_pyobj.call_count]
+    assert len(ranks) == 1, ranks
+    ctl.workers[ranks[0]].send_pyobj.reset_mock()
+    return ranks[0]
+
+
+class TestPrefixAffinityIndex(CustomTestCase):
+    def test_keys_chain_full_blocks_and_ignore_the_tail(self):
+        idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=8)
+        keys = idx.prefix_keys(list(range(10)))
+        self.assertEqual(len(keys), 2, "10 tokens / block 4 -> 2 full blocks")
+        self.assertEqual(keys, idx.prefix_keys(list(range(8))))
+        self.assertNotEqual(keys[1], idx.prefix_keys([0, 1, 2, 3, 9, 9, 9, 9])[1])
+
+    def test_longest_match_returns_deepest_ranks(self):
+        idx = PrefixAffinityIndex(dp_size=3, block_tokens=4, max_blocks_per_rank=8)
+        self.assertEqual(idx.longest_match(idx.prefix_keys(list(range(8)))), ([], 0))
+        idx.record(rank=0, keys=idx.prefix_keys(list(range(4))))
+        idx.record(rank=2, keys=idx.prefix_keys(list(range(12))))
+        ranks, tokens = idx.longest_match(idx.prefix_keys(list(range(8))))
+        self.assertEqual((ranks, tokens), ([2], 8))
+        ranks, tokens = idx.longest_match(idx.prefix_keys(list(range(4)) + [7] * 4))
+        self.assertEqual((sorted(ranks), tokens), ([0, 2], 4))
+
+    def test_record_evicts_least_recently_used_keys(self):
+        idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=3)
+        idx.record(rank=0, keys=[1, 2, 3])
+        idx.record(rank=0, keys=[1])  # refresh 1, so 2 is the oldest
+        idx.record(rank=0, keys=[4])
+        self.assertEqual(list(idx._keys[0]), [3, 1, 4])
+
+
+class TestPrefixAffinityScheduler(CustomTestCase):
+    def test_first_turn_goes_to_least_loaded_worker(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [5, 3, 1, 4]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 2)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 3, 2, 4])
+
+    def test_next_turn_follows_the_prefix(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [0, 0, 0, 3]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        first = _dispatched_rank(ctl)
+        # A new turn appends to the prompt; the retained prefix is 8 of 12 tokens.
+        ctl.dp_budget.total_requests = [3, 3, 3, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(12))))
+        self.assertEqual(_dispatched_rank(ctl), first)
+
+    def test_short_match_falls_back_to_least_loaded(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [0, 1, 1, 1]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(4))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        # Only 4 of 16 tokens match: below the 50% threshold.
+        ctl.dp_budget.total_requests = [2, 1, 1, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(16))))
+        self.assertEqual(_dispatched_rank(ctl), 3)
+
+    def test_overloaded_matching_worker_is_skipped(self):
+        ctl = _make_prefix_affinity_controller(dp_size=2, max_imbalance=2)
+        ctl.dp_budget.total_requests = [0, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        ctl.dp_budget.total_requests = [10, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 1)
+
+    def test_inactive_matching_worker_is_skipped(self):
+        ctl = _make_prefix_affinity_controller(dp_size=3)
+        ctl.dp_budget.total_requests = [0, 1, 1]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        ctl._active_workers = [1, 2]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertIn(_dispatched_rank(ctl), (1, 2))
+
+    def test_routed_dp_rank_bypasses_index_and_budget(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [5, 3, 1, 4]
+        ctl.prefix_affinity_scheduler(_req(routed_dp_rank=3, input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 3)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 3, 1, 4])
+        self.assertEqual(ctl.prefix_index.longest_match(ctl.prefix_index.prefix_keys(list(range(8)))), ([], 0))
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
