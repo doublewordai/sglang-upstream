@@ -1054,6 +1054,11 @@ class HiSparseCoordinator:
         self.req_to_host_pool[idx, :n] = rows
         self.req_to_host_pool_allocated_len[idx] = n
         self.req_adopted_len[idx] = n
+        logger.info(
+            "HiSparse retention: adopted %d-token host-resident prefix for %s",
+            n,
+            req.rid,
+        )
 
     def release_for_retention(self, req: Req) -> None:
         """request_finished minus the host-row free: device buffer slots,

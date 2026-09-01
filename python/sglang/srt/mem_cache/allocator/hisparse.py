@@ -26,6 +26,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
         self._size_hisparse = size
+        # Prefix retention (radix-over-hisparse): set via register_retention_cb.
+        self._retention_cb = None
         self.compress_ratio = 1
         self.dtype = dtype
         self.device = device
@@ -265,7 +267,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
-            if getattr(self, "_retention_cb", None) is not None:
+            if self._retention_cb is not None:
                 self._retention_cb(free_index)
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
