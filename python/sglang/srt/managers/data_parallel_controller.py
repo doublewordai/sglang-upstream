@@ -42,6 +42,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
+from sglang.srt.managers.dp_prefix_affinity import PrefixAffinityIndex
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -83,6 +84,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -160,11 +162,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AFFINITY,
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -172,6 +176,16 @@ class DataParallelController:
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
+        )
+
+        self.prefix_index = PrefixAffinityIndex(
+            dp_size=self.max_dp_size,
+            block_tokens=server_args.dp_prefix_affinity_block_tokens,
+            max_blocks_per_rank=server_args.dp_prefix_affinity_max_blocks_per_rank,
+        )
+        self.prefix_affinity_threshold = server_args.dp_prefix_affinity_threshold
+        self.prefix_affinity_max_imbalance = (
+            server_args.dp_prefix_affinity_max_imbalance
         )
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
@@ -796,6 +810,44 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def prefix_affinity_scheduler(self, req: Req):
+        """Cache-aware dispatch: send a request to the DP rank that most likely
+        still holds its prompt prefix; otherwise to the least-loaded rank."""
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        if not self._active_workers:
+            raise RuntimeError("No active DP workers are available for routing.")
+        keys = self.prefix_index.prefix_keys(req.input_ids)
+        target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
+        if target is None:
+            target = self._least_loaded_rank(self._active_workers)
+        # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
+        self.dp_budget.total_requests[target] += 1
+        self.prefix_index.record(rank=target, keys=keys)
+        sock_send(self.workers[target], req)
+
+    def _least_loaded_rank(self, ranks: List[int]) -> int:
+        loads = self.dp_budget.total_requests
+        return min(ranks, key=lambda r: loads[r])
+
+    def _prefix_affinity_rank(
+        self, *, keys: List[int], input_len: int
+    ) -> Optional[int]:
+        """The least-loaded rank among those sharing the longest prefix match,
+        or None when the match is too short or that rank is too far behind the
+        least-loaded one (the same rule sgl-router's cache-aware policy applies
+        across workers)."""
+        ranks, matched_tokens = self.prefix_index.longest_match(keys)
+        ranks = [r for r in ranks if r in self._active_workers]
+        if not ranks or matched_tokens < self.prefix_affinity_threshold * input_len:
+            return None
+        target = self._least_loaded_rank(ranks)
+        loads = self.dp_budget.total_requests
+        least = self._least_loaded_rank(self._active_workers)
+        if loads[target] - loads[least] > self.prefix_affinity_max_imbalance:
+            return None
+        return target
 
     def event_loop(self):
         while True:

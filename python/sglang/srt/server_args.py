@@ -1058,10 +1058,45 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
         NS("parallel"),
     ] = "auto"
+    dp_prefix_affinity_block_tokens: A[
+        int,
+        Arg(
+            help="prefix_affinity load balancing: prompt block size (tokens) used "
+            "to key the per-DP-rank prefix index.",
+        ),
+        NS("parallel"),
+    ] = 2048
+    dp_prefix_affinity_threshold: A[
+        float,
+        Arg(
+            help="prefix_affinity load balancing: route to the matching DP rank "
+            "only when at least this fraction of the prompt matches its index; "
+            "otherwise to the least-loaded rank.",
+        ),
+        NS("parallel"),
+    ] = 0.5
+    dp_prefix_affinity_max_imbalance: A[
+        int,
+        Arg(
+            help="prefix_affinity load balancing: ignore the prefix match when "
+            "the matching DP rank has more than this many requests over the "
+            "least-loaded rank.",
+        ),
+        NS("parallel"),
+    ] = 16
+    dp_prefix_affinity_max_blocks_per_rank: A[
+        int,
+        Arg(
+            help="prefix_affinity load balancing: prefix-index entries kept per "
+            "DP rank (LRU).",
+        ),
+        NS("parallel"),
+    ] = 1 << 15
     attn_cp_size: A[
         int,
         Arg(
@@ -4023,12 +4058,18 @@ class ServerArgs:
             # Default behavior:
             # - non-PD: round_robin
             # - PD prefill: follow_bootstrap_room
-            # - PD decode: round_robin
-            self.load_balance_method = (
-                "follow_bootstrap_room"
-                if self.disaggregation_mode == "prefill"
-                else "round_robin"
-            )
+            # - PD decode with a radix cache: prefix_affinity (a retained
+            #   prefix is only hit if the session lands on the same DP rank)
+            # - PD decode otherwise: round_robin
+            if self.disaggregation_mode == "prefill":
+                self.load_balance_method = "follow_bootstrap_room"
+            elif (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_enable_radix_cache
+            ):
+                self.load_balance_method = "prefix_affinity"
+            else:
+                self.load_balance_method = "round_robin"
             return
 
     def _handle_ssl_validation(self):
