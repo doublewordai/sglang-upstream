@@ -112,7 +112,7 @@ class MegakernelMoE(FusedMoE):
             self.hidden_size, self.top_k, self.num_local_experts, self.intermediate_size_per_partition
         )
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         assert self._kernel is not None, "prepare_megakernel_weights() must run after weight loading"
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
