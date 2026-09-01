@@ -352,7 +352,7 @@ class PrefillBootstrapQueue:
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
-        logger.debug(
+        logger.info(
             "bootstrap done rid=%s input_len=%d decode_prefix_len=%d send_pages=%d",
             req.rid,
             num_kv_indices,
