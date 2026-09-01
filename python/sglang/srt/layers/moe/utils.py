@@ -38,6 +38,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     PPLX = "pplx"
+    MEGAKERNEL = "megakernel"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -78,6 +79,9 @@ class MoeA2ABackend(Enum):
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
+
+    def is_megakernel(self):
+        return self == MoeA2ABackend.MEGAKERNEL
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED

@@ -282,6 +282,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
     "pplx",
     "ascend_tp",
+    "megakernel",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -6893,6 +6894,13 @@ class ServerArgs:
 
         run_post_process_pass(self, _a2a_backend_overrides)
         run_post_process_pass(self, _a2a_ep_size)
+
+        if self.moe_a2a_backend == "megakernel":
+            self.ep_size = self.tp_size
+            logger.info(
+                f"Megakernel MoE is enabled. The expert parallel size is adjusted "
+                f"to be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
         # The a2a-driven shared-experts fusion adjustments moved to the
         # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),

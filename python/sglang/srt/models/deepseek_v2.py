@@ -728,6 +728,7 @@ class DeepseekV2MoE(nn.Module):
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_pplx()
+                or get_moe_a2a_backend().is_megakernel()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
@@ -835,6 +836,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_megakernel()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first

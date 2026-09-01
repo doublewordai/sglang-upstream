@@ -1695,6 +1695,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
+            if get_moe_a2a_backend().is_megakernel():
+                layer.prepare_megakernel_weights()
+                return
+
             if get_moe_a2a_backend().is_megamoe() and is_sm90_supported():
                 from sglang.srt.layers.moe.mega_moe_sm90 import (
                     build_sm90_mega_moe_experts_weights,
