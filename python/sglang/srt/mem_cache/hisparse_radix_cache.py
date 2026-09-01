@@ -78,17 +78,6 @@ class HiSparseRadixCache(RadixCache):
         missing = (rows < 0).nonzero()
         return int(missing[0]) if missing.numel() > 0 else prefix_indices.numel()
 
-    def match_prefix(self, params):
-        """Trim a match to the head whose host rows are retained (a prefix
-        inserted by a still-running request has no side-table rows yet)."""
-        result = super().match_prefix(params)
-        di = result.device_indices
-        if di is not None and di.numel() > 0 and self.coordinator is not None:
-            keep = self.retained_prefix_len(di)
-            if keep < di.numel():
-                result = result._replace(device_indices=di[:keep])
-        return result
-
     def cache_finished_req(
         self, req: "Req", is_insert: bool = True, *, kv_len_to_handle: int
     ):
@@ -142,16 +131,23 @@ class HiSparseRadixCache(RadixCache):
         else:
             freed_end = key_len
 
-        # 3. Host-row ownership by position (compress_ratio == 1):
-        #    [0, adopted)          side-table copies — not this req's to free
-        #    [adopted, freed_end)  duplicates of existing tree content — free
-        #    [freed_end, key_len)  newly retained — move to the side table
-        #    [key_len, host_len)   un-inserted tail — free
-        lo = max(adopted, prot)
-        if freed_end > lo:
-            coord.free_unretained_rows(rows_all[lo:freed_end])
-        if key_len > freed_end:
-            coord.retain_rows(values[freed_end:key_len], rows_all[freed_end:key_len])
+        # 3. Host-row ownership (compress_ratio == 1). For each position in
+        #    [adopted, key_len): if the tree's logical index there has no
+        #    side-table row yet, this request's row becomes the retained one
+        #    (covers both newly inserted nodes and nodes inserted earlier by
+        #    cache_unfinished_req, whose logical indices this request shares);
+        #    if the table already holds a row (duplicate content), free ours.
+        #    Rows past key_len are an un-inserted tail — free. Rows retained
+        #    for logical indices that step 4 then frees (dedup range) are
+        #    released again by the allocator's retention hook — consistent.
+        if key_len > adopted:
+            pos_values = full_kv[adopted:key_len].to(device="cpu", dtype=torch.int64)
+            pos_rows = rows_all[adopted:key_len].to(device="cpu", dtype=torch.int64)
+            vacant = coord.logical_to_host_row[pos_values] < 0
+            if bool(vacant.any()):
+                coord.retain_rows(pos_values[vacant], pos_rows[vacant])
+            if bool((~vacant).any()):
+                coord.free_unretained_rows(pos_rows[~vacant])
         if host_len > max(key_len, adopted):
             coord.free_unretained_rows(rows_all[max(key_len, adopted) :])
 

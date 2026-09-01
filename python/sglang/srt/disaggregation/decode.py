@@ -574,7 +574,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        if self.scheduler.enable_hisparse and prefix_match.l1_prefix_len > 0:
+            # Retention: only adopt the head whose host rows the tree owns (a
+            # prefix inserted by a still-running request has no rows yet).
+            keep = self.tree_cache.retained_prefix_len(prefix_match.prefix_indices)
+            if keep < prefix_match.l1_prefix_len:
+                prefix_match.prefix_indices = prefix_match.prefix_indices[:keep]
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
