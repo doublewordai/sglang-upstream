@@ -317,18 +317,36 @@ class CommonKVManager(BaseKVManager):
                     f"[prewarm] could not fetch prefill info from {addr}; skipping"
                 )
                 continue
-            try:
-                receiver_class = get_kv_class(
-                    TransferBackend(self.server_args.disaggregation_transfer_backend),
-                    KVClassType.RECEIVER,
-                )
-                rx = receiver_class(mgr=self, bootstrap_addr=addr, bootstrap_room=None)
-                rx.init(0)  # fetch bootstrap infos + register KV args (warms ZMQ)
-                rx.clear()
-                self.addr_to_rooms_tracker[addr].discard(None)
-                logger.info(f"[prewarm] bootstrap connections to {addr} established")
-            except Exception as e:
-                logger.warning(f"[prewarm] failed to warm {addr}: {e}")
+            # Gate on the prefill arm actually serving: registering KV args
+            # drives add_remote_agent (UCCL CXI endpoint handshake) on the
+            # prefill, which times out if the prefill agent is not ready yet.
+            for _attempt in range(120):
+                try:
+                    r = requests.get(f"http://{addr}/health", timeout=5)
+                    if r.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                _time.sleep(5)
+            else:
+                logger.warning(f"[prewarm] prefill {addr} never became healthy; skipping")
+                continue
+            _time.sleep(20)  # margin for the prefill NIXL/UCCL agent init
+            for _attempt in range(3):
+                try:
+                    receiver_class = get_kv_class(
+                        TransferBackend(self.server_args.disaggregation_transfer_backend),
+                        KVClassType.RECEIVER,
+                    )
+                    rx = receiver_class(mgr=self, bootstrap_addr=addr, bootstrap_room=None)
+                    rx.init(0)  # fetch bootstrap infos + register KV args (warms ZMQ)
+                    rx.clear()
+                    self.addr_to_rooms_tracker[addr].discard(None)
+                    logger.info(f"[prewarm] bootstrap connections to {addr} established")
+                    break
+                except Exception as e:
+                    logger.warning(f"[prewarm] failed to warm {addr} (attempt {_attempt+1}): {e}")
+                    _time.sleep(30)
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
