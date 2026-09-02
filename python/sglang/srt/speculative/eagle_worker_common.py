@@ -586,6 +586,17 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
+    # pd/mtp-hisparse: back up the accepted tokens' KV to host rows before the
+    # reserved buffer slots are reused by the next verify step.
+    coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+    if coord is not None and not batch.forward_mode.is_idle():
+        coord.commit_verify_tokens(
+            batch.seq_lens,
+            accept_lens,
+            batch.req_pool_indices,
+            batch.seq_lens_cpu,
+            getattr(batch, "req_pool_indices_cpu", None),
+        )
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

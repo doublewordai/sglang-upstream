@@ -532,6 +532,18 @@ def eagle_prepare_for_verify(
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
         )
+        # pd/mtp-hisparse: steer the draft positions' KV writes into the
+        # hisparse device buffer (decode does this in prepare_for_decode).
+        coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+        if coord is not None:
+            coord.map_verify_locs_to_buffer(
+                batch.seq_lens,
+                batch.out_cache_loc,
+                batch.req_pool_indices,
+                batch.seq_lens_cpu,
+                getattr(batch, "req_pool_indices_cpu", None),
+                verify_input.draft_token_num,
+            )
 
         prepare_mamba_track_for_verify(batch)
 

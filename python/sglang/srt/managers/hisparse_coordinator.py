@@ -662,6 +662,132 @@ class HiSparseCoordinator:
             reserved_buffer_loc
         )
 
+    # ------------------------------------------------------------------
+    # MTP target-verify (pd/mtp-hisparse)
+    #
+    # A verify step writes num_draft_tokens new tokens per request at positions
+    # [seq_len, seq_len + n). Decode's single reserved slot generalises to a
+    # window: positions below device_buffer_size take their 1:1 buffer slot,
+    # positions at or past it take the reserved page slot
+    # device_buffer_size + (pos - max(seq_len, device_buffer_size)). The swap-in
+    # kernel binds the same window (num_newest = p + 1 for draft position p).
+    # After acceptance the committed tokens are backed up to host rows, exactly
+    # like decode's eager backup of the previous token, before the next step
+    # reuses the reserved slots.
+    # ------------------------------------------------------------------
+    def _verify_slot_locs(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Physical device-buffer slots of positions [seq_len, seq_len + n) per request: [bs, n]."""
+        dbs = self.device_buffer_size
+        positions = seq_lens.view(-1, 1) + torch.arange(
+            num_tokens, device=seq_lens.device, dtype=seq_lens.dtype
+        ).view(1, -1)
+        reserved_base = torch.clamp(seq_lens, min=dbs).view(-1, 1)
+        slot_idx = torch.where(positions < dbs, positions, dbs + (positions - reserved_base))
+        return self.req_to_device_buffer[req_pool_indices.view(-1, 1), slot_idx]
+
+    def map_verify_locs_to_buffer(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        """Before an MTP target-verify forward: steer the n new tokens' KV writes
+        into the device buffer (1:1 region or reserved page) and grow buffers."""
+        assert not self.is_dsv4_hisparse, "MTP verify under hisparse: DSA only"
+        n = int(num_draft_tokens)
+        page_size = self.mem_pool_device.page_size
+        assert n <= page_size, (
+            f"MTP verify needs num_draft_tokens ({n}) <= hisparse page size ({page_size})"
+        )
+        assert self.device_buffer_size >= n * self.top_k, (
+            f"MTP verify needs device_buffer_size ({self.device_buffer_size}) >= "
+            f"num_draft_tokens * top_k ({n} * {self.top_k})"
+        )
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.cpu()
+        self.wait_for_pending_backup()
+        # Grow 1:1 buffers to cover the last new position; allocates the reserved
+        # page for requests crossing device_buffer_size.
+        self._grow_device_buffers(
+            seq_lens + n, req_pool_indices, seq_lens_cpu + n, req_pool_indices_cpu
+        )
+        locs = self._verify_slot_locs(seq_lens, req_pool_indices, n)  # [bs, n]
+        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+            out_cache_loc
+        )
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
+            locs.reshape(-1)
+        )
+
+    def commit_verify_tokens(
+        self,
+        seq_lens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """After acceptance: back up the accepted tokens [seq_len, seq_len + accept)
+        from their buffer slots to host rows (the swap-in kernel serves them from
+        host once the reserved slots are reused)."""
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.cpu()
+        accept_cpu = accept_lens.to("cpu", non_blocking=False).tolist()
+        host_locs_list = []
+        device_locs_list = []
+        for i, a in enumerate(accept_cpu):
+            a = int(a)
+            if a <= 0:
+                continue
+            req_idx = int(req_pool_indices_cpu[i])
+            start_pos = int(seq_lens_cpu[i])
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                req_idx,
+                start_pos,
+                a,
+            )
+            host_locs_list.append(host_locs)
+            device_locs_list.append(
+                self._verify_slot_locs(
+                    seq_lens[i : i + 1], req_pool_indices[i : i + 1], a
+                ).reshape(-1)
+            )
+        if not host_locs_list:
+            return
+        host_locs = torch.cat(host_locs_list)
+        device_locs = torch.cat(device_locs_list).to(torch.int64)
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            self._backup_done_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
     def _eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,
@@ -1117,14 +1243,19 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         record_plan: bool = False,
+        num_newest: int = 1,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
+        num_newest: the tokens [seq_len - num_newest, seq_len) were written this
+        step and resolve to the reserved page (MTP target-verify; 1 = decode).
         """
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        if num_newest != 1:
+            assert not self.is_dsv4_hisparse, "MTP verify swap-in: DSA hisparse only"
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
@@ -1159,6 +1290,7 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
             skip_io=self.skip_io,
             **plan,
+            **({} if self.is_dsv4_hisparse else {"num_newest": num_newest}),
         )
         return top_k_indices
 
@@ -1184,15 +1316,22 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        num_newest: int = 1,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
+        num_newest > 1 is an MTP target-verify position (prefetch is off under
+        speculative decoding, so it always takes the direct path).
         """
-        if not self.enable_prefetch:
+        if not self.enable_prefetch or num_newest != 1:
             return self._run_swap_in_kernel(
-                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                layer_id,
+                num_newest=num_newest,
             )
 
         num_reqs = req_pool_indices.size(0)

@@ -330,6 +330,8 @@ class DeepseekSparseAttnBackend(
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self._hisparse_verify_pt = None
+        self._hisparse_verify_page_table = _dsa_hisparse_verify_page_table.__get__(self)
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
@@ -2256,12 +2258,32 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
-            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                topk_indices,
-                layer.layer_id,
-            )
+            if forward_batch.forward_mode.is_target_verify():
+                # pd/mtp-hisparse: one swap-in per draft position p (query rows
+                # p, n+p, 2n+p, ...); position p sees the window of p+1 tokens
+                # written this step. Results are interleaved back to row order.
+                n = self.speculative_num_draft_tokens
+                bs = topk_indices.shape[0] // n
+                tk = topk_indices.view(bs, n, -1)
+                out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
+                outv = out.view(bs, n, -1)
+                for p in range(n):
+                    pt = self.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens + (p + 1),
+                        tk[:, p].contiguous(),
+                        layer.layer_id,
+                        num_newest=p + 1,
+                    )
+                    outv[:, p].copy_(pt)
+                page_table_1 = out
+            else:
+                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    topk_indices,
+                    layer.layer_id,
+                )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
@@ -3635,3 +3657,14 @@ DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
 DSAMetadata = DSAMetadata
 DSAFlashMLAMetadata = DSAFlashMLAMetadata
 DSAIndexerMetadata = DSAIndexerMetadata
+
+def _dsa_hisparse_verify_page_table(self, bs: int, n: int, top_k: int) -> torch.Tensor:
+    """Persistent [bs*n, top_k] int32 page table for MTP verify under hisparse
+    (allocated once at the largest size seen, so CUDA-graph replays reuse it)."""
+    need = bs * n
+    buf = self._hisparse_verify_pt
+    if buf is None or buf.shape[0] < need or buf.shape[1] != top_k:
+        cap = max(need, (getattr(self, "_hisparse_verify_cap", 0) or 0))
+        buf = torch.empty((cap, top_k), dtype=torch.int32, device=self.device)
+        self._hisparse_verify_pt = buf
+    return buf[:need]

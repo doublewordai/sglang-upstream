@@ -327,6 +327,7 @@ template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
     int HOT_BUFFER_SIZE,
+    int NUM_NEWEST,
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
@@ -453,18 +454,23 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  const int newest_slot = HOT_BUFFER_SIZE;
-  const int32_t newest_token = seq_len - 1;
+  // Newest window: the NUM_NEWEST tokens [seq_len - NUM_NEWEST, seq_len) are the
+  // ones written this step (NUM_NEWEST == 1: plain decode; > 1: an MTP
+  // target-verify batch, one launch per draft position p with seq_len =
+  // committed + p + 1). Window tokens at or past HOT_BUFFER_SIZE live in the
+  // reserved page, slot HOT_BUFFER_SIZE + (token - reserved_base), excluded from
+  // LRU tracking; window tokens below HOT_BUFFER_SIZE sit in their 1:1 slot and
+  // resolve through the LRU hash like any other token.
+  const int32_t newest_base = static_cast<int32_t>(seq_len) - NUM_NEWEST;
+  const int32_t reserved_base = newest_base > HOT_BUFFER_SIZE ? newest_base : HOT_BUFFER_SIZE;
 
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
-      // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
-      // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
+    if (token_idx >= reserved_base && token_idx < static_cast<int32_t>(seq_len)) {
       s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
-      s_newest_hit = 1;
+      req_top_k_device_locs[i] = req_device_buffer_locs[HOT_BUFFER_SIZE + (token_idx - reserved_base)];
+      atomicAdd(&s_newest_hit, 1);
     } else {
       int slot = hash_slot(token_idx, HASH_SIZE);
       while (true) {
@@ -692,6 +698,7 @@ template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
     int HOT_BUFFER_SIZE,
+    int NUM_NEWEST,
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
@@ -781,6 +788,7 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            NUM_NEWEST,
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
@@ -795,6 +803,7 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            NUM_NEWEST,
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
@@ -809,6 +818,7 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            NUM_NEWEST,
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
@@ -823,6 +833,7 @@ void load_cache_to_device_buffer(
             BLOCK_SIZE,
             NUM_TOP_K,
             HOT_BUFFER_SIZE,
+            NUM_NEWEST,
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,

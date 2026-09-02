@@ -21,13 +21,17 @@ def _jit_sparse_module(
     is_dsv4_layout: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    num_newest: int = 1,
 ) -> Module:
     # record_miss_plan / skip_io are compile-time kernel flags; the
     # (False, False) production instantiation stays byte-identical.
+    # num_newest: size of the newest-token window bound to the reserved page
+    # (1 = decode; p + 1 for MTP target-verify draft position p).
     template_args = make_cpp_args(
         block_size,
         num_top_k,
         hot_buffer_size,
+        num_newest,
         is_mla,
         is_dsv4_layout,
         record_miss_plan,
@@ -38,6 +42,7 @@ def _jit_sparse_module(
         block_size,
         num_top_k,
         hot_buffer_size,
+        num_newest,
         is_mla,
         is_dsv4_layout,
         record_miss_plan,
@@ -136,10 +141,14 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    num_newest: int = 1,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert 1 <= num_newest <= page_size or page_size == 1, (
+        f"num_newest ({num_newest}) exceeds the reserved page ({page_size})"
+    )
 
     record_miss_plan = miss_src is not None
     module = _jit_sparse_module(
@@ -151,6 +160,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        num_newest=num_newest,
     )
 
     empty = torch.empty(0)
@@ -213,14 +223,17 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    num_newest: int = 1,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
     Optional miss_src/miss_dst/miss_count record the miss plan for replay by
     copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
+    num_newest: newest-token window size (see _jit_sparse_module).
     """
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
+        num_newest=num_newest,
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,
         host_cache_locs=host_cache_locs,
