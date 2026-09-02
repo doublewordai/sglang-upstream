@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -277,6 +278,56 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+        if disaggregation_mode == DisaggregationMode.DECODE:
+            prewarm_addrs = os.environ.get(
+                "SGLANG_DISAGGREGATION_PREFILL_BOOTSTRAP_ADDRS", ""
+            )
+            if prewarm_addrs.strip():
+                threading.Thread(
+                    target=self._prewarm_bootstrap_connections,
+                    args=(prewarm_addrs,),
+                    daemon=True,
+                ).start()
+
+    def _prewarm_bootstrap_connections(self, addrs: str) -> None:
+        """Establish decode->prefill bootstrap connections at engine boot.
+
+        The first ZMQ PUSH message on a fresh connection to a prefill rank
+        port is delivered ~1 s late (first-flow SYN loss -> one TCP RTO),
+        which lands on the first cold request of every new decode->prefill
+        pair (e.g. after a generation handover). Creating the connections
+        (and registering KV args) here moves that cost off the request path.
+        """
+        import time as _time
+
+        from sglang.srt.disaggregation.utils import (
+            KVClassType,
+            get_kv_class,
+        )
+
+        for addr in [a.strip() for a in addrs.split(",") if a.strip()]:
+            for _attempt in range(120):
+                if self.try_ensure_parallel_info(addr):
+                    break
+                _time.sleep(5)  # prefill engines may still be booting
+            else:
+                logger.warning(
+                    f"[prewarm] could not fetch prefill info from {addr}; skipping"
+                )
+                continue
+            try:
+                receiver_class = get_kv_class(
+                    self.server_args.disaggregation_transfer_backend,
+                    KVClassType.RECEIVER,
+                )
+                rx = receiver_class(mgr=self, bootstrap_addr=addr, bootstrap_room=None)
+                rx.init(0)  # fetch bootstrap infos + register KV args (warms ZMQ)
+                rx.clear()
+                self.addr_to_rooms_tracker[addr].discard(None)
+                logger.info(f"[prewarm] bootstrap connections to {addr} established")
+            except Exception as e:
+                logger.warning(f"[prewarm] failed to warm {addr}: {e}")
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
