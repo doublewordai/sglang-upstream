@@ -70,8 +70,8 @@ namespace sm90_blockwise {
 
 using ElementBlockScale = float;
 using ElementAccumulator = float;
-constexpr cutlass::arch::Sm90 ArchTag{};
-constexpr cutlass::arch::OpClassTensorOp OperatorClass{};
+using ArchTag = cutlass::arch::Sm90;
+using OperatorClass = cutlass::arch::OpClassTensorOp;
 
 // Assembles the GemmKernel for one (TileShape, ClusterShape, Schedule) combo
 // given the operand/scale type configuration, and runs it.
