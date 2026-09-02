@@ -303,6 +303,7 @@ class CommonKVManager(BaseKVManager):
 
         from sglang.srt.disaggregation.utils import (
             KVClassType,
+            TransferBackend,
             get_kv_class,
         )
 
@@ -318,7 +319,7 @@ class CommonKVManager(BaseKVManager):
                 continue
             try:
                 receiver_class = get_kv_class(
-                    self.server_args.disaggregation_transfer_backend,
+                    TransferBackend(self.server_args.disaggregation_transfer_backend),
                     KVClassType.RECEIVER,
                 )
                 rx = receiver_class(mgr=self, bootstrap_addr=addr, bootstrap_room=None)
