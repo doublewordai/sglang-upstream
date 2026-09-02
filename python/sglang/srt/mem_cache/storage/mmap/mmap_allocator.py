@@ -33,6 +33,8 @@ try:
     _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     _libc.madvise.restype = ctypes.c_int
     _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _libc.prctl.restype = ctypes.c_int
+    _libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 5
 except OSError:
     _libc = None
 
@@ -49,6 +51,8 @@ _MADV_NOHUGEPAGE = getattr(mmap, "MADV_NOHUGEPAGE", 15)
 _MADV_HUGEPAGE = 14
 # MADV_COLLAPSE: kernel 6.1+; synchronously collapse a range to PMD THPs.
 _MADV_COLLAPSE = 25
+_PR_SET_THP_DISABLE = 41
+_PR_GET_THP_DISABLE = 42
 
 
 def _thp_anon_huge_kb(ptr: int) -> int:
@@ -138,6 +142,25 @@ def _alloc_plain(alloc_bytes: int) -> mmap.mmap:
     return mm
 
 
+def _prctl_thp_disabled(on: bool) -> int:
+    """Set/clear PR_SET_THP_DISABLE; return the PREVIOUS state (0/1).
+
+    Used by the THP mode so an engine running with SGLANG_DISABLE_THP=1 can
+    still fault in a THP-backed pool: the process flag gates fault-time THP
+    allocation and MADV_COLLAPSE, but not explicit hugetlb mappings.
+    """
+    prev = int(_libc.prctl(_PR_GET_THP_DISABLE, *([ctypes.c_ulong(0)] * 5)))
+    want = 1 if on else 0
+    if prev != want:
+        rc = _libc.prctl(
+            _PR_SET_THP_DISABLE, ctypes.c_ulong(want), *([ctypes.c_ulong(0)] * 4)
+        )
+        if rc != 0:
+            e = ctypes.get_errno()
+            raise OSError(e, f"prctl(PR_SET_THP_DISABLE,{on}) {os.strerror(e)}")
+    return prev
+
+
 def _thp_pmd_size() -> int:
     """PMD (transparent huge page) size in bytes; 2 MiB fallback."""
     try:
@@ -213,30 +236,36 @@ def _alloc_thp(n_bytes: int, alloc_bytes: int, strict: bool) -> ctypes.Array:
             )
             ptr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
     # enable + fault in THPs (madvise argtypes are declared above; without them
-    # a >2 GiB length silently wraps to a C int and the advice never applies)
-    rc = _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_HUGEPAGE)
-    if rc != 0:
-        e = ctypes.get_errno()
-        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
-        raise OSError(e, f"madvise(MADV_HUGEPAGE) {os.strerror(e)}")
-    rc = _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_POPULATE_WRITE)
-    if rc != 0:
-        e = ctypes.get_errno()
-        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
-        raise OSError(e, f"madvise(MADV_POPULATE_WRITE) {os.strerror(e)}")
+    # a >2 GiB length silently wraps to a C int and the advice never applies).
+    # Clear any process-wide PR_SET_THP_DISABLE first (SGLANG_DISABLE_THP),
+    # restore it afterwards.
+    prev_disabled = _prctl_thp_disabled(False)
     try:
-        _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_COLLAPSE)
-    except OSError as e:  # <6.1 kernels: coverage check below still applies
-        logger.warning("MADV_COLLAPSE unavailable (%s); THP coverage may be partial", e)
-    huge_kb = _thp_anon_huge_kb(ptr)
-    coverage = huge_kb * 1024 / alloc_bytes
-    if strict and coverage < 0.98:
-        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
-        raise RuntimeError(
-            f"SGLANG_HUGEPAGE_SIZE=THP with SGLANG_HUGEPAGE_STRICT=1 but only "
-            f"{coverage:.1%} of {alloc_bytes >> 20} MiB is THP-backed "
-            f"(AnonHugePages={huge_kb} kB); refusing to fall back silently."
-        )
+        rc = _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_HUGEPAGE)
+        if rc != 0:
+            e = ctypes.get_errno()
+            _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
+            raise OSError(e, f"madvise(MADV_HUGEPAGE) {os.strerror(e)}")
+        rc = _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_POPULATE_WRITE)
+        if rc != 0:
+            e = ctypes.get_errno()
+            _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
+            raise OSError(e, f"madvise(MADV_POPULATE_WRITE) {os.strerror(e)}")
+        try:
+            _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_COLLAPSE)
+        except OSError as e:  # <6.1 kernels: coverage check below still applies
+            logger.warning("MADV_COLLAPSE unavailable (%s); THP coverage may be partial", e)
+        huge_kb = _thp_anon_huge_kb(ptr)
+        coverage = huge_kb * 1024 / alloc_bytes
+        if strict and coverage < 0.98:
+            _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
+            raise RuntimeError(
+                f"SGLANG_HUGEPAGE_SIZE=THP with SGLANG_HUGEPAGE_STRICT=1 but only "
+                f"{coverage:.1%} of {alloc_bytes >> 20} MiB is THP-backed "
+                f"(AnonHugePages={huge_kb} kB); refusing to fall back silently."
+            )
+    finally:
+        _prctl_thp_disabled(bool(prev_disabled))
     if coverage < 0.5:
         logger.warning(
             "THP host pool only %.1f%% hugepage-backed (AnonHugePages=%d kB of %d MiB)",

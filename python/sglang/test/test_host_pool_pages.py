@@ -166,6 +166,30 @@ def test_hugetlb_2m_mode():
     _gpu_roundtrip(t)
 
 
+def test_thp_mode_works_under_disable_thp():
+    """SGLANG_DISABLE_THP engines can still allocate a THP-backed pool."""
+    from sglang.srt.utils.thp import get_thp_disabled, set_thp_disabled
+
+    prev = get_thp_disabled()
+    set_thp_disabled(True)
+    try:
+        assert get_thp_disabled() == 1
+        with envs.SGLANG_HUGEPAGE_SIZE.override("THP"), envs.SGLANG_HUGEPAGE_STRICT.override(True):
+            try:
+                t = alloc_mmap((1 * GIB,), torch.uint8)
+            except (RuntimeError, OSError) as e:
+                pytest.skip(f"THP unavailable on this host: {e}")
+        # prctl must be restored to disabled after the allocation
+        assert get_thp_disabled() == 1
+        sm = _smaps_entry(_ptr_of(t))
+        huge_kb = int(sm["AnonHugePages:"].split()[0])
+        assert huge_kb * 1024 >= 0.98 * 1 * GIB, f"THP coverage too low under disable flag: {sm}"
+        assert _pattern_roundtrip(t)
+        _gpu_roundtrip(t)
+    finally:
+        set_thp_disabled(bool(prev))
+
+
 def test_strict_rejects_unknown_size():
     with envs.SGLANG_HUGEPAGE_SIZE.override("3MB"), envs.SGLANG_HUGEPAGE_STRICT.override(True):
         with pytest.raises(ValueError):
