@@ -108,15 +108,28 @@ def tree_pools(tree) -> Dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def iter_backuped_nodes(root) -> List:
-    """All nodes with host_value set, DFS pre-order (parents before children)."""
+def iter_backuped_chains(root):
+    """All backuped nodes with their FULL key path from root, DFS pre-order.
+
+    Each entry is (full_path_tokens: array('q'), node). Full-path keys make
+    every chain self-contained on the heir: the insert walk from root
+    consumes the parent path and appends the node's own segment (exactly the
+    ``_insert_helper_host(last_host_node, suffix_key, ...)`` shape of the
+    storage-prefetch path). Split-safe regardless of insertion order.
+    """
     out = []
-    stack = [root]
-    while stack:
-        n = stack.pop()
-        if n is not root and n.backuped and len(n.key) > 0:
-            out.append(n)
-        stack.extend(reversed(list(n.children.values())))
+
+    def dfs(node, path_tokens):
+        for c in node.children.values():
+            if len(c.key) == 0:
+                continue
+            seg = c.key.raw_token_ids()
+            full = path_tokens + seg if len(path_tokens) else seg
+            if c.backuped:
+                out.append((full, c))
+            dfs(c, full)
+
+    dfs(root, array("q"))
     return out
 
 
@@ -148,23 +161,27 @@ class PrefillExport:
 
         page_size = tree.page_size
         pools = tree_pools(tree)
-        nodes = iter_backuped_nodes(tree.root_node)
+        chains_and_nodes = iter_backuped_chains(tree.root_node)
+        nodes = [n for _, n in chains_and_nodes]
         chains: List[ChainRecord] = []
-        for n in nodes:
+        for full_tokens, n in chains_and_nodes:
             if n.key.is_bigram:
                 raise NotImplementedError("bigram (eagle) keys not supported yet")
-            tokens = array("q", n.key.token_ids)
             hv = n.host_value
-            assert hv is not None and len(hv) == len(tokens)
-            assert len(hv) % page_size == 0, "node host_value not page-aligned"
+            assert hv is not None and len(hv) % page_size == 0, (
+                "node host_value not page-aligned"
+            )
+            seg_pages = len(hv) // page_size
+            assert len(full_tokens) >= len(hv)
             page_rows = (hv.view(-1, page_size)[:, 0] // page_size).to(torch.int64).numpy()
             hashes: Optional[List[str]] = None
             if n.hash_value is not None and len(n.hash_value) > 0:
                 hashes = list(n.hash_value)
-                assert len(hashes) == len(page_rows)
+                assert len(hashes) == seg_pages
             chains.append(
                 ChainRecord(
-                    tokens=tokens,
+                    tokens=full_tokens,
+                    n_seg_pages=seg_pages,
                     page_rows=page_rows,
                     extra_key=n.key.extra_key,
                     cache_salt=n.key.cache_salt,
@@ -372,9 +389,9 @@ def import_manifest(
 
     offset = 0
     for chain in manifest.chains:
-        ntok = len(chain.tokens)
-        rows = slots[offset : offset + ntok].clone()
-        offset += ntok
+        seg_tokens = chain.n_seg_pages * page_size
+        rows = slots[offset : offset + seg_tokens].clone()
+        offset += seg_tokens
         key = RadixKey(
             array("q", chain.tokens),
             extra_key=chain.extra_key,
@@ -382,14 +399,18 @@ def import_manifest(
         )
         hashes = None
         if need_hashes:
+            hashes = _recompute_chain_hashes(tree, chain)
             if chain.page_hashes is not None:
-                hashes = list(chain.page_hashes)
-            else:
-                hashes = _recompute_chain_hashes(tree, chain)
+                # verify the manifest's segment hashes against the tail of
+                # the recomputed full-path chain (integrity check)
+                n_seg = len(chain.page_hashes)
+                assert hashes[-n_seg:] == list(chain.page_hashes), (
+                    "hash mismatch between manifest and recomputed chain"
+                )
         _insert_host_chain(tree, key, rows, hashes)
         stats["chains"] += 1
-        stats["tokens"] += ntok
-        stats["pages"] += ntok // page_size
+        stats["tokens"] += seg_tokens
+        stats["pages"] += chain.n_seg_pages
     assert offset == len(slots), (offset, len(slots))
     return stats
 
@@ -437,17 +458,20 @@ def _parent_last_hash(tree, chain) -> Optional[str]:
 
 
 def _insert_host_chain(tree, key, host_value, hash_value) -> int:
-    """Insert one host-only chain (HiRadixCache._insert_helper_host twin).
+    """Insert one host-only chain whose ``key`` is the FULL path from root.
 
-    Module function so any RadixCache-derived tree whose ``_split_node``
-    splits ``host_value`` (HiRadixCache and the rig's registered backend)
-    can import; the algorithm is identical.
+    Walks the heir tree from the root consuming the parent path (splitting
+    partially-matched nodes exactly like the storage-prefetch path), then
+    appends the remaining segment (== ``host_value``'s rows) as a host-only
+    node under the final node. ``hash_value`` (if given) is the full-path
+    chained page-hash list; the walk slices it down to the segment.
     """
     from sglang.srt.mem_cache.radix_cache import TreeNode
 
     page_size = tree.page_size
     node = tree.root_node
     node.last_access_time = time.monotonic()
+    assert len(host_value) % page_size == 0
     if len(key) == 0:
         return 0
 
@@ -458,7 +482,6 @@ def _insert_host_chain(tree, key, host_value, hash_value) -> int:
         node.last_access_time = time.monotonic()
         prefix_len = node.key.match(key, page_size=page_size)
         key = key[prefix_len:]
-        host_value = host_value[prefix_len:]
         if hash_value is not None:
             hash_value = hash_value[prefix_len // page_size :]
         matched_length += prefix_len
@@ -469,18 +492,25 @@ def _insert_host_chain(tree, key, host_value, hash_value) -> int:
         if len(key):
             child_key = key.child_key(page_size)
 
-    if len(key):
-        new_node = TreeNode(priority=node.priority)
-        new_node.parent = node
-        new_node.key = key
-        new_node.value = None
-        new_node.host_value = host_value.clone()
-        new_node.hash_value = hash_value
-        node.children[child_key] = new_node
-        _host_leaf_status(tree, new_node)
-        _leaf_status(tree, node)
-        _host_leaf_status(tree, node)
-        _store_event(tree, new_node)
+    if len(key) == 0:
+        # full path already present (import of a strict-prefix chain after a
+        # longer one); nothing new to append
+        return matched_length
+    assert len(key) == len(host_value), (
+        f"handover insert walk mismatch: {len(key)} remaining tokens but "
+        f"{len(host_value)} segment rows (parent path incomplete?)"
+    )
+    new_node = TreeNode(priority=node.priority)
+    new_node.parent = node
+    new_node.key = key
+    new_node.value = None
+    new_node.host_value = host_value.clone()
+    new_node.hash_value = hash_value
+    node.children[child_key] = new_node
+    _host_leaf_status(tree, new_node)
+    _leaf_status(tree, node)
+    _host_leaf_status(tree, node)
+    _store_event(tree, new_node)
     return matched_length
 
 

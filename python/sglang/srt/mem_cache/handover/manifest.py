@@ -49,21 +49,28 @@ class PoolSpec:
 
 @dataclass
 class ChainRecord:
-    """One exported radix chain: a maximal run of backuped tree nodes.
+    """One exported radix chain: a backuped tree node with its FULL key path.
 
-    ``tokens`` are the chain's token ids (page-multiple length),
-    ``page_rows`` the source host page row of each page of the chain
-    (empty when ``staged``: rows are the staging buffer, sequential from 0).
-    ``page_hashes`` carries the full 64-hex chained page hashes when the
-    exporting tree had them (storage / kv events enabled); the full digest
-    is required to continue the chain on the heir.
+    ``tokens`` are the FULL path's token ids from the root (page-multiple
+    length) — self-contained for the heir's insert walk. The exported ROWS
+    belong to the chain's tail segment only: the last ``n_seg_pages`` pages
+    of ``tokens``. ``page_rows`` are the source host page rows of that
+    segment (empty when ``staged``: rows are the staging buffer, sequential
+    from 0). ``page_hashes`` carries the full 64-hex chained page hashes of
+    the segment when the exporting tree had them (storage / kv events
+    enabled); the full digest is required to continue the chain on the heir.
     """
 
-    tokens: array  # array('q')
-    page_rows: np.ndarray  # int64 [num_pages] (source side)
+    tokens: array  # array('q'), full path from root
+    n_seg_pages: int = 0  # segment pages (rows belong here)
+    page_rows: np.ndarray = None  # int64 [n_seg_pages] (source side)
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
     page_hashes: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.page_rows is None:
+            self.page_rows = np.empty(0, dtype=np.int64)
 
 
 @dataclass
@@ -79,11 +86,12 @@ class HandoverManifest:
     # ---- derived ----
     @property
     def num_tokens(self) -> int:
-        return sum(len(c.tokens) for c in self.chains)
+        """Total SEGMENT tokens (rows to land), not full-path tokens."""
+        return sum(c.n_seg_pages for c in self.chains) * self.page_size
 
     @property
     def num_pages(self) -> int:
-        return sum(len(c.page_rows) if len(c.page_rows) else len(c.tokens) // self.page_size for c in self.chains)
+        return sum(c.n_seg_pages for c in self.chains)
 
     def flat_tokens(self) -> np.ndarray:
         if not self.chains:
@@ -91,7 +99,7 @@ class HandoverManifest:
         return np.concatenate([np.frombuffer(c.tokens, dtype=np.int64) for c in self.chains])
 
     def flat_page_rows(self) -> np.ndarray:
-        """Source page rows in canonical order (staged: 0..num_pages-1)."""
+        """Source page rows of all segments in canonical order (staged: arange)."""
         if self.staged:
             return np.arange(self.num_pages, dtype=np.int64)
         return np.concatenate([c.page_rows for c in self.chains])
@@ -142,14 +150,13 @@ def manifest_to_bytes(m: HandoverManifest) -> bytes:
         tokens = np.frombuffer(c.tokens, dtype=np.int64)
         rows = c.page_rows.astype(np.int64, copy=False)
         hashes = c.page_hashes if c.page_hashes is not None else []
-        parts.append(
-            np.uint64(len(tokens)).tobytes()
-        )  # chain length also implies page count
+        parts.append(np.uint64(len(tokens)).tobytes())  # full-path length
         parts.append(tokens.tobytes())
+        parts.append(np.uint64(c.n_seg_pages).tobytes())
         if m.staged:
-            parts.append(np.uint64(0).tobytes())
+            pass  # rows implicit: sequential staging pages in canonical order
         else:
-            parts.append(np.uint64(len(rows)).tobytes())
+            assert len(rows) == c.n_seg_pages
             parts.append(rows.tobytes())
         parts.append(np.uint64(len(hashes)).tobytes())
         if hashes:
@@ -182,11 +189,12 @@ def bytes_to_manifest(b: bytes) -> HandoverManifest:
         ntok = int(np.frombuffer(take(8), dtype=np.uint64)[0])
         tokens = array("q")
         tokens.frombytes(take(ntok * 8))
+        n_seg = int(np.frombuffer(take(8), dtype=np.uint64)[0])
         if m.staged:
-            nrows = 0
+            rows = np.arange(0, dtype=np.int64)  # filled below from canonical order
+            rows = np.empty(0, dtype=np.int64)
         else:
-            nrows = int(np.frombuffer(take(8), dtype=np.uint64)[0])
-            rows = np.frombuffer(take(nrows * 8), dtype=np.int64).copy()
+            rows = np.frombuffer(take(n_seg * 8), dtype=np.int64).copy()
         nhash = int(np.frombuffer(take(8), dtype=np.uint64)[0])
         hashes = None
         if nhash:
@@ -195,7 +203,8 @@ def bytes_to_manifest(b: bytes) -> HandoverManifest:
         m.chains.append(
             ChainRecord(
                 tokens=tokens,
-                page_rows=rows if not m.staged else np.empty(0, dtype=np.int64),
+                n_seg_pages=n_seg,
+                page_rows=rows,
                 page_hashes=hashes,
             )
         )
