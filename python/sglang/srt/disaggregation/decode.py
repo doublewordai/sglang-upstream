@@ -473,12 +473,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
+        kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            if hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        if self.draft_token_to_kv_pool is not None:
+            # Draft (NextN) layers sit at global ids [num_hidden_layers, ...):
+            # register them so PP prefill stages pair their subset of layers
+            # (target stage layers + the draft layer on the LAST stage) by
+            # layer id instead of positionally.
+            draft_num = len(draft_kv_data_ptrs)
+            num_hidden_layers = self.scheduler.model_config.num_hidden_layers
+            kv_layer_ids += list(
+                range(num_hidden_layers, num_hidden_layers + draft_num)
+            )
+        kv_args.kv_layer_ids = kv_layer_ids
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size

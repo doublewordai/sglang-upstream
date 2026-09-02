@@ -237,12 +237,25 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
+        kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            if hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+            # Draft (NextN) layers sit at global ids [num_hidden_layers, ...).
+            # Register them so a PP decode peer pairs this stage's entries
+            # (its target layers +, on the LAST stage, the draft layer) by
+            # layer id instead of treating the longer decode list as
+            # decode-only speculative decoding.
+            draft_num = len(draft_kv_data_ptrs)
+            num_hidden_layers = self.scheduler.model_config.num_hidden_layers
+            kv_layer_ids += list(
+                range(num_hidden_layers, num_hidden_layers + draft_num)
+            )
+        elif self.draft_token_to_kv_pool is not None:
+            kv_layer_ids = []
+        kv_args.kv_layer_ids = kv_layer_ids
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

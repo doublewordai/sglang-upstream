@@ -951,7 +951,15 @@ class NixlKVManager(CommonKVManager):
         self,
         peer_info: KVArgsRegisterInfo,
         mem_segments: List[_KVXferMemSegment],
+        dst_align: Optional[List[int]] = None,
     ):
+        # dst_align: decode entry index per src entry (PP layer-id pairing);
+        # None keeps the previous positional behavior.
+        dst_ptrs_all = peer_info.dst_kv_ptrs
+        dst_item_lens_all = peer_info.dst_kv_item_lens
+        if dst_align is not None:
+            dst_ptrs_all = [dst_ptrs_all[j] for j in dst_align]
+            dst_item_lens_all = [dst_item_lens_all[j] for j in dst_align]
         prepared_segments = []
         for seg in mem_segments:
             src_key = (seg.start, seg.end, seg.src_mem_kind)
@@ -972,13 +980,13 @@ class NixlKVManager(CommonKVManager):
                 if peer_info.dst_num_slots is not None
                 else self._num_slots_src
             )
-            dst_kv_item_lens = peer_info.dst_kv_item_lens[seg.start : seg.end]
+            dst_kv_item_lens = dst_item_lens_all[seg.start : seg.end]
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
             dst_handle = self._prep_equal_tp_dlist(
                 peer_info.agent_name,
-                peer_info.dst_kv_ptrs[seg.start : seg.end],
+                dst_ptrs_all[seg.start : seg.end],
                 dst_kv_item_lens,
                 dst_kv_data_lens,
                 peer_info.gpu_id,
@@ -1021,6 +1029,27 @@ class NixlKVManager(CommonKVManager):
         )
         decode_only_spec_dec = n_dst > n_src and not paired_by_layer_id
 
+        # PP (+spec): the decode list spans ALL prefill stages' layers plus
+        # the draft layer; align it to exactly this rank's entries by layer
+        # id before any positional pairing (homogeneity check, mixed-memory
+        # segmentation, prepped dlists). Equal lengths (pp_size 1) keep the
+        # previous positional behavior.
+        dst_align = None
+        if paired_by_layer_id and n_dst != n_src:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=False,
+            )
+            dst_align = [j for _, j in pairs]
+        aligned_dst_mem_kinds = (
+            [peer_info.dst_kv_mem_kinds[j] for j in dst_align]
+            if dst_align is not None
+            else peer_info.dst_kv_mem_kinds
+        )
+
         if peer_info.requires_dcp_relayout:
             dst_indices = resolve_dcp_dst_entry_indices(
                 self.kv_args.kv_layer_ids,
@@ -1049,7 +1078,7 @@ class NixlKVManager(CommonKVManager):
             dst_mem_kind = None
             try:
                 dst_mem_kind = _homogeneous_kv_mem_kind(
-                    peer_info.dst_kv_mem_kinds, "destination"
+                    aligned_dst_mem_kinds, "destination"
                 )
             except NotImplementedError:
                 if decode_only_spec_dec:
@@ -1058,11 +1087,15 @@ class NixlKVManager(CommonKVManager):
                         "decode-only speculative decoding."
                     )
                 mem_segments = _kv_xfer_mem_segments(
-                    self.kv_args.kv_data_mem_kinds, peer_info.dst_kv_mem_kinds
+                    self.kv_args.kv_data_mem_kinds, aligned_dst_mem_kinds
                 )
                 if not mem_segments:
                     raise ValueError("NIXL KV transfer has no KV memory segments")
-                self._init_mixed_equal_tp_prep_handles(peer_info, mem_segments)
+                self._init_mixed_equal_tp_prep_handles(
+                    peer_info,
+                    mem_segments,
+                    dst_align=dst_align,
+                )
                 return
 
             if decode_only_spec_dec and dst_mem_kind != "VRAM":
