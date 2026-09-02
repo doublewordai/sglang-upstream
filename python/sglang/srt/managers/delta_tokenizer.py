@@ -39,6 +39,8 @@ from typing import List, Optional, Tuple
 
 
 class DeltaTokenizerCache:
+    VERIFY_WINDOW = 8
+
     def __init__(self, tokenizer, max_sessions: int = 64):
         self.tokenizer = tokenizer
         specials = [t for t in tokenizer.get_added_vocab() if t]
@@ -108,15 +110,24 @@ class DeltaTokenizerCache:
             c = self._last_special_end(text, limit)
             if c > 0:
                 j = bisect.bisect_right(old_ends, c)
-                suffix = self.tokenizer(
-                    text[c:], return_offsets_mapping=True, **encode_kwargs
-                )
-                ids = old_ids[:j] + suffix["input_ids"]
-                ends = old_ends[:j] + [c + e for _, e in suffix["offset_mapping"]]
-                self._store(key, text, ids, ends)
-                self.stats["hit"] += 1
-                self.stats["bytes_saved"] += c
-                return ids
+                # Boundary-window re-verification: the last VERIFY_WINDOW tokens
+                # of the cached prefix must re-encode identically when cut at c.
+                # Catches any (unexpected) merge crossing the cut; on mismatch we
+                # fall back to a full encode, so ids are never wrong.
+                w = min(self.VERIFY_WINDOW, j)
+                s0 = old_ends[j - w - 1] if j > w else 0
+                if self.tokenizer.encode(
+                    old_text[s0:c], **encode_kwargs
+                ) == old_ids[j - w : j]:
+                    suffix = self.tokenizer(
+                        text[c:], return_offsets_mapping=True, **encode_kwargs
+                    )
+                    ids = old_ids[:j] + suffix["input_ids"]
+                    ends = old_ends[:j] + [c + e for _, e in suffix["offset_mapping"]]
+                    self._store(key, text, ids, ends)
+                    self.stats["hit"] += 1
+                    self.stats["bytes_saved"] += c
+                    return ids
             self.stats["fallback"] += 1
         # miss (or no usable boundary): full encode, remember for next time
         enc = self.tokenizer(text, return_offsets_mapping=True, **encode_kwargs)
