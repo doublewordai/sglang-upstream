@@ -279,6 +279,10 @@ def _make_prefix_affinity_controller(
     )
     ctl.prefix_affinity_threshold = threshold
     ctl.prefix_affinity_max_imbalance = max_imbalance
+    # _size_prefix_index_to_kv_capacity reads these (hierarchical-cache
+    # sizing); defaults describe a cache-less rank.
+    ctl.server_args = _retention_args()
+    ctl.hicache_host_pool_tokens = None
     return ctl
 
 
@@ -450,6 +454,53 @@ class TestPrefixAffinityScheduler(CustomTestCase):
         ctl._size_prefix_index_to_kv_capacity()
         self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 2560)
 
+    def test_index_capacity_covers_a_fixed_hicache_size_host_tier(self):
+        """--hicache-size buys the host tier in bytes; the scheduler reports
+        the token capacity it actually allocated (per-token host bytes of the
+        rank's layer set, PP sync, page alignment) in the init handshake, and
+        the index must reach it. Production numbers: 68 GB bought 5,182,976
+        host tokens over a 1,821,184-token device pool; sizing to the device
+        pool alone (889 instead of 2530 2048-token blocks) thrashed the
+        warm-session LRU and re-prefilled nearly every turn."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.server_args = _retention_args(
+            enable_hierarchical_cache=True, hicache_size=68
+        )
+        ctl.max_total_num_tokens = 1_821_184
+        ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 1.0  # size flag: not a ratio
+        ctl.hicache_host_pool_tokens = 5_182_976
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 5_182_976 // 4)
+
+    def test_fixed_hicache_size_smaller_than_device_keeps_device_bound(self):
+        """A tiny fixed host tier must not shrink the index below the device
+        pool: the radix cache retains at least what fits on device."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.server_args = _retention_args(
+            enable_hierarchical_cache=True, hicache_size=1
+        )
+        ctl.max_total_num_tokens = 4096
+        ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 1.0
+        ctl.hicache_host_pool_tokens = 2048
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 1024)
+
+    def test_fixed_hicache_size_without_reported_capacity_uses_device_pool(self):
+        """Old schedulers do not report the handshake field; the index falls
+        back to the device pool (pre-fix behavior) rather than crashing."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.server_args = _retention_args(
+            enable_hierarchical_cache=True, hicache_size=68
+        )
+        ctl.max_total_num_tokens = 4096
+        ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 1.0
+        ctl.hicache_host_pool_tokens = None
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 1024)
+
 
 def _retention_args(**overrides) -> SimpleNamespace:
     args = dict(
@@ -470,6 +521,16 @@ class TestRetainedTokensPerDeviceToken(CustomTestCase):
     def test_hierarchical_cache_host_tier(self):
         args = _retention_args(enable_hierarchical_cache=True, hicache_ratio=2.5)
         self.assertEqual(retained_tokens_per_device_token(args), 2.5)
+
+    def test_fixed_hicache_size_is_sized_by_the_scheduler_not_a_ratio(self):
+        """A fixed --hicache-size buys the host tier in bytes; the ratio this
+        function returns stays 1.0 because the token capacity depends on the
+        per-token host bytes of the rank's layer set, PP sync and page
+        alignment. The controller sizes the index from the capacity the
+        scheduler reports instead (see
+        test_index_capacity_covers_a_fixed_hicache_size_host_tier)."""
+        args = _retention_args(enable_hierarchical_cache=True, hicache_size=68)
+        self.assertEqual(retained_tokens_per_device_token(args), 1.0)
 
     def test_hisparse_host_pool(self):
         """A HiSparse rank retains host_to_device_ratio x the device pool: a

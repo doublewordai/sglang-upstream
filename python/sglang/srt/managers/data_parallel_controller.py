@@ -182,8 +182,10 @@ class DataParallelController:
 
         # 0 = size the index to the KV capacity, known once the workers report
         # max_total_num_tokens (_size_prefix_index_to_kv_capacity). With the
-        # hierarchical cache the host tier (hicache_ratio x device) is what a
-        # rank retains, as every device page is written through to it.
+        # hierarchical cache the host tier (hicache_ratio x device, or the
+        # token capacity bought by a fixed hicache_size GB, reported by the
+        # scheduler) is what a rank retains, as every device page is written
+        # through to it.
         self.prefix_index_blocks_arg = (
             server_args.dp_prefix_affinity_max_blocks_per_rank
         )
@@ -757,6 +759,11 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        # Token capacity of the hierarchical-cache host tier this rank
+        # allocated (None when there is none); see _size_prefix_index_to_kv_capacity.
+        self.hicache_host_pool_tokens = scheduler_info[0].get(
+            "hicache_host_pool_tokens"
+        )
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
@@ -768,6 +775,27 @@ class DataParallelController:
         retained = int(
             self.max_total_num_tokens * self.retained_tokens_per_device_token
         )
+        if (
+            self.server_args.enable_hierarchical_cache
+            and self.server_args.hicache_size > 0
+        ):
+            # A fixed --hicache-size sizes the host tier in bytes; the token
+            # capacity it buys depends on the per-token host bytes of this
+            # rank's layer set, PP-group synchronization and page alignment,
+            # none of which are known until the scheduler allocates the pool.
+            # It therefore reports the capacity in the init handshake, and the
+            # index is sized to the host tier actually allocated instead of
+            # the device pool alone (retained_tokens_per_device_token cannot
+            # express this as a ratio).
+            if self.hicache_host_pool_tokens:
+                retained = max(retained, int(self.hicache_host_pool_tokens))
+            else:
+                logger.warning(
+                    "--hicache-size %s GB is set but the scheduler did not "
+                    "report a hierarchical host pool token capacity; sizing "
+                    "the prefix-affinity index to the device pool only.",
+                    self.server_args.hicache_size,
+                )
         blocks = max(1, retained // self.prefix_index.block_tokens)
         self.prefix_index.set_max_blocks_per_rank(blocks)
 
@@ -921,7 +949,15 @@ def retained_tokens_per_device_token(server_args: ServerArgs) -> float:
     its KV in a host pool of host_to_device_ratio x the device pool and its
     radix cache retains into that pool; a hierarchical cache writes every
     device page through to a host tier of hicache_ratio x the device pool.
-    Without either, the device pool is all a rank retains."""
+    Without either, the device pool is all a rank retains.
+
+    A hierarchical cache sized by --hicache-size (bytes) cannot be reduced to
+    a ratio here: the host tier's token capacity depends on the per-token
+    host bytes of the rank's layer set, on PP-group synchronization and on
+    page alignment, all known only to the scheduler once its pools are
+    allocated. The scheduler reports that capacity in its init handshake and
+    _size_prefix_index_to_kv_capacity sizes the index from it; this
+    function's hierarchical branch covers only ratio-based sizing."""
     if server_args.enable_hisparse:
         return max(1.0, float(parse_hisparse_config(server_args).host_to_device_ratio))
     if server_args.enable_hierarchical_cache and server_args.hicache_size == 0:
