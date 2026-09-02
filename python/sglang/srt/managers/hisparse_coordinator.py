@@ -211,6 +211,14 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
+        # Pinned D2H for the spec-v2 verify hooks: pageable .cpu() reads are
+        # stream-ordered behind queued kernels (e.g. the draft-extend replay)
+        # and pay pageable-staging overhead; these copies run on a private
+        # stream gated on the verify-sample event instead.
+        self._d2h_stream = device_module.Stream()
+        self._d2h_event = device_module.Event()
+        self._d2h_pinned = None
+        self._verify_sample_done = None
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -732,6 +740,45 @@ class HiSparseCoordinator:
     # like decode's eager backup of the previous token, before the next step
     # reuses the reserved slots.
     # ------------------------------------------------------------------
+    def _pinned_read(self, tensors) -> list:
+        """Async-copy small int64 GPU tensors into one pinned buffer on the
+        private D2H stream (gated on the verify-sample event when set), then
+        event-synchronize and return the pinned views. Values read here were
+        produced no later than the last event this host thread synchronized
+        on, so the wait is transfer latency, not GPU work."""
+        n = sum(t.numel() for t in tensors)
+        if self._d2h_pinned is None or self._d2h_pinned.numel() < n:
+            self._d2h_pinned = torch.empty(
+                max(n, 256), dtype=torch.int64, pin_memory=True
+            )
+        ev = self._verify_sample_done
+        if ev is not None:
+            self._d2h_stream.wait_event(ev)
+        else:
+            self._d2h_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._d2h_stream):
+            off = 0
+            for t in tensors:
+                self._d2h_pinned[off : off + t.numel()].copy_(
+                    t.to(torch.int64), non_blocking=True
+                )
+                off += t.numel()
+        self._d2h_event.record(self._d2h_stream)
+        self._d2h_event.synchronize()
+        off = 0
+        views = []
+        for t in tensors:
+            views.append(self._d2h_pinned[off : off + t.numel()])
+            off += t.numel()
+        return views
+
+    def record_verify_sample_done(self) -> None:
+        """Fence the verify sample output (called right after eagle_sample,
+        before the caller launches draft-extend)."""
+        ev = device_module.Event()
+        ev.record()
+        self._verify_sample_done = ev
+
     def _verify_slot_locs(
         self,
         seq_lens: torch.Tensor,
@@ -770,13 +817,14 @@ class HiSparseCoordinator:
         )
         bs = seq_lens.shape[0]
         if seq_lens_cpu is None or req_pool_indices_cpu is None:
-            # One packed D2H (values are relay-published and ready; the cost is
-            # sync overhead, not GPU wait) instead of two blocking copies.
-            packed = torch.cat([seq_lens, req_pool_indices]).cpu()
+            # Pinned async D2H on the private stream: the values are relay-
+            # published and ready, and this must not wait behind queued
+            # kernels on the forward stream.
+            pin_seq, pin_req = self._pinned_read([seq_lens, req_pool_indices])
             if seq_lens_cpu is None:
-                seq_lens_cpu = packed[:bs]
+                seq_lens_cpu = pin_seq
             if req_pool_indices_cpu is None:
-                req_pool_indices_cpu = packed[bs:]
+                req_pool_indices_cpu = pin_req
         self.wait_for_pending_backup()
         # Grow 1:1 buffers to cover the last new position; allocates the reserved
         # page for requests crossing device_buffer_size.
@@ -804,21 +852,17 @@ class HiSparseCoordinator:
         host once the reserved slots are reused)."""
         bs = seq_lens.shape[0]
         if seq_lens_cpu is None or req_pool_indices_cpu is None:
-            # One packed blocking D2H (the values include this round's
-            # accept_lens, so the sync also waits out the verify sample)
-            # instead of three separate blocking copies.
-            packed = torch.cat(
-                [
-                    seq_lens.to(torch.int64),
-                    req_pool_indices.to(torch.int64),
-                    accept_lens.to(torch.int64),
-                ]
-            ).cpu()
+            # Pinned async D2H on the private stream, gated on the
+            # verify-sample event: the read must not be stream-ordered behind
+            # the draft-extend replay queued on the forward stream.
+            pin_seq, pin_req, pin_acc = self._pinned_read(
+                [seq_lens, req_pool_indices, accept_lens]
+            )
             if seq_lens_cpu is None:
-                seq_lens_cpu = packed[:bs]
+                seq_lens_cpu = pin_seq
             if req_pool_indices_cpu is None:
-                req_pool_indices_cpu = packed[bs : 2 * bs]
-            accept_cpu = packed[2 * bs :].tolist()
+                req_pool_indices_cpu = pin_req
+            accept_cpu = pin_acc.tolist()
         else:
             accept_cpu = accept_lens.to("cpu", non_blocking=False).tolist()
         accept_cpu = [int(a) for a in accept_cpu]

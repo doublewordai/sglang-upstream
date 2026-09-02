@@ -608,6 +608,13 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    # pd/mtp-hisparse: fence the sample output NOW (the queue still holds only
+    # the verify forward + sample; the draft-extend launch comes later in the
+    # caller). The hisparse commit's pinned D2H gates on this event so its CPU
+    # read is NOT stream-ordered behind the draft-extend kernels.
+    coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+    if coord is not None:
+        coord.record_verify_sample_done()
     new_seq_lens = batch.seq_lens + accept_lens
     # pd/mtp-hisparse: the accepted tokens' KV backup moved AFTER the
     # draft-extend launch (maybe_commit_verify_tokens, called by the workers)
