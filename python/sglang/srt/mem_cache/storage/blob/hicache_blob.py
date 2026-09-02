@@ -70,8 +70,13 @@ logger = logging.getLogger(__name__)
 
 MAGIC = b"SGBLOB01"
 VERSION = 1
-HEADER_SIZE = 4096
-DIO_BLOCK = 4096
+HEADER_SIZE = 4096  # header content size (packed fields + page keys)
+# O_DIRECT file offsets must be aligned to the OS page size on this
+# filesystem (measured: 4096-aligned offsets fail with EINVAL, 64 KiB-aligned
+# work on the aarch64 GH200 nodes; buffer lengths are unconstrained).
+DIO_ALIGN = max(getattr(mmap, "PAGESIZE", 4096), 4096)
+HEADER_BLOCK = DIO_ALIGN  # on-disk header block (content padded with zeros)
+DIO_BLOCK = 4096  # per-page slot padding granularity (size->np inversion)
 CHUNK_SIZE = 4 * 1024 * 1024  # O_DIRECT pwrite/pread chunk
 MAX_POOLS = 8
 MAX_POOLSET_LEN = 128
@@ -318,10 +323,11 @@ class HiCacheBlob(HiCacheStorage):
         page_keys: Sequence[str],
     ) -> bytearray:
         buf = bytearray(HEADER_SIZE)
-        seg_off = HEADER_SIZE
+        seg_off = HEADER_BLOCK
         seg_lens = []
         for geo in pool_geos:
-            seg_len = geo.slot_bytes * num_pages
+            # segment extent padded so every segment START stays DIO-aligned
+            seg_len = _round_up(geo.slot_bytes * num_pages, DIO_ALIGN)
             seg_lens.append(seg_len)
             seg_off += seg_len
         poolset_b = poolset.encode()[:MAX_POOLSET_LEN]
@@ -347,7 +353,7 @@ class HiCacheBlob(HiCacheStorage):
                 len(nm),
                 nm,
                 geo.page_bytes,
-                HEADER_SIZE + sum(seg_lens[:i]),
+                HEADER_BLOCK + sum(seg_lens[:i]),
                 seg_lens[i],
             )
         for i, k in enumerate(page_keys[:num_pages]):
@@ -432,21 +438,26 @@ class HiCacheBlob(HiCacheStorage):
             st = os.stat(self._obj_path(group_id))
         except FileNotFoundError:
             return 0
-        slot_total = sum(g.slot_bytes for g in self._pools.values())
-        if slot_total == 0:
-            return 0
-        body = st.st_size - HEADER_SIZE
-        np_, rem = divmod(body, slot_total)
-        if rem != 0 or np_ < 0 or np_ > self.blob_pages:
+        np_ = self._np_from_size(st.st_size)
+        if np_ == 0 and st.st_size > 0:
             logger.warning(
-                "[blob] object %s has unexpected size %d (slot_total %d)",
-                group_id,
-                st.st_size,
-                slot_total,
+                "[blob] object %s has unexpected size %d", group_id, st.st_size
             )
-            np_ = 0
         self._coverage.put(group_id, np_)
         return np_
+
+    def _np_from_size(self, size: int) -> int:
+        """Invert file size -> num_pages under the padded segment layout."""
+        pools = list(self._pools.values())
+        if not pools:
+            return 0
+        for np_ in range(1, self.blob_pages + 1):
+            total = HEADER_BLOCK + sum(
+                _round_up(g.slot_bytes * np_, DIO_ALIGN) for g in pools
+            )
+            if total == size:
+                return np_
+        return 0
 
     def _hit_pages(
         self, keys: List[str], extra_info
@@ -543,14 +554,25 @@ class HiCacheBlob(HiCacheStorage):
             off += w
 
     def _pread_all(self, fd: int, buf, total: int, offset: int = 0):
-        off = 0
+        """Read `total` bytes at `offset` into (a view of) `buf` (preadv-based)."""
         mv = memoryview(buf)
+        off = 0
         while off < total:
             n = min(CHUNK_SIZE, total - off)
-            r = os.pread(fd, mv[off : off + n], offset + off)
-            if r == 0:
-                raise IOError(f"short pread at {off}/{total}")
-            off += r
+            view = mv[off : off + n]
+            done = 0
+            while done < n:
+                got = os.preadv(fd, [view[done:]], offset + off + done)
+                if got == 0:
+                    raise IOError(f"short pread at {offset + off + done}/{total}")
+                done += got
+                if got < n and done < n:
+                    # DIO short read mid-chunk: next offset would be unaligned;
+                    # treat as truncation (the caller reports a group miss)
+                    raise IOError(
+                        f"short DIO pread {done}/{n} at {offset + off}"
+                    )
+            off += n
 
     # ------------------------------------------------------------------
     # read path
@@ -578,12 +600,10 @@ class HiCacheBlob(HiCacheStorage):
         except OSError:
             return
         try:
-            hbuf = self._aligned_buffer(HEADER_SIZE)
-            try:
-                self._pread_all(fd, hbuf, HEADER_SIZE)
-                header = self._unpack_header(hbuf)
-            finally:
-                hbuf.close()
+            hbuf = self._aligned_buffer(HEADER_BLOCK)
+            self._pread_all(fd, hbuf, HEADER_BLOCK)
+            header = self._unpack_header(hbuf)
+            # hbuf (and its views) are freed by refcounting
 
             if header["poolset"] != poolset or header["page_tokens"] != self._page_tokens:
                 logger.debug(
@@ -631,22 +651,24 @@ class HiCacheBlob(HiCacheStorage):
                             continue
                         seg = seg_cache.get(name)
                         if seg is None:
-                            seg = self._aligned_buffer(h["seg_len"])
-                            self._pread_all(fd, seg, h["seg_len"], h["seg_off"])
+                            m = self._aligned_buffer(h["seg_len"])
+                            self._pread_all(fd, m, h["seg_len"], h["seg_off"])
+                            seg = memoryview(m)
                             seg_cache[name] = seg
                         src = seg[
                             p * geo.slot_bytes : p * geo.slot_bytes + geo.page_bytes
                         ]
-                        page_t = torch.frombuffer(memoryview(src), dtype=geo.dtype)
+                        page_t = torch.frombuffer(src, dtype=geo.dtype)
                         pool.set_from_flat_data_page(host_idx, page_t)
                         results[tn][ti] = True
                 self._total_read_objects += 1
-                self._total_read_bytes += HEADER_SIZE + sum(
+                self._total_read_bytes += HEADER_BLOCK + sum(
                     h["seg_len"] for h in header["pools"]
                 )
             finally:
-                for seg in seg_cache.values():
-                    seg.close()
+                # explicit close() raises while torch views exist; drop refs
+                # and let refcounting unmap the anonymous mmaps
+                seg_cache.clear()
         except (IOError, OSError, ValueError) as e:
             logger.warning("[blob] read %s failed: %s", group_id, e)
         finally:
@@ -752,18 +774,30 @@ class HiCacheBlob(HiCacheStorage):
 
         names = sorted(pool_pages.keys())
         geos = [self._pools[n] for n in names]
-        total = HEADER_SIZE + sum(g.slot_bytes for g in geos) * num_pages
+        seg_base = {}
+        off = HEADER_BLOCK
+        for geo in geos:
+            seg_base[geo.name] = off
+            off += _round_up(geo.slot_bytes * num_pages, DIO_ALIGN)
+        total = off
         buf = self._aligned_buffer(total)
+        mv = memoryview(buf)
         tmp = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
         try:
             header = self._pack_header(num_pages, geos, poolset, page_keys)
-            buf[:HEADER_SIZE] = header
+            mv[:HEADER_SIZE] = bytes(header)
+            mv[HEADER_SIZE:HEADER_BLOCK] = bytes(HEADER_BLOCK - HEADER_SIZE)
             for name, targets in pool_pages.items():
                 geo = self._pools[name]
                 pool = geo.host_pool
+                base = seg_base[name]
                 for (p, host_idx) in targets:
                     page = pool.get_data_page(host_idx)
-                    dst = buf[p * geo.slot_bytes : p * geo.slot_bytes + geo.page_bytes]
+                    dst = mv[
+                        base + p * geo.slot_bytes : base
+                        + p * geo.slot_bytes
+                        + geo.page_bytes
+                    ]
                     page_bytes = page.contiguous().view(torch.uint8).numpy()
                     dst[:] = page_bytes
             fd = self._open_write(tmp)
@@ -782,9 +816,7 @@ class HiCacheBlob(HiCacheStorage):
                 os.remove(tmp)
             except OSError:
                 pass
-            return "fail", 0
-        finally:
-            buf.close()
+            return fail, 0
 
     def _write_transfers(
         self, transfers: List[PoolTransfer], extra_info
@@ -887,7 +919,7 @@ class HiCacheBlob(HiCacheStorage):
             except Exception as e:  # pragma: no cover
                 logger.warning("[blob] group write future failed: %s", e)
                 status = "fail"
-            if status != "ok":
+            if status not in ("ok", "skip"):
                 continue
             p0 = g * self.blob_pages
             for name in self._pools:
@@ -913,7 +945,7 @@ class HiCacheBlob(HiCacheStorage):
                 status, _ = self._write_group(
                     gid, np_avail, name, page_keys, {name: targets}, np_avail
                 )
-                if status != "ok":
+                if status not in ("ok", "skip"):
                     continue
                 key = name_obj.get(name)
                 if key is None or key not in results:
@@ -1034,12 +1066,9 @@ class HiCacheBlob(HiCacheStorage):
         except OSError:
             return None
         try:
-            hbuf = self._aligned_buffer(HEADER_SIZE)
-            try:
-                self._pread_all(fd, hbuf, HEADER_SIZE)
-                header = self._unpack_header(hbuf)
-            finally:
-                hbuf.close()
+            hbuf = self._aligned_buffer(HEADER_BLOCK)
+            self._pread_all(fd, hbuf, HEADER_BLOCK)
+            header = self._unpack_header(hbuf)
             if (
                 header["poolset"] != self._poolset
                 or header["page_tokens"] != self._page_tokens
@@ -1050,16 +1079,13 @@ class HiCacheBlob(HiCacheStorage):
             h = header["pools"][0]
             geo = self._pools[str(PoolName.KV)]
             seg = self._aligned_buffer(h["seg_len"])
-            try:
-                self._pread_all(fd, seg, h["seg_len"], h["seg_off"])
-                src = seg[0 : geo.page_bytes]
-                page_t = torch.frombuffer(memoryview(src), dtype=geo.dtype).clone()
-                target_location.view(torch.uint8).copy_(
-                    page_t.view(torch.uint8).reshape(-1)
-                )
-                return target_location
-            finally:
-                seg.close()
+            self._pread_all(fd, seg, h["seg_len"], h["seg_off"])
+            src = memoryview(seg)[0 : geo.page_bytes]
+            page_t = torch.frombuffer(src, dtype=geo.dtype).clone()
+            target_location.view(torch.uint8).copy_(
+                page_t.view(torch.uint8).reshape(-1)
+            )
+            return target_location
         except (IOError, OSError, ValueError, IndexError) as e:
             logger.warning("[blob] legacy get %s failed: %s", key, e)
             return None

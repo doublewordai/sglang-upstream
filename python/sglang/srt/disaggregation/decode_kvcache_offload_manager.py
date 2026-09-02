@@ -149,6 +149,10 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup = {}
         self.offloaded_state = {}
         self.offload_inflight = {}
+        # rid -> full page-key chain of the context so far (prefill + offloaded
+        # incremental pages). Blob-style storage backends need the absolute
+        # chain position to group pages correctly.
+        self.offload_page_keys: dict = {}
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
@@ -193,6 +197,7 @@ class DecodeKVCacheOffloadManager:
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
             )
+            self.offload_page_keys[req.rid] = list(prefill_hashes)
             state = OffloadedState(
                 prefill_len=prefill_offloaded_len,
                 inc_len=0,
@@ -309,6 +314,7 @@ class DecodeKVCacheOffloadManager:
                     if req.rid in self.offloaded_state
                     else None
                 )
+                prior_page_keys = self.offload_page_keys.get(req.rid, [])
                 last_hash = self._trigger_backup(
                     req,
                     host_indices,
@@ -316,6 +322,7 @@ class DecodeKVCacheOffloadManager:
                     start_time,
                     prior_hash,
                     indexer_host_indices,
+                    prior_page_keys,
                 )
                 if req.rid in self.offloaded_state:
                     self.offloaded_state[req.rid].last_hash = last_hash
@@ -369,6 +376,7 @@ class DecodeKVCacheOffloadManager:
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
+        self.offload_page_keys.pop(req.rid, None)
 
     def _check_backup_progress(self, finish_count):
         """Check the progress of backup from host to storage."""
@@ -396,6 +404,7 @@ class DecodeKVCacheOffloadManager:
         start_time,
         prior_hash,
         indexer_host_indices=None,
+        prior_page_keys=None,
     ):
         """Trigger async backup from host to storage."""
         page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
@@ -411,6 +420,10 @@ class DecodeKVCacheOffloadManager:
         write_kwargs = {}
         if extra_pools is not None:
             write_kwargs["extra_pools"] = extra_pools
+        if prior_page_keys:
+            # absolute chain position so group-based backends address pages
+            # from the context root (see blob backend)
+            write_kwargs["prefix_keys"] = list(prior_page_keys)
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
@@ -423,6 +436,7 @@ class DecodeKVCacheOffloadManager:
             start_time,
             indexer_host_indices,
         )
+        self.offload_page_keys[req.rid] = list(prior_page_keys or []) + list(page_hashes)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
     def _compute_prefix_hash(self, tokens, prior_hash=""):
