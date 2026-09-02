@@ -735,6 +735,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
+    def _fp8_mqa_logits_padded(self, q_padded, kv_fp8, w_padded, ks, ke):
+        """deep_gemm.fp8_mqa_logits(clean_logits=False), or the tuned
+        block-configuration variant when SGLANG_DSA_MQA_LOGITS_VARIANT is set.
+
+        The variant instantiates the *same* DeepGEMM sm90_fp8_mqa_logits kernel
+        template with different BLOCK_Q/BLOCK_KV/stage/math-thread constants
+        (bit-exact; the block layout does not change any output element's
+        arithmetic). Measured +5-7% on GH200 at GLM-5.3 prefill shapes; see
+        grace-1m lane mqa-tune."""
+        from sglang.kernels.ops.attention.mqa_logits_variant import (
+            fp8_mqa_logits_variant,
+            get_mqa_logits_variant_config,
+        )
+
+        cfg = get_mqa_logits_variant_config(
+            envs.SGLANG_DSA_MQA_LOGITS_VARIANT.get()
+        )
+        if cfg is None or q_padded.shape[1] != 32 or q_padded.shape[2] != 128:
+            return deep_gemm.fp8_mqa_logits(
+                q_padded, kv_fp8, w_padded, ks, ke, clean_logits=False
+            )
+        # Mirror _with_real_sm_count: the PP recv occupies one SM.
+        num_sms = self.sm_count - (1 if self.logits_with_pp_recv else 0)
+        kv, kv_scale = kv_fp8
+        return fp8_mqa_logits_variant(
+            q_padded, kv, kv_scale, w_padded, ks, ke, num_sms, *cfg
+        )
+
     @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
         """Pad q and weights to 32 heads when num_heads < 32,
@@ -1119,13 +1147,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[:q_offset], weights[:q_offset]
                     )
-                    logits = deep_gemm.fp8_mqa_logits(
-                        q_padded,
-                        kv_fp8,
-                        w_padded,
-                        ks,
-                        ke,
-                        clean_logits=False,
+                    logits = self._fp8_mqa_logits_padded(
+                        q_padded, kv_fp8, w_padded, ks, ke
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
@@ -1175,13 +1198,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[start:end], weights[start:end]
                     )
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_padded,
-                        kv_fp8,
-                        w_padded,
-                        ks[start:end],
-                        ke[start:end],
-                        clean_logits=False,
+                    logits_chunk = self._fp8_mqa_logits_padded(
+                        q_padded, kv_fp8, w_padded, ks[start:end], ke[start:end]
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
@@ -1385,13 +1403,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
                 q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_padded,
-                    kv_fp8,
-                    w_padded,
-                    ks,
-                    ke,
-                    clean_logits=False,
+                logits = self._fp8_mqa_logits_padded(
+                    q_padded, kv_fp8, w_padded, ks, ke
                 )
             topk_result = metadata.topk_transform(
                 logits,
@@ -1432,13 +1445,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             with self._with_real_sm_count():
                 q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_padded,
-                    kv_fp8,
-                    w_padded,
-                    ks,
-                    ke,
-                    clean_logits=False,
+                logits = self._fp8_mqa_logits_padded(
+                    q_padded, kv_fp8, w_padded, ks, ke
                 )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
