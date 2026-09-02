@@ -190,7 +190,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         Not bit-exact vs the bf16 matmul; error characterized in
         grace-1m lanes/lm-head-gemm.
         """
-        if not envs.SGLANG_LM_HEAD_FP8:
+        if not envs.SGLANG_LM_HEAD_FP8.get():
             return
         if type(layer).__name__ != "ParallelLMHead":
             return
