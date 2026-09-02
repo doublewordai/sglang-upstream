@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
+    copy_cache_planned_wide_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
@@ -176,6 +177,20 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
+        # Plan-then-IO split (lanes/gather): the fused swap-in kernel plans only
+        # (its hit/LRU/evict logic is unchanged -- IO was strictly after
+        # planning) and records the miss plan; a full-GPU-grid kernel then
+        # copies the planned rows (warp per row). The per-warp copy inside the
+        # fused kernel leaves the C2C link starved at small batch (one block
+        # per request). DSA/MLA linear layout only; the DSv4 page-padded path
+        # keeps the fused kernel.
+        self._wide_gather = (
+            envs.SGLANG_HISPARSE_WIDE_GATHER.get() and not self.is_dsv4_hisparse
+        )
+        self._sm_count = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
@@ -252,6 +267,21 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
+        # Miss-plan buffers for the plan-then-IO swap-in split: the planning
+        # kernel (every layer when the wide gather is on; each group's anchor
+        # under shared-index prefetch) records (host row, device slot) per
+        # miss, and the wide-grid copy replays them. One buffer set suffices:
+        # readers are ordered after the writer on the issuing stream(s).
+        self._miss_src = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int64, device=device
+        )
+        self._miss_dst = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=device
+        )
+        self._miss_count = torch.zeros(
+            (max_num_req_slots,), dtype=torch.int32, device=device
+        )
+
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
@@ -295,18 +325,6 @@ class HiSparseCoordinator:
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = device_module.Stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
-        # Plan recorded by the current anchor, replayed by its skip layers. One
-        # buffer set suffices: the last skip layer's event wait orders the next
-        # anchor's writes after this group's copies.
-        self._miss_src = torch.zeros(
-            (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
-        )
-        self._miss_dst = torch.zeros(
-            (max_num_req_slots, self.top_k), dtype=torch.int32, device=self.device
-        )
-        self._miss_count = torch.zeros(
-            (max_num_req_slots,), dtype=torch.int32, device=self.device
-        )
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
             "group(s), %d skip layer(s) of %d total.",
@@ -1245,12 +1263,17 @@ class HiSparseCoordinator:
         record_plan: bool = False,
         num_newest: int = 1,
     ) -> torch.Tensor:
-        """Run the full plan+IO swap-in kernel for one layer; return its slot table.
+        """Run the swap-in kernel for one layer; return its slot table.
 
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         num_newest: the tokens [seq_len - num_newest, seq_len) were written this
         step and resolve to the reserved page (MTP target-verify; 1 = decode).
+
+        With the wide gather enabled the fused kernel runs in plan-only mode
+        (skip_io; hit/LRU/evict decisions and the recorded plan are identical --
+        the elided IO was strictly after planning) and the planned rows are
+        then copied by a full-GPU-grid kernel.
         """
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
@@ -1262,13 +1285,14 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
+        plan_only = self._wide_gather
         plan = (
             dict(
                 miss_src=self._miss_src[:num_reqs],
                 miss_dst=self._miss_dst[:num_reqs],
                 miss_count=self._miss_count[:num_reqs],
             )
-            if record_plan
+            if record_plan or plan_only
             else {}
         )
         swap_in_fn(
@@ -1288,15 +1312,44 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
-            skip_io=self.skip_io,
+            skip_io=self.skip_io or plan_only,
             **plan,
             **({} if self.is_dsv4_hisparse else {"num_newest": num_newest}),
         )
+        if plan_only and not self.skip_io:
+            self._run_wide_copy_kernel(num_reqs, layer_id)
         return top_k_indices
+
+    def _wide_copy_blocks(self, num_reqs: int) -> int:
+        """Grid for the wide plan-driven copy: one warp per worst-case row
+        (num_reqs * top_k rows / warps per block), capped at 4 blocks per SM
+        (the measured sweet spot for a per-layer random gather; more blocks
+        cannot help once every SM has rows in flight)."""
+        warps_per_block = 256 // 32
+        wanted = (num_reqs * self.top_k + warps_per_block - 1) // warps_per_block
+        return min(wanted, 4 * self._sm_count)
+
+    def _run_wide_copy_kernel(self, num_reqs: int, layer_id: int) -> None:
+        """Copy this layer's recorded miss plan host->device with a
+        full-GPU-grid gather (warp per planned row; see lanes/gather for why
+        the C2C link needs the whole grid at small batch)."""
+        copy_cache_planned_wide_mla(
+            miss_src=self._miss_src[:num_reqs],
+            miss_dst=self._miss_dst[:num_reqs],
+            miss_count=self._miss_count[:num_reqs],
+            num_real_reqs=self.num_real_reqs,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            item_size_bytes=self.item_size_bytes,
+            num_blocks=self._wide_copy_blocks(num_reqs),
+        )
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
         (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        if self._wide_gather and not self.skip_io:
+            self._run_wide_copy_kernel(num_reqs, skip_layer)
+            return
         copy_cache_planned_mla(
             miss_src=self._miss_src[:num_reqs],
             miss_dst=self._miss_dst[:num_reqs],
@@ -1320,10 +1373,11 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
-        With prefetch enabled, anchors swap in synchronously (recording the miss
-        plan) and prefetch their skip layers' copies; skip layers just wait.
-        num_newest > 1 is an MTP target-verify position (prefetch is off under
-        speculative decoding, so it always takes the direct path).
+        With prefetch enabled, anchors plan (and, unless the wide gather is
+        on, copy) synchronously, recording the miss plan, and prefetch their
+        skip layers' copies; skip layers just wait. num_newest > 1 is an MTP
+        target-verify position (prefetch is off under speculative decoding, so
+        it always takes the direct path).
         """
         if not self.enable_prefetch or num_newest != 1:
             return self._run_swap_in_kernel(
