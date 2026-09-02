@@ -1845,6 +1845,10 @@ class UnifiedRadixCache(BasePrefixCache):
         def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
+                logger.info(
+                    "[kvl3] drain hit rid=%s storage_hit_tokens=%d terminated=%s",
+                    req_id, operation.storage_hit_count, operation.is_terminated(),
+                )
                 info = self.ongoing_prefetch.get(req_id)
                 if info is None:
                     # request already aborted/cleaned up, skip
@@ -1883,6 +1887,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 operation.host_indices = host_indices
                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
                 cc.prefetch_buffer.put(operation)
+                logger.info(
+                    "[kvl3] drain alloc rid=%s alloc_len=%d -> io thread",
+                    req_id, alloc_len,
+                )
 
         def _drain_backup():
             drained = 0

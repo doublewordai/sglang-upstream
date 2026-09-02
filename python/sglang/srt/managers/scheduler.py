@@ -2747,6 +2747,13 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
+            logger.info(
+                "[kvl3] prefetch gate rid=%s last_host_node=%s is_backuped=%s is_root=%s prefix_idx=%d host_hit=%d",
+                req.rid, req.last_host_node,
+                tree_cache.is_backuped(req.last_host_node),
+                tree_cache.is_root(req.last_host_node),
+                len(req.prefix_indices), req.host_hit_length,
+            )
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
                 req.last_host_node
             ):

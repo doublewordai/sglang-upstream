@@ -603,6 +603,11 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        logger.info(
+            "[kvl3] hit query rid=%s pages=%d/%d kv_hit=%d extra=%s",
+            operation.request_id, kv_hit_pages, len(hash_value), kv_hit_pages,
+            dict(hit_result.extra_pool_hit_pages),
+        )
 
         return (
             hash_value[:kv_hit_pages],
