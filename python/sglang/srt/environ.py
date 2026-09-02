@@ -683,6 +683,10 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Fail hard instead of silently falling back to base pages when the
+    # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
+    # hugetlb mmap failure, THP coverage below ~98%).
+    SGLANG_HUGEPAGE_STRICT = EnvBool(False)
     # Back host KV pools with MAP_PRIVATE anonymous pages (huge pages off) instead
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
