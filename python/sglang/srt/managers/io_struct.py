@@ -228,6 +228,14 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether this request is a warmup/health probe. It is served normally
+    # but excluded from the DP prefix-affinity dispatch index: warmup KV is
+    # evicted from the radix cache soon after boot, while an index entry
+    # never ages on an idle rank, so recording a large warmup request
+    # inflates that rank's footprint and starves it of new sessions.
+    # Engine-internal warmup senders set this; external boot-time probes
+    # (e.g. a site's long-context validation request) should set it too.
+    is_warmup: bool = False
     # Whether to return hidden states
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
@@ -876,6 +884,7 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            is_warmup=self.is_warmup,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)
@@ -1009,6 +1018,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Whether this request is a warmup/health probe (see
+    # GenerateReqInput.is_warmup); excluded from the DP prefix-affinity index.
+    is_warmup: bool = False
+
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[str] = None
 
@@ -1102,6 +1115,9 @@ class EmbeddingReqInput:
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether this request is a warmup/health probe (see
+    # GenerateReqInput.is_warmup); excluded from the DP prefix-affinity index.
+    is_warmup: bool = False
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
@@ -1259,6 +1275,7 @@ class EmbeddingReqInput:
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
+                is_warmup=self.is_warmup,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
@@ -1287,6 +1304,7 @@ class EmbeddingReqInput:
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
+                is_warmup=self.is_warmup,
                 dimensions=self.dimensions,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
@@ -1324,6 +1342,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     dimensions: Optional[int] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+    # Whether this request is a warmup/health probe (see
+    # GenerateReqInput.is_warmup); excluded from the DP prefix-affinity index.
+    is_warmup: bool = False
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
 
@@ -1632,6 +1653,18 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
 class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+
+
+class ClearPrefixAffinityIndexReq(BaseReq, kw_only=True):
+    """Ask the DataParallelController to drop every entry of the DP
+    prefix-affinity dispatch index. The tokenizer manager sends it when the
+    server warmup completes, so boot-time warmup traffic (which the radix
+    cache evicts within minutes) cannot pin the per-rank footprints used for
+    new-session placement. Individual requests can opt out of the index with
+    GenerateReqInput.is_warmup instead. Only meaningful when a
+    DataParallelController owns the scheduler input socket (dp > 1 or EP
+    scale-join); senders must gate on that condition because a bare scheduler
+    has no handler for it."""
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

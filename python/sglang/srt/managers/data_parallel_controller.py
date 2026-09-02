@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ClearPrefixAffinityIndexReq,
     ElasticScaleUpdateReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -198,6 +199,9 @@ class DataParallelController:
             max_blocks_per_rank=self.prefix_index_blocks_arg or (1 << 15),
         )
         self.prefix_affinity_threshold = server_args.dp_prefix_affinity_threshold
+        self.prefix_affinity_abs_floor_tokens = (
+            server_args.dp_prefix_affinity_abs_floor_tokens
+        )
         self.prefix_affinity_max_imbalance = (
             server_args.dp_prefix_affinity_max_imbalance
         )
@@ -378,6 +382,10 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ClearPrefixAffinityIndexReq,
+                    self.handle_clear_prefix_affinity_index,
+                ),
                 (
                     ElasticScaleUpdateReq,
                     lambda msg: self.add_elastic_workers(
@@ -890,7 +898,23 @@ class DataParallelController:
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
         if target < self.dp_budget.dp_size:
             self.dp_budget.total_requests[target] += 1
-        self.prefix_index.record(rank=target, keys=keys)
+        # A warmup/health request is served normally but must not enter the
+        # index: its KV is evicted from the radix cache within minutes of boot,
+        # while an index entry never ages on an idle rank. Recording one
+        # 262k-token warmup inflated one decode rank's footprint_tokens for a
+        # whole production day and starved it of all traffic (dp1 in gen0/gen1).
+        if not getattr(req, "is_warmup", False):
+            self.prefix_index.record(rank=target, keys=keys)
+
+    def handle_clear_prefix_affinity_index(
+        self, _req: ClearPrefixAffinityIndexReq
+    ) -> None:
+        """Drop every index entry, e.g. when the server warmup completes so
+        boot-time warmup traffic cannot pin the per-rank footprints used for
+        new-session placement. Requests can also opt out individually with
+        is_warmup=True (GenerateReqInput)."""
+        self.prefix_index.clear()
+        logger.info("prefix_affinity index cleared after warmup")
 
     def _rank_load(self, rank: int) -> int:
         """Ranks activated beyond the launch dp_size have no budget slot yet
@@ -921,10 +945,26 @@ class DataParallelController:
         """The least-loaded rank among those sharing the longest prefix match,
         or None when the match is too short or that rank is too far ahead of
         the least-loaded one (the same rule sgl-router's cache-aware policy
-        applies across workers)."""
+        applies across workers).
+
+        ""Too short" is relative (dp_prefix_affinity_threshold fraction of the
+        prompt) OR absolute (dp_prefix_affinity_abs_floor_tokens): a turn that
+        appends a large new span — a tool result or a paste — drops its match
+        fraction below the threshold while still matching tens of thousands of
+        cached tokens. Bouncing such a turn recomputes the cached span on both
+        PD arms and fragments the session across ranks, so an absolutely large
+        match stays affine; the imbalance guard below still bounds the skew."""
         ranks, matched_tokens = self.prefix_index.longest_match(keys)
         ranks = [r for r in ranks if r in self._active_workers]
-        if not ranks or matched_tokens < self.prefix_affinity_threshold * input_len:
+        if not ranks:
+            return None
+        if (
+            matched_tokens < self.prefix_affinity_threshold * input_len
+            and (
+                self.prefix_affinity_abs_floor_tokens <= 0
+                or matched_tokens < self.prefix_affinity_abs_floor_tokens
+            )
+        ):
             return None
         target = self._least_loaded_rank(ranks)
         least = self._least_loaded_rank(self._active_workers)

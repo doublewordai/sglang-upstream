@@ -1085,6 +1085,18 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 0.5
+    dp_prefix_affinity_abs_floor_tokens: A[
+        int,
+        Arg(
+            help="prefix_affinity load balancing: route to the matching DP rank "
+            "whenever the matched prefix is at least this many tokens, even if it "
+            "is below dp_prefix_affinity_threshold's fraction of the prompt. A "
+            "turn that appends a large new span (tool result, paste) otherwise "
+            "drops a multi-10k-token match, lands on a cold rank and recomputes "
+            "the cached span on both PD arms. 0 disables the absolute floor.",
+        ),
+        NS("parallel"),
+    ] = 16384
     dp_prefix_affinity_max_imbalance: A[
         int,
         Arg(

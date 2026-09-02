@@ -64,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ClearPrefixAffinityIndexReq,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
@@ -1450,6 +1451,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                is_warmup=obj.is_warmup,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1477,6 +1479,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                is_warmup=obj.is_warmup,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -2156,6 +2159,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
+
+    def clear_prefix_affinity_index(self) -> None:
+        """Ask the DP controller to drop every prefix-affinity index entry.
+
+        Sent when the server warmup completes so boot-time warmup traffic
+        (whose KV the radix cache evicts within minutes) cannot pin the
+        per-rank footprints used for new-session placement. Gated on a
+        DataParallelController owning the scheduler input socket; a bare
+        scheduler (dp_size == 1, no EP scale-join) has no handler for the
+        message and no index to clear."""
+        if not (
+            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+        ):
+            return
+        self._dispatch_to_scheduler(ClearPrefixAffinityIndexReq())
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.

@@ -2164,6 +2164,9 @@ async def _send_disaggregation_warmup_requests(
             "bootstrap_room": dp_rank,
             "input_ids": [10, 11, 12, 13],
             "routed_dp_rank": dp_rank,
+            # Keep warmup traffic out of the DP prefix-affinity index (see
+            # GenerateReqInput.is_warmup).
+            "is_warmup": True,
         }
         async with session.post(
             url + "/generate", json=json_data, ssl=ssl_context
@@ -2235,6 +2238,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
+        # Keep warmup traffic out of the DP prefix-affinity index (see
+        # GenerateReqInput.is_warmup).
+        "is_warmup": True,
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
@@ -2350,6 +2356,15 @@ def _execute_server_warmup(server_args: ServerArgs):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
+
+    # Warmup is done: whatever boot-time traffic reached the engine so far
+    # must not pin the DP prefix-affinity index (warmup KV is evicted from
+    # the radix cache within minutes, but index entries never age on an idle
+    # rank). Requests that arrive later opt out individually with
+    # is_warmup=True. No tokenizer manager in Rust-server mode; there the
+    # skip must come from the client.
+    if not envs.SGLANG_RUST_SERVER.get():
+        _global_state.tokenizer_manager.clear_prefix_affinity_index()
 
     return success
 
