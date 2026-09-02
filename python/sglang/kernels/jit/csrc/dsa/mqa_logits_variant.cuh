@@ -89,7 +89,7 @@ struct MQALogitsVariantKernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(cu_seq_len_k_end);
-    TensorMatcher({{-1, -1}})  // logits: padded [align(N, BLOCK_Q), stride]
+    TensorMatcher({-1, -1})  // logits: padded [align(N, BLOCK_Q), stride]
         .with_dtype<float>()
         .with_device(device_)
         .verify(logits);
