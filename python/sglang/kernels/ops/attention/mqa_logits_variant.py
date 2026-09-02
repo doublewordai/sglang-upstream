@@ -34,6 +34,18 @@ logger = logging.getLogger(__name__)
 # for the production 4/256/3/3/512 config. See lanes/mqa-tune/results.md.
 BEST_CONFIG: Tuple[int, int, int, int, int] = (4, 192, 3, 5, 384)
 
+# Configurations measured bit-exact and spill-free on GH200 (lanes/mqa-tune
+# sweep, ptxas-verified register usage). Others are rejected: the register
+# file caps usable accumulators at 65536/(128+math_threads) per thread, and
+# e.g. BLOCK_Q=8 at 512 math threads compiles but spills catastrophically.
+VALID_CONFIGS = {
+    (4, 192, 3, 5, 384),  # best
+    (4, 192, 3, 3, 384),
+    (4, 192, 3, 4, 384),
+    (4, 256, 2, 4, 512),
+    (4, 256, 3, 3, 512),  # production config (for A/B)
+}
+
 
 @cache_once
 def _jit_mqa_logits_variant_module(
@@ -69,19 +81,21 @@ def parse_mqa_logits_variant(raw: str) -> Optional[Tuple[int, int, int, int, int
             f"'BQ,BKV,QS,KVS,MT' (5 ints), got {raw!r}"
         )
     bq, bkv, qs, kvs, mt = parts
-    if not (1 <= bq <= 8 and bkv >= 64 and qs >= 1 and kvs >= 1 and mt >= 128):
-        raise ValueError(f"unreasonable mqa logits variant config {raw!r}")
-    if bkv != mt // 2 or mt % 128 != 0 or mt > 512:
+    cfg = (bq, bkv, qs, kvs, mt)
+    if bq * 32 > 256 or bkv != mt // 2 or mt % 128 != 0 or mt > 512 or bkv < 64:
         # Kernel constraints: BLOCK_KV == num_math_threads / 2 (epilogue
         # mapping), math threads multiple of 128 (warpgroups) and at most 512
-        # (register file: ptxas caps at 65536/(128+mt) regs per thread).
+        # (register file), WGMMA N = BLOCK_Q * 32 <= 256.
         raise ValueError(
             f"invalid mqa logits variant config {raw!r}: need BLOCK_KV == MT/2, "
-            f"MT % 128 == 0, MT <= 512"
+            f"MT % 128 == 0, MT <= 512, BLOCK_Q*32 <= 256"
         )
-    if bq * 32 > 256:
-        raise ValueError(f"invalid mqa logits variant config {raw!r}: BLOCK_Q*32 > 256 (WGMMA N)")
-    return (bq, bkv, qs, kvs, mt)
+    if cfg not in VALID_CONFIGS:
+        raise ValueError(
+            f"mqa logits variant config {raw!r} was not measured; valid configs: "
+            f"{sorted(VALID_CONFIGS)} (see grace-1m lane mqa-tune results.md)"
+        )
+    return cfg
 
 
 _VARIANT_CACHE: dict = {"raw": None, "cfg": None}
