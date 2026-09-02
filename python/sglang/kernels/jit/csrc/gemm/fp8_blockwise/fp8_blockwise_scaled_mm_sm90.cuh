@@ -86,6 +86,7 @@ template <
     typename TileShape,
     typename ClusterShape,
     typename KernelSchedule,
+    typename EpilogueSchedule,
     typename EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
 struct GemmRunner {
   using ElementA = cutlass::float_e4m3_t;
@@ -110,7 +111,7 @@ struct GemmRunner {
       ElementD,
       LayoutDTag,
       AlignmentD,
-      cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
+      EpilogueSchedule>::CollectiveOp;
 
   using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<
       static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
@@ -202,6 +203,7 @@ struct GemmRunner {
 // SFA = per-token scales [M, K/128] col-major; SFB = weight block scales
 // [K/128, N/128] row-major.
 template <typename OutType, typename TileShape, typename ClusterShape, typename KernelSchedule,
+          typename EpilogueSchedule,
           typename EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
 void launch_sm90_fp8_blockwise_scaled_mm(
     tvm::ffi::TensorView out,
@@ -235,6 +237,7 @@ void launch_sm90_fp8_blockwise_scaled_mm(
       TileShape,
       ClusterShape,
       KernelSchedule,
+      EpilogueSchedule,
       EpilogueTile>;
 
   CUTLASS_CHECK(Runner::run(
@@ -246,6 +249,7 @@ void launch_sm90_fp8_blockwise_scaled_mm(
 // D' = out^T column-major. SFA' = weight block scales ([K/128, N/128]
 // row-major, MN-major view), SFB' = per-token-group scales (col-major).
 template <typename OutType, typename TileShape, typename ClusterShape, typename KernelSchedule,
+          typename EpilogueSchedule,
           typename EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
 void launch_sm90_fp8_blockwise_scaled_mm_swapab(
     tvm::ffi::TensorView out,
@@ -281,6 +285,7 @@ void launch_sm90_fp8_blockwise_scaled_mm_swapab(
       TileShape,
       ClusterShape,
       KernelSchedule,
+      EpilogueSchedule,
       EpilogueTile>;
 
   CUTLASS_CHECK(Runner::run(
@@ -341,55 +346,60 @@ struct Fp8BlockwiseSm90Kernel {
     const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
 
     using Cluster = Shape<_1, _1, _1>;
+    using EpiWS = cutlass::epilogue::TmaWarpSpecialized;
+    using EpiCoop = cutlass::epilogue::TmaWarpSpecializedCooperative;
     if constexpr (kVariant == 0) {
       // pingpong 128x128x128
       launch_sm90_fp8_blockwise_scaled_mm<cutlass::bfloat16_t, Shape<_128, _128, _128>, Cluster,
-                                          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8Blockwise>(
+                                          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8Blockwise,
+                                          EpiWS>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 1) {
-      // cooperative 128x128x128 (explicit epilogue tile: Auto picks (64,32)
-      // which fails "MMA_TILE_M must divide EPI_TILE_M" for cooperative)
+      // cooperative 128x128x128 (needs the cooperative epilogue schedule tag,
+      // else EpilogueTileAuto picks (64,32) -> "MMA_TILE_M must divide EPI_TILE_M")
       launch_sm90_fp8_blockwise_scaled_mm<cutlass::bfloat16_t, Shape<_128, _128, _128>, Cluster,
                                           cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise,
-                                          Shape<_128, _32>>(
+                                          EpiCoop>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 2) {
       // cooperative 256x128x128 (NumSplitsM=2)
       launch_sm90_fp8_blockwise_scaled_mm<cutlass::bfloat16_t, Shape<_256, _128, _128>, Cluster,
                                           cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise,
-                                          Shape<_128, _32>>(
+                                          EpiCoop>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 3) {
       // cooperative 128x256x128
       launch_sm90_fp8_blockwise_scaled_mm<cutlass::bfloat16_t, Shape<_128, _256, _128>, Cluster,
                                           cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise,
-                                          Shape<_128, _32>>(
+                                          EpiCoop>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 4) {
       // swap: pingpong 128x16x128 (tokens on N')
       launch_sm90_fp8_blockwise_scaled_mm_swapab<
           cutlass::bfloat16_t, Shape<_128, _16, _128>, Cluster,
-          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8Blockwise>(
+          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8Blockwise,
+          EpiWS>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 5) {
       // swap: cooperative 128x16x128
       launch_sm90_fp8_blockwise_scaled_mm_swapab<
           cutlass::bfloat16_t, Shape<_128, _16, _128>, Cluster,
           cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise,
-          Shape<_128, _16>>(
+          EpiCoop>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 6) {
       // swap: pingpong 128x32x128
       launch_sm90_fp8_blockwise_scaled_mm_swapab<
           cutlass::bfloat16_t, Shape<_128, _32, _128>, Cluster,
-          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8Blockwise>(
+          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8Blockwise,
+          EpiWS>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else if constexpr (kVariant == 7) {
       // swap: cooperative 128x32x128
       launch_sm90_fp8_blockwise_scaled_mm_swapab<
           cutlass::bfloat16_t, Shape<_128, _32, _128>, Cluster,
           cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise,
-          Shape<_128, _32>>(
+          EpiCoop>(
           out, mat_a, mat_b, scales_a, scales_b, stream);
     } else {
       Panic("unknown variant");
