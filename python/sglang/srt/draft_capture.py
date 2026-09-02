@@ -149,7 +149,9 @@ class DraftCapture:
             except Exception:  # noqa: BLE001
                 rank = 0
             os.makedirs(self.dir, exist_ok=True)
-            base = os.path.join(self.dir, f"shard-{self.tag}-{rank}")
+            base = os.path.join(
+                self.dir, f"shard-{self.tag}-{rank}-{int(time.time())}"
+            )
             self.q = queue.Queue(maxsize=8)
             self.writer = _Writer(base + ".bin", base + ".stats.json", self.q)
             self.writer.start()
