@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.cold_trace import cold_trace
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -2779,6 +2780,7 @@ class NixlKVManager(CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
+                    cold_trace("pf_room_registered", room=room, senders=len(self.transfer_infos[room]))
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
