@@ -725,6 +725,10 @@ class SessionMigrationAgent:
             "n_pages": man["n_pages"],
             "n_tokens": len(man["tokens"]),
             "fingerprint": self._fingerprint(),
+            # NIXL agent identity: the target adds us so the UCCL handshake is
+            # bidirectional before it asks us to push.
+            "nixl_name": self.plane.name,
+            "nixl_meta": base64.b64encode(self.plane.metadata()).decode(),
         }
 
     def _op_push(self, msg: dict) -> dict:
@@ -814,6 +818,9 @@ class SessionMigrationAgent:
                 return {"ok": False, "reason": "holder holds nothing"}
             if meta_resp.get("fingerprint") != self._fingerprint():
                 return {"ok": False, "error": "pool fingerprint mismatch"}
+            # Bidirectional NIXL handshake: add the holder before asking it to
+            # push (UCCL rejects prepXferDlist until both sides exchanged).
+            self.plane.add_peer(meta_resp["nixl_name"], meta_resp["nixl_meta"])
 
             # 2. Allocate target rows (page runs in the anchor pool).
             slots = self.exec.run(
