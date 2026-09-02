@@ -450,6 +450,29 @@ class DeepseekV2MLP(nn.Module):
                 x = gate_up.new_empty((M, N // 2))
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
+            if (
+                _PMOE_FUSED_ACT_QUANT
+                and self.swiglu_limit is None
+                and self.down_proj.weight.dtype == torch.uint8
+                and hasattr(self.down_proj, "weight_scale_inv")
+            ):
+                # prefill-moe lane: fused SiLU*mul + fp8 group quant (bit-exact
+                # with act_fn + the linear's inner quant; TMA-aligned scales).
+                from sglang.kernels.ops.quantization.per_token_group_quant import (
+                    per_token_group_quant,
+                )
+
+                x, _ = self.down_proj(
+                    per_token_group_quant(
+                        gate_up,
+                        group_size=128,
+                        scale_ue8m0=False,
+                        fuse_silu_and_mul=True,
+                        column_major_scales=True,
+                        legacy_exact_act=True,
+                    )
+                )
+                return x
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x

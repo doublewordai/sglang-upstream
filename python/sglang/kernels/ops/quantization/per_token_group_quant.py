@@ -32,10 +32,12 @@ def _jit_module(
     fuse_silu_and_mul: bool,
     masked_layout: bool,
     use_pdl: bool,
+    legacy_exact_act: bool = False,
 ) -> Module:
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
     assert group_size in _SUPPORTED_GROUP_SIZES
+    assert not legacy_exact_act or fuse_silu_and_mul
     trait_args = make_cpp_args(
         in_dtype,
         out_dtype,
@@ -46,6 +48,10 @@ def _jit_module(
         fuse_silu_and_mul,
         use_pdl,
     )
+    if legacy_exact_act:
+        # in-place: list.__add__ would return a plain list whose __str__ is a
+        # python literal, breaking the cuda_wrappers template rendering
+        trait_args += make_cpp_args(True)
     launcher = (
         "PerTokenGroupQuantMaskedKernel"
         if masked_layout
@@ -95,6 +101,7 @@ def _per_token_group_quant_custom_op(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
+    legacy_exact_act: bool = False,
 ) -> None:
     num_groups = output_q.shape[-1] // group_size
     row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
@@ -108,6 +115,7 @@ def _per_token_group_quant_custom_op(
         bool(fuse_silu_and_mul),
         masked_m is not None,
         is_arch_support_pdl(),
+        bool(legacy_exact_act),
     )
     if masked_m is not None:
         module.per_token_group_quant(
@@ -171,6 +179,7 @@ def per_token_group_quant(
     *,
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
+    legacy_exact_act: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quantization. Returns ``(output_q, output_s)``.
 
@@ -219,5 +228,6 @@ def per_token_group_quant(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         expected_m=expected_m,
+        legacy_exact_act=legacy_exact_act,
     )
     return output_q, output_s

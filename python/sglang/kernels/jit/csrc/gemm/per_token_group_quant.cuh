@@ -218,7 +218,8 @@ template <
     bool kUe8m0_,
     bool kRowMajor_,
     bool kAligned_,
-    bool kFuseSiluAndMul_>
+    bool kFuseSiluAndMul_,
+    bool kLegacyExactAct_ = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -228,6 +229,7 @@ struct QuantTrait {
   static constexpr bool kRowMajor = kRowMajor_;
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
+  static constexpr bool kLegacyExactAct = kLegacyExactAct_;
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
@@ -281,9 +283,21 @@ struct QuantTrait {
       up.load(token_in + group_offset + params.hidden_size, lane_id);
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        const auto gate = cast<float2>(in[i]);
-        const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
-        in[i] = __hmul2(act, up[i]);
+        if constexpr (kLegacyExactAct) {
+          // prefill-moe lane: bit-exact with act_and_mul_kernel — same fp32
+          // expression (under --use_fast_math both sides compile expf to
+          // __expf and '/' to div.approx) and a single round of the fp32
+          // product to T, exactly like device::cast<T>(act * up_f32).
+          const auto gate = cast<float2>(in[i]);
+          const auto upf = cast<float2>(up[i]);
+          in[i] = cast<T2>(float2{
+              (gate.x / (1.0f + expf(-gate.x))) * upf.x,
+              (gate.y / (1.0f + expf(-gate.y))) * upf.y});
+        } else {
+          const auto gate = cast<float2>(in[i]);
+          const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
+          in[i] = __hmul2(act, up[i]);
+        }
       }
     }
 
@@ -570,9 +584,10 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kLegacyExactAct = false>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kLegacyExactAct>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     using namespace host;
@@ -594,9 +609,10 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kLegacyExactAct = false>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kLegacyExactAct>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means
