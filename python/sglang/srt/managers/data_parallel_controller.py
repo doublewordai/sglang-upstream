@@ -43,7 +43,10 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.dp_prefix_affinity import PrefixAffinityIndex
-from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.load_snapshot import (
+    LOAD_AWARE_METHODS,
+    create_load_snapshot_reader,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -165,10 +168,8 @@ class DataParallelController:
             LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
-        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
-            LoadBalanceMethod.TOTAL_REQUESTS,
-            LoadBalanceMethod.TOTAL_TOKENS,
-            LoadBalanceMethod.PREFIX_AFFINITY,
+        self.refresh_load_budget_on_dispatch = (
+            self.load_balance_method.name.lower() in LOAD_AWARE_METHODS
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -848,6 +849,17 @@ class DataParallelController:
             if target is None:
                 target = self._new_session_rank()
             sock_send(self.workers[target], req)
+        if logger.isEnabledFor(logging.INFO):
+            ranks, matched = self.prefix_index.longest_match(keys)
+            logger.info(
+                "prefix_affinity dispatch rid=%s len=%d matched=%d on %s -> dp%d loads=%s",
+                req.rid,
+                len(req.input_ids),
+                matched,
+                ranks,
+                target,
+                [self._rank_load(r) for r in self._active_workers],
+            )
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
         if target < self.dp_budget.dp_size:
             self.dp_budget.total_requests[target] += 1
