@@ -112,7 +112,7 @@ struct MQALogitsVariantKernel {
         (kNumQStages * 2 + kNumKVStages * 2 + (kNumMathThreads / 128) * 2) * 8 + 4);
     CHECK_HOST(smem_size <= kMaxSmem) << "smem overflow: " << smem_size;
 
-    auto kernel = deep_gemm::sm90_fp8_mqa_logits<
+    static constexpr auto kernel = deep_gemm::sm90_fp8_mqa_logits<
         kNumHeads, kHeadDim, false, BLOCK_Q, BLOCK_KV,
         kNumQStages, kNumKVStages, kNumSMs, kNumTMAThreads, kNumMathThreads, float>;
     static const bool smem_attr_ok = [] {
