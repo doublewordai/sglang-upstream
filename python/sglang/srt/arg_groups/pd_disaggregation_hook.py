@@ -66,7 +66,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if server_args.speculative_algorithm is not None:
+            if (
+                server_args.speculative_algorithm is not None
+                and not server_args.enable_hisparse
+            ):
+                # The plain decode radix cache is still refused with speculative
+                # decoding. Under --enable-hisparse the retention cache
+                # (HiSparseRadixCache) keeps a request's rows in the host pool,
+                # whose layer set already includes the MTP draft pools, so the
+                # draft KV is retained with the target KV (pd/mtp-hisparse).
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
