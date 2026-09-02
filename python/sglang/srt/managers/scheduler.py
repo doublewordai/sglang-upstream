@@ -326,6 +326,7 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.pool_aging import maybe_log_pool_aging
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -1728,6 +1729,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -1772,6 +1774,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
