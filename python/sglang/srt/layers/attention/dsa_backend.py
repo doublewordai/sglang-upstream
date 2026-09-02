@@ -2277,14 +2277,36 @@ class DeepseekSparseAttnBackend(
                 tk = topk_indices.view(bs, n, -1)
                 out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
                 outv = out.view(bs, n, -1)
+                probe = getattr(self.hisparse_coordinator, "dpf_probe", None)
+                if probe is not None:
+                    probe.on_verify_layer(
+                        layer.layer_id,
+                        tk,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        bs,
+                        n,
+                    )
                 for p in range(n):
+                    ev = (
+                        probe.events_for(layer.layer_id, p)
+                        if probe is not None
+                        else None
+                    )
+                    if ev is not None:
+                        ev[0].record()
                     pt = self.hisparse_coordinator.swap_in_selected_pages(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens + (p + 1),
                         tk[:, p].contiguous(),
                         layer.layer_id,
                         num_newest=p + 1,
+                        probe_plan=probe.plan() if probe is not None else None,
                     )
+                    if ev is not None:
+                        ev[1].record()
+                    if probe is not None:
+                        probe.after_swap_in(layer.layer_id, p)
                     outv[:, p].copy_(pt)
                 page_table_1 = out
             else:

@@ -597,6 +597,11 @@ def run_eagle_verify(
             batch.seq_lens_cpu,
             getattr(batch, "req_pool_indices_cpu", None),
         )
+        if coord.dpf_probe is not None:
+            coord.dpf_probe.finalize_step(
+                seq_lens_cpu=batch.seq_lens_cpu,
+                accept_lens=accept_lens,
+            )
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

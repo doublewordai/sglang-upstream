@@ -1169,6 +1169,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                _dpf_coord = getattr(
+                    self.target_worker.model_runner, "hisparse_coordinator", None
+                )
+                if _dpf_coord is not None and _dpf_coord.dpf_probe is not None:
+                    _dpf_coord.dpf_probe.on_draft_seed(
+                        getattr(batch.spec_info, "dsa_topk_indices", None)
+                    )
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group

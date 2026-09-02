@@ -262,6 +262,23 @@ class HiSparseCoordinator:
             max_num_req_slots=max_num_req_slots,
         )
 
+        # draft-prefetch probe (lane/draft-prefetch, SGLANG_DPF_PROBE)
+        self.dpf_probe = None
+        if envs.SGLANG_DPF_PROBE.get():
+            from sglang.srt.managers.draft_prefetch_probe import DraftPrefetchProbe
+
+            self.dpf_probe = DraftPrefetchProbe(
+                self,
+                out_path=envs.SGLANG_DPF_PROBE_OUT.get(),
+                probe_reqs=int(envs.SGLANG_DPF_PROBE_REQS.get()),
+                raw_steps=int(envs.SGLANG_DPF_PROBE_RAW_STEPS.get()),
+            )
+            logger.info(
+                "draft-prefetch probe enabled (probe_reqs=%d, out=%s)",
+                self.dpf_probe.probe_reqs,
+                self.dpf_probe.out_path,
+            )
+
     def _init_shared_index_prefetch(
         self,
         shared_index_layers: Optional[List[bool]],
@@ -1244,6 +1261,7 @@ class HiSparseCoordinator:
         layer_id: int,
         record_plan: bool = False,
         num_newest: int = 1,
+        probe_plan: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -1271,6 +1289,9 @@ class HiSparseCoordinator:
             if record_plan
             else {}
         )
+        if probe_plan is not None:
+            assert not plan, "DPF probe plan conflicts with the anchor miss plan"
+            plan = dict(probe_plan)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1317,6 +1338,7 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         num_newest: int = 1,
+        probe_plan: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
@@ -1332,6 +1354,7 @@ class HiSparseCoordinator:
                 top_k_result,
                 layer_id,
                 num_newest=num_newest,
+                probe_plan=probe_plan,
             )
 
         num_reqs = req_pool_indices.size(0)
