@@ -113,6 +113,7 @@ class DPBudget:
         self.host_pool_free_tokens = [0] * dp_size
         self.host_pool_total_tokens = [0] * dp_size
         self.host_pool_pinned_tokens = [0] * dp_size
+        self.host_pool_evictable_tokens = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -132,6 +133,9 @@ class DPBudget:
             )
             self.host_pool_pinned_tokens[load.dp_rank] = getattr(
                 load, "host_pool_pinned_tokens", 0
+            )
+            self.host_pool_evictable_tokens[load.dp_rank] = getattr(
+                load, "host_pool_evictable_tokens", 0
             )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):

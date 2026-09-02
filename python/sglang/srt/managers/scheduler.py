@@ -4319,6 +4319,9 @@ class Scheduler(
                 "free_tokens": int(host_pool.available_size()),
                 "total_tokens": int(host_pool.size),
                 "pinned_tokens": int(host_pool.size) - int(host_pool.available_size()),
+                "evictable_tokens": int(
+                    self.disagg_decode_prealloc_queue.tree_cache.evictable_size()
+                ),
                 "page_size": int(host_pool.page_size),
                 "prealloc_wait_events": int(
                     self.disagg_decode_prealloc_queue.host_pool_wait_events

@@ -128,7 +128,7 @@ class SchedulerLoadInquirer:
         # never via getattr(self, ...): a slots dataclass has no scheduler
         # attributes, so such guards silently evaluate to their defaults.
         host_pool_free_tokens = host_pool_total_tokens = host_pool_pinned_tokens = 0
-        host_pool_wait_events = 0
+        host_pool_evictable_tokens = host_pool_wait_events = 0
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             coordinator = None
             if self.server_args.enable_hisparse:
@@ -145,6 +145,13 @@ class SchedulerLoadInquirer:
                     )
                     host_pool_wait_events = int(
                         self.get_disagg_decode_prealloc_queue().host_pool_wait_events
+                    )
+                    # Unlocked retained radix rows: host tokens the admission
+                    # path can free by eviction (what the scheduler log calls
+                    # `evictable=`). locked = pinned - evictable.
+                    host_pool_evictable_tokens = int(
+                        self.get_disagg_decode_prealloc_queue()
+                        .tree_cache.evictable_size()
                     )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
@@ -246,6 +253,7 @@ class SchedulerLoadInquirer:
             host_pool_free_tokens=host_pool_free_tokens,
             host_pool_total_tokens=host_pool_total_tokens,
             host_pool_pinned_tokens=host_pool_pinned_tokens,
+            host_pool_evictable_tokens=host_pool_evictable_tokens,
             host_pool_wait_events=host_pool_wait_events,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,

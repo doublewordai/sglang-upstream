@@ -1131,12 +1131,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse and not self._host_pool_admission(
                 decode_req, self._pre_alloc_fill_len(decode_req.req), prefix_len
             ):
-                # Host KV pool full: leave the request queued (head order is
-                # kept by the break) and retry on a later tick, after the
-                # eviction inside _host_pool_admission has freed host rows.
+                # Host KV pool full for THIS request: skip it (it stays queued,
+                # head order preserved among the waiting) and try the next
+                # queued request. Skipping — not breaking — matters: a giant
+                # no-prefix request that cannot fit must not head-of-line block
+                # small cache-hit requests behind it (prod 23:10Z: a 9,510-
+                # page waiter stalled a 173-page hit for ~15 min until it
+                # aborted). The skipped request is retried next tick; if the
+                # pool stays full it eventually hits the bootstrap timeout.
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                break
+                continue
 
             try:
                 dst_kv_indices = self._pre_alloc(
@@ -1146,14 +1151,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     total_prefix_len,
                 )
             except HostPoolExhaustedError:
-                # Safety net: the admission pre-check above should break
+                # Safety net: the admission pre-check above should skip
                 # first. Keep the failure non-fatal anyway — the partial
                 # pre-allocation was rolled back inside _pre_alloc, so leave
-                # the request queued and retry on a later tick.
+                # the request queued, skip to the next queued request and
+                # retry on a later tick.
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 self._note_host_pool_wait(0)
-                break
+                continue
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
