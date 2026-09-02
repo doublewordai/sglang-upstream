@@ -3387,7 +3387,24 @@ class DeepseekSparseAttnBackend(
                     if total_kv_tokens < total_q_tokens * 512:
                         self.dsa_prefill_impl = "flashmla_sparse"
                         return
-                self.dsa_prefill_impl = "flashmla_kv"
+                    self.dsa_prefill_impl = "flashmla_kv"
+                elif (
+                    # lane/sparse-attn: opt-in native-fp8 Q8KV8 sparse prefill
+                    # on SM90 (see SGLANG_DSA_PREFILL_Q8KV8_AUTO in environ.py).
+                    # Only for plain EXTEND batches: the Q8KV8 dispatch lives in
+                    # the RAGGED branch of forward_extend, which is selected
+                    # exactly for ForwardMode.EXTEND; MIXED / target-verify /
+                    # draft-extend batches keep the flashmla_kv path.
+                    envs.SGLANG_DSA_PREFILL_Q8KV8_AUTO.get()
+                    and not is_blackwell()
+                    and forward_batch is not None
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and self.hisparse_coordinator is None
+                    and not is_dsa_enable_prefill_cp()
+                ):
+                    self.dsa_prefill_impl = "flashmla_sparse_q8"
+                else:
+                    self.dsa_prefill_impl = "flashmla_kv"
             else:
                 # bf16 kv cache
                 self.dsa_prefill_impl = "flashmla_sparse"
