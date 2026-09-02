@@ -452,6 +452,10 @@ class HiSparseCoordinator:
         logical = self.req_to_token_pool.req_to_token[idx, start:end].to(torch.int64)
         for layer_id in range(self.draft_pool.layer_num):
             buf = self.draft_pool.get_key_buffer(layer_id)
+            # fp8/byte-typed rows have no index_copy_cuda; move them as raw
+            # bytes (the row holds nope_fp8|scales|rope_bf16 contiguously).
+            if buf.dtype != torch.uint8 and buf.element_size() == 1:
+                buf = buf.view(torch.uint8)
             staged = buf.index_select(0, host_rows)
             buf.index_copy_(0, logical, staged)
         if envs.SGLANG_MTP_DEBUG.get():
