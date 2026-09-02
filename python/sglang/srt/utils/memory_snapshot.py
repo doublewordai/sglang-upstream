@@ -12,7 +12,7 @@ Env knobs:
   SGLANG_MEM_SNAPSHOT_DIR          directory for pickle snapshots + peaks.jsonl
   SGLANG_MEM_SNAPSHOT_MAX_ENTRIES  history ring size (default 200000)
   SGLANG_MEM_SNAPSHOT_LAYER        decoder layer index for mid-forward dumps (default 40)
-  SGLANG_MEM_SNAPSHOT_MIDFORWARD   comma list mode:count of mid-forward snapshot triggers
+  SGLANG_MEM_SNAPSHOT_MIDFORWARD   comma list mode:count:min_ntok of mid-forward snapshot triggers
   SGLANG_MEM_SNAPSHOT_EVERY        track peaks on every Nth batch of each mode (default 10)
 """
 
@@ -39,15 +39,17 @@ _MAX_ENTRIES = int(os.getenv("SGLANG_MEM_SNAPSHOT_MAX_ENTRIES", "200000"))
 _LAYER = int(os.getenv("SGLANG_MEM_SNAPSHOT_LAYER", "40"))
 _MIDFORWARD: Dict[str, int] = {}
 for _kv in os.getenv(
-    "SGLANG_MEM_SNAPSHOT_MIDFORWARD", "DECODE:1,TARGET_VERIFY:1,EXTEND:2"
+    "SGLANG_MEM_SNAPSHOT_MIDFORWARD", "DECODE:1:16,TARGET_VERIFY:1:16,EXTEND:2:2048"
 ).split(","):
     if _kv.strip():
-        _k, _, _v = _kv.partition(":")
-        _MIDFORWARD[_k.strip()] = int(_v or 1)
+        _parts = _kv.split(":")
+        _k = _parts[0].strip()
+        _MIDFORWARD[_k] = (int(_parts[1] or 1) if len(_parts) > 1 else 1,
+                           int(_parts[2]) if len(_parts) > 2 else 0)
 _EVERY = int(os.getenv("SGLANG_MEM_SNAPSHOT_EVERY", "10"))
 
 _history_on = False
-_midforward_left: Dict[str, int] = dict(_MIDFORWARD)
+_midforward_left: Dict[str, tuple] = dict(_MIDFORWARD)
 _mode_counts: Dict[str, int] = defaultdict(int)
 _layer_hook_installed = False
 _pending_midforward = False
@@ -174,8 +176,9 @@ def _begin(forward_batch: "ForwardBatch"):
             info["alloc_before"] = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
             global _pending_midforward
-            if _midforward_left.get(mode, 0) > 0:
-                _midforward_left[mode] -= 1
+            trig = _midforward_left.get(mode, (0, 0))
+            if trig[0] > 0 and ntok >= trig[1]:
+                _midforward_left[mode] = (trig[0] - 1, trig[1])
                 _pending_midforward = True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[mem-snap] begin failed: {e}")
