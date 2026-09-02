@@ -205,6 +205,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    # HiSparse host KV pool (decode arm): free/total host tokens and the
+    # cumulative prealloc admission-wait counter (host-pool backpressure).
+    host_pool_free_tokens: int = 0
+    host_pool_total_tokens: int = 0
+    host_pool_wait_events: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0

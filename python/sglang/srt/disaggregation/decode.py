@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.pool_host.hisparse import HostPoolExhaustedError
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -349,6 +350,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        # HiSparse host-pool backpressure: admission ticks skipped because the
+        # host KV pool had no whole pages for the head request (exposed via
+        # /server_info + load snapshots so it can be charted/dispatched on).
+        self.host_pool_wait_events: int = 0
+        self._host_pool_wait_last_log_ts: float = 0.0
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1122,12 +1128,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+            if self.scheduler.enable_hisparse and not self._host_pool_admission(
+                decode_req, self._pre_alloc_fill_len(decode_req.req), prefix_len
+            ):
+                # Host KV pool full: leave the request queued (head order is
+                # kept by the break) and retry on a later tick, after the
+                # eviction inside _host_pool_admission has freed host rows.
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
+
+            try:
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
+            except HostPoolExhaustedError:
+                # Safety net: the admission pre-check above should break
+                # first. Keep the failure non-fatal anyway — the partial
+                # pre-allocation was rolled back inside _pre_alloc, so leave
+                # the request queued and retry on a later tick.
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                self._note_host_pool_wait(0)
+                break
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1553,6 +1579,65 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return num_new_pages * page_size
 
+    def _host_pool_admission(
+        self, decode_req: DecodeRequest, fill_len: int, prefix_len: int
+    ) -> bool:
+        """HiSparse host-pool admission for one queued request.
+
+        Returns True when the host KV pool can cover the request's delta
+        pages right now. When it cannot, evict retained radix rows (their
+        host pages return through the allocator's retention hook) and
+        re-check. Still short means "not yet": the caller leaves the request
+        queued and it is retried on a later scheduling tick, exactly like
+        GPU/logical-pool exhaustion. No exception escapes for this state.
+        """
+        coordinator = self.scheduler.hisparse_coordinator
+        host_pool = coordinator.mem_pool_host
+        start_pos = coordinator.host_token_len(prefix_len)
+        num_tokens = coordinator.host_token_len(fill_len) - start_pos
+        # A retained prefix keeps its host rows (adopted later, inside
+        # _pre_alloc), so only the delta beyond it is newly allocated; the
+        # request's own host-row table is still empty at this point.
+        needed_pages = host_pool.host_pages_needed(start_pos, num_tokens, 0)
+        if needed_pages <= 0 or host_pool.has_free_pages(needed_pages):
+            return True
+
+        # Host pressure, unlike logical-pool pressure, frees nothing by
+        # itself: retained rows only return when their radix nodes are
+        # evicted, so drive eviction with the deficit before giving up.
+        deficit_tokens = (
+            needed_pages * host_pool.page_size - host_pool.available_size()
+        )
+        evictable = self.tree_cache.evictable_size()
+        if evictable > 0:
+            self.tree_cache.evict(
+                EvictParams(num_tokens=min(deficit_tokens, evictable))
+            )
+            if host_pool.has_free_pages(needed_pages):
+                return True
+
+        self._note_host_pool_wait(needed_pages)
+        return False
+
+    def _note_host_pool_wait(self, needed_pages: int) -> None:
+        """Count one host-pool admission skip; rate-limit the log line."""
+        self.host_pool_wait_events += 1
+        now = time.monotonic()
+        if now - self._host_pool_wait_last_log_ts < 10.0:
+            return
+        self._host_pool_wait_last_log_ts = now
+        host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+        logger.warning(
+            "HiSparse: host mem pool full; prealloc request waits "
+            "(need=%d pages, free=%d pages, queue_len=%d, evictable=%d tok, "
+            "wait_events=%d)",
+            needed_pages,
+            host_pool.available_size() // host_pool.page_size,
+            len(self.queue),
+            self.tree_cache.evictable_size(),
+            self.host_pool_wait_events,
+        )
+
     def _pre_alloc(
         self,
         req: Req,
@@ -1643,13 +1728,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             # Allocate host indices for the RDMA transfer target (delta only).
             prefix_host = coordinator.host_token_len(prefix_len)
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                prefix_host,
-                coordinator.host_token_len(fill_len) - prefix_host,
-            )
+            try:
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.req_pool_idx,
+                    prefix_host,
+                    coordinator.host_token_len(fill_len) - prefix_host,
+                )
+            except HostPoolExhaustedError:
+                # Roll the partial pre-allocation back so a retried attempt
+                # starts clean: logical indices (their pages are disjoint
+                # from the page-aligned adopted prefix), the adopted host-row
+                # view, and the req slot. The retained prefix itself stays
+                # owned by the radix tree; only this request's view of it is
+                # dropped (unadopt_prefix).
+                self.token_to_kv_pool_allocator.free(kv_loc)
+                coordinator.unadopt_prefix(req)
+                self.req_to_token_pool.free(req)
+                raise
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
             swa_tail_len = self._swa_tail_len(fill_len)
