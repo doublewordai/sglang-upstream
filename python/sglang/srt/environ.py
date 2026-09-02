@@ -457,6 +457,9 @@ class Envs:
     SGLANG_WLP_ENABLE = EnvBool(False)
     SGLANG_WLP_MAX_NEW_TOKENS = EnvInt(4096)
     SGLANG_WLP_MIN_MATCH_FRAC = EnvFloat(0.5)
+    # Allow prefix_len == 0 (full local prefill of a short prompt on the decode
+    # rank): rig weight-equality probe + the local-refill fallback variant.
+    SGLANG_WLP_ALLOW_COLD = EnvBool(False)
     SGLANG_WLP_TRACE = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on

@@ -577,6 +577,7 @@ class Scheduler(
         )
         self.wlp_max_new_tokens = envs.SGLANG_WLP_MAX_NEW_TOKENS.get()
         self.wlp_min_match_frac = envs.SGLANG_WLP_MIN_MATCH_FRAC.get()
+        self.wlp_allow_cold = envs.SGLANG_WLP_ALLOW_COLD.get()
         self.wlp_trace = envs.SGLANG_WLP_TRACE.get()
 
         if (
@@ -2757,6 +2758,11 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             if self._wlp_try_local_extend(req):
                 req.time_stats.set_wait_queue_entry_time()
+            elif req.finished_reason is not None:
+                # WLP-marked but ineligible: already aborted above (the
+                # marker is a decode-only dispatch contract; nothing will
+                # bootstrap it). Do not enqueue it into the PD path.
+                pass
             else:
                 self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
                 if not is_retracted:
@@ -3213,12 +3219,17 @@ class Scheduler(
             prefix_indices = prefix_indices[:keep]
         prefix_len = len(prefix_indices)
         delta = input_len - prefix_len
-        eligible = (
-            prefix_len > 0
-            and req.last_node is not None
-            and prefix_len >= self.wlp_min_match_frac * input_len
-            and 0 < delta <= min(self.wlp_max_new_tokens, self.chunked_prefill_size)
-        )
+        if prefix_len == 0:
+            cold_ok = self.wlp_allow_cold and req.last_node is None
+            eligible = cold_ok and 0 < delta <= min(
+                self.wlp_max_new_tokens, self.chunked_prefill_size
+            )
+        else:
+            eligible = (
+                req.last_node is not None
+                and prefix_len >= self.wlp_min_match_frac * input_len
+                and 0 < delta <= min(self.wlp_max_new_tokens, self.chunked_prefill_size)
+            )
         if not eligible:
             if self.wlp_trace:
                 logger.info(
@@ -3228,12 +3239,20 @@ class Scheduler(
                     prefix_len,
                     delta,
                 )
+            # The WLP- marker is the router's decode-only dispatch contract:
+            # no prefill arm will ever bootstrap this request. Fail loudly
+            # instead of parking it in the PD prealloc queue forever.
+            prepare_abort(req, "WLP: request not eligible for local extend")
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid), req
+            )
             return False
 
         # Hold the admission lock for the duration of the extend; released by
         # the normal finish/insert path (cache_finished_req dec_lock_ref),
         # exactly like the PD path's prealloc lock.
-        self.tree_cache.inc_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.tree_cache.inc_lock_ref(req.last_node)
         req.prefix_indices = prefix_indices
         req.cache_protected_len = prefix_len
         req.wlp_adopted_len = prefix_len
