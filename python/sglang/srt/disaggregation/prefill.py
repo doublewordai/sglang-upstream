@@ -756,6 +756,13 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if cold_trace_enabled():
+                cold_trace(
+                    "pf_result_entry",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    mid=req.inflight_middle_chunks,
+                )
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -1351,6 +1358,13 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        cold_trace(
+            "pf_send_call",
+            rid=req.rid,
+            room=req.bootstrap_room,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
