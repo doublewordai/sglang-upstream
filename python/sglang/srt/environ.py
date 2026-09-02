@@ -450,6 +450,14 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
+    # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
+    # eligibility (max new-span tokens, min matched fraction of the prompt) and
+    # tracing.
+    SGLANG_WLP_ENABLE = EnvBool(False)
+    SGLANG_WLP_MAX_NEW_TOKENS = EnvInt(4096)
+    SGLANG_WLP_MIN_MATCH_FRAC = EnvFloat(0.5)
+    SGLANG_WLP_TRACE = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

@@ -2308,6 +2308,31 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
+        # warm-local-prefill: transition staged local extends into decode
+        # (mirror of the normal scheduler's hisparse block in
+        # get_next_batch_to_run), then run at most one local extend as its
+        # own eager step. The extend step replaces this iteration's decode
+        # step (separate-step design: decode keeps its CUDA graphs; the
+        # co-resident decodes stall for the extend chunk's duration).
+        if self.enable_hisparse:
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if len(ready_reqs) > 0:
+                new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                if running_batch.is_empty():
+                    running_batch = new_batch
+                else:
+                    running_batch.merge_batch(new_batch)
+                running_batch.hisparse_coordinator = self.hisparse_coordinator
+                running_batch.batch_is_full = False
+
+            if self.wlp_enable and self.chunked_req is None:
+                extend_batch = self._wlp_build_extend_batch()
+                if extend_batch is not None:
+                    set_schedule_time_batch(extend_batch)
+                    return NextBatchPlan(
+                        batch_to_run=extend_batch, running_batch=running_batch
+                    )
+
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None
