@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -156,6 +158,9 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
@@ -245,6 +250,28 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
+
+
+# ---- lane prefill-graphs bench rig: stand-in a2a (NOT for production) ----
+# Emulates the DeepEP normal-mode dispatch host sync (blocking UCCL
+# intranode_prepare-style CPU spin) plus the a2a GPU occupancy (notify/dispatch
+# wait kernels), so single-GPU eager-vs-BCG step measurements reproduce the
+# production launch-starvation mechanism around the a2a break point.
+# Enabled only when SGLANG_PG_STANDIN_A2A_US > 0 at server start.
+_pg_standin_a2a_us = int(os.environ.get("SGLANG_PG_STANDIN_A2A_US", "0") or 0)
+_pg_standin_a2a_gpu_us = float(os.environ.get("SGLANG_PG_STANDIN_A2A_GPU_US", "0") or 0)
+
+
+@eager_on_graph(_pg_standin_a2a_us > 0)
+def _pg_standin_a2a_exchange() -> None:
+    if _pg_standin_a2a_gpu_us > 0:
+        # ~2 GHz clock on GH200; occupancy stand-in for the a2a wait kernels
+        torch.cuda._sleep(int(_pg_standin_a2a_gpu_us * 2000))
+    if _pg_standin_a2a_us > 0:
+        deadline = time.perf_counter() + _pg_standin_a2a_us / 1e6
+        while time.perf_counter() < deadline:
+            pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -1130,6 +1157,10 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+
+        if _pg_standin_a2a_us > 0:
+            # lane prefill-graphs bench rig: a2a dispatch-point stand-in
+            _pg_standin_a2a_exchange()
 
         if pre_quant_input is not None:
             final_hidden_states = self.experts(
