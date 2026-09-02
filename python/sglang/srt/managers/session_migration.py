@@ -275,7 +275,7 @@ def _pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
         n = int(buf.shape[0])
         flat = buf.reshape(n, row_elems)
         geoms["indexer"] = PoolGeom(
-            "indexer", [buf.data_ptr()], int(row_elems * buf.dtype.itemsize()), n, 1, [flat], n
+            "indexer", [buf.data_ptr()], int(row_elems * buf.dtype.itemsize), n, 1, [flat], n
         )
     else:
         raise RuntimeError(f"unsupported indexer layout {indexer.layout}")
