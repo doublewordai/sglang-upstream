@@ -1093,10 +1093,12 @@ class ServerArgs:
         int,
         Arg(
             help="prefix_affinity load balancing: prefix-index entries kept per "
-            "DP rank (LRU).",
+            "DP rank (LRU). 0 (default) sizes it to the rank's KV capacity so the "
+            "index tracks what the radix cache retains and new sessions go to "
+            "the rank with the smallest cache footprint.",
         ),
         NS("parallel"),
-    ] = 1 << 15
+    ] = 0
     attn_cp_size: A[
         int,
         Arg(

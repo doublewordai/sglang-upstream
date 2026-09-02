@@ -178,10 +178,15 @@ class DataParallelController:
             f"--dp ({self.launch_dp_size})."
         )
 
+        # 0 = size the index to the KV capacity, known once the workers report
+        # max_total_num_tokens (_size_prefix_index_to_kv_capacity).
+        self.prefix_index_blocks_arg = (
+            server_args.dp_prefix_affinity_max_blocks_per_rank
+        )
         self.prefix_index = PrefixAffinityIndex(
             dp_size=self.max_dp_size,
             block_tokens=server_args.dp_prefix_affinity_block_tokens,
-            max_blocks_per_rank=server_args.dp_prefix_affinity_max_blocks_per_rank,
+            max_blocks_per_rank=self.prefix_index_blocks_arg or (1 << 15),
         )
         self.prefix_affinity_threshold = server_args.dp_prefix_affinity_threshold
         self.prefix_affinity_max_imbalance = (
@@ -748,6 +753,13 @@ class DataParallelController:
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
+        self._size_prefix_index_to_kv_capacity()
+
+    def _size_prefix_index_to_kv_capacity(self) -> None:
+        if self.prefix_index_blocks_arg:
+            return
+        blocks = max(1, self.max_total_num_tokens // self.prefix_index.block_tokens)
+        self.prefix_index.set_max_blocks_per_rank(blocks)
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -824,7 +836,7 @@ class DataParallelController:
         else:
             target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
             if target is None:
-                target = self._least_loaded_rank(self._active_workers)
+                target = self._new_session_rank()
             sock_send(self.workers[target], req)
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
         if target < self.dp_budget.dp_size:
@@ -839,6 +851,20 @@ class DataParallelController:
 
     def _least_loaded_rank(self, ranks: List[int]) -> int:
         return min(ranks, key=self._rank_load)
+
+    def _new_session_rank(self) -> int:
+        """Where an unmatched prompt goes: the rank whose cache footprint is
+        smallest (it evicts the least), unless that rank is too far ahead of
+        the least-loaded one in requests; then the least-loaded rank."""
+        least = self._least_loaded_rank(self._active_workers)
+        target = min(
+            self._active_workers,
+            key=lambda r: (self.prefix_index.footprint_tokens(r), self._rank_load(r)),
+        )
+        imbalance = self._rank_load(target) - self._rank_load(least)
+        if imbalance > self.prefix_affinity_max_imbalance:
+            return least
+        return target
 
     def _prefix_affinity_rank(
         self, *, keys: List[int], input_len: int

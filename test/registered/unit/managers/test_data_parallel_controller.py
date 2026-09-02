@@ -307,9 +307,27 @@ class TestPrefixAffinityIndex(CustomTestCase):
     def test_record_evicts_least_recently_used_keys(self):
         idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=3)
         idx.record(rank=0, keys=[1, 2, 3])
-        idx.record(rank=0, keys=[1])  # refresh 1, so 2 is the oldest
+        idx.record(rank=0, keys=[3])  # refresh 3, so 2 is the oldest
         idx.record(rank=0, keys=[4])
-        self.assertEqual(list(idx._keys[0]), [3, 1, 4])
+        self.assertEqual(list(idx._keys[0]), [1, 3, 4])
+
+    def test_trimming_drops_a_stale_prompt_tail_before_its_head(self):
+        """A radix cache evicts leaves first; the index must keep matching the
+        surviving head of an old session rather than its orphaned tail."""
+        idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=3)
+        old = idx.prefix_keys(list(range(8)))
+        idx.record(rank=0, keys=old)
+        idx.record(rank=0, keys=idx.prefix_keys(list(range(100, 108))))
+        self.assertEqual(idx.longest_match(old), ([0], 4), "head kept, tail gone")
+
+    def test_footprint_follows_the_lru_and_its_capacity(self):
+        idx = PrefixAffinityIndex(dp_size=2, block_tokens=4, max_blocks_per_rank=2)
+        idx.record(rank=0, keys=[1, 2, 3])
+        self.assertEqual(idx.footprint_tokens(0), 8, "capped at 2 blocks of 4")
+        self.assertEqual(idx.footprint_tokens(1), 0)
+        idx.set_max_blocks_per_rank(1)
+        self.assertEqual(list(idx._keys[0]), [1], "resizing keeps the newest head")
+        self.assertEqual(idx.footprint_tokens(0), 4)
 
 
 class TestPrefixAffinityScheduler(CustomTestCase):
@@ -385,6 +403,37 @@ class TestPrefixAffinityScheduler(CustomTestCase):
         ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
         self.assertEqual(_dispatched_rank(ctl), 2)
         self.assertEqual(ctl.dp_budget.total_requests, [1, 1])
+
+    def test_new_session_goes_to_the_smallest_cache_footprint(self):
+        """Long-context sessions are bounded by KV, not request count: a new
+        session goes where it evicts the least, unless that rank is far ahead
+        in requests."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.dp_budget.total_requests = [0, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 0)  # 2 blocks on rank 0
+        ctl.dp_budget.total_requests = [0, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(100, 112))))
+        self.assertEqual(_dispatched_rank(ctl), 1)  # 3 blocks on rank 1
+        # Rank 1 has fewer requests but the larger footprint.
+        ctl.dp_budget.total_requests = [1, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(200, 204))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        # ...until the request imbalance exceeds the cap.
+        ctl.dp_budget.total_requests = [20, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(300, 304))))
+        self.assertEqual(_dispatched_rank(ctl), 1)
+
+    def test_index_capacity_defaults_to_the_kv_pool(self):
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.max_total_num_tokens = 4096
+        ctl.prefix_index_blocks_arg = 0
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 1024)
+        ctl.prefix_index_blocks_arg = 64
+        ctl.prefix_index.set_max_blocks_per_rank(64)
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 64, "explicit wins")
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
