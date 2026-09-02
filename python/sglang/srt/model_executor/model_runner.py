@@ -875,6 +875,11 @@ class ModelRunner:
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
+            num_draft_tokens=(
+                self.server_args.speculative_num_draft_tokens
+                if self.spec_algorithm.is_speculative()
+                else 1
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
