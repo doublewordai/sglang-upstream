@@ -507,6 +507,13 @@ class NixlPlane:
             canonical = self.agent.add_remote_agent(base64.b64decode(peer_meta_b64))
             self._peer_canonical[peer_name] = canonical
             self._peers.add(peer_name)
+            # Same-host UCCL peers get a deferred connection that the plugin
+            # only establishes on the NEXT register_memory (prepareLocalConn in
+            # uccl_backend.cpp). Re-register one existing region (ref-counted,
+            # no-op MR-wise) to trigger it now.
+            if self.geoms:
+                ptr, nbytes = self.geoms["kv"].regions[0]
+                self.agent.register_memory([(ptr, nbytes, 0, "")], "DRAM")
             return canonical
 
     def drain_notifs(self, seconds: float = 1.0) -> int:
@@ -530,11 +537,11 @@ class NixlPlane:
             self.ensure()
             canonical = self._peer_canonical.get(peer_name, peer_name)
             preps = None
+            last_err = None
             # loadRemoteMD is asynchronous: the remote agent's registrations
             # become visible to the backend only after its handshake completes
             # (observed as NIXL_ERR_NOT_FOUND from prepXferDlist). Retry a few
             # seconds; this cost is paid once per peer pair.
-            last_err = None
             for attempt in range(40):
                 try:
                     preps = {}
@@ -544,6 +551,7 @@ class NixlPlane:
                         preps[pool] = h
                     break
                 except Exception as e:  # noqa: BLE001
+                    preps = None
                     last_err = e
                     time.sleep(0.25)
             if preps is None:
