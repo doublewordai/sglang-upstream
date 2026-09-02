@@ -428,12 +428,24 @@ class TestPrefixAffinityScheduler(CustomTestCase):
         ctl = _make_prefix_affinity_controller(dp_size=2)
         ctl.max_total_num_tokens = 4096
         ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 1.0
         ctl._size_prefix_index_to_kv_capacity()
         self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 1024)
         ctl.prefix_index_blocks_arg = 64
         ctl.prefix_index.set_max_blocks_per_rank(64)
         ctl._size_prefix_index_to_kv_capacity()
         self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 64, "explicit wins")
+
+    def test_index_capacity_covers_the_host_tier(self):
+        """With a hierarchical cache every device page is written through to a
+        host pool of hicache_ratio x the device size, so that is what a rank
+        retains and what the footprint estimate must be allowed to reach."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.max_total_num_tokens = 4096
+        ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 2.5
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 2560)
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

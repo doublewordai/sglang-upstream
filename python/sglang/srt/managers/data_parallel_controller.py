@@ -179,9 +179,16 @@ class DataParallelController:
         )
 
         # 0 = size the index to the KV capacity, known once the workers report
-        # max_total_num_tokens (_size_prefix_index_to_kv_capacity).
+        # max_total_num_tokens (_size_prefix_index_to_kv_capacity). With the
+        # hierarchical cache the host tier (hicache_ratio x device) is what a
+        # rank retains, as every device page is written through to it.
         self.prefix_index_blocks_arg = (
             server_args.dp_prefix_affinity_max_blocks_per_rank
+        )
+        self.retained_tokens_per_device_token = (
+            max(1.0, server_args.hicache_ratio or 1.0)
+            if server_args.enable_hierarchical_cache and server_args.hicache_size == 0
+            else 1.0
         )
         self.prefix_index = PrefixAffinityIndex(
             dp_size=self.max_dp_size,
@@ -758,7 +765,10 @@ class DataParallelController:
     def _size_prefix_index_to_kv_capacity(self) -> None:
         if self.prefix_index_blocks_arg:
             return
-        blocks = max(1, self.max_total_num_tokens // self.prefix_index.block_tokens)
+        retained = int(
+            self.max_total_num_tokens * self.retained_tokens_per_device_token
+        )
+        blocks = max(1, retained // self.prefix_index.block_tokens)
         self.prefix_index.set_max_blocks_per_rank(blocks)
 
     def maybe_external_dp_rank_routing(self, req: Req):
