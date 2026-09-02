@@ -152,72 +152,144 @@ class SchedulerExecutor:
 
 
 # --------------------------------------------------------------------------
-# Host-pool geometry (works for the DSA stack: KV anchor + INDEXER sidecar)
+# Host-pool geometry (works for the DSA stack: KV anchor + INDEXER sidecar).
+# Both hicache layouts are supported:
+#   layer_first: L per-layer regions; a page row of layer l is a contiguous
+#     item-bytes chunk; the flat dlist index is l * rows_per_layer + page.
+#   page_first: ONE region per pool; a page row is one contiguous chunk that
+#     spans ALL layers; the flat dlist index is just the page id.
 # --------------------------------------------------------------------------
 
 
-def _pool_layers(tree_cache: Any) -> Dict[str, List[Tuple[int, int, int]]]:
-    """{pool_name: [(ptr, nbytes, item_bytes) per layer]} for NIXL registration.
+class PoolGeom:
+    """Per-pool NIXL geometry: registered regions + flat page-row dlist."""
 
-    Both pools are ``layer_first``: one contiguous per-layer buffer where page
-    row r lives at ``ptr + r * item_bytes`` (the MLA anchor is token-major but
-    a 64-token page is contiguous, so the page-row view is identical).
-    """
+    def __init__(self, name: str, regions, descs, rows_per_layer: int, span: int, cksum_mats):
+        self.name = name
+        self.regions = regions            # [(ptr, nbytes)] to register
+        self.descs = descs                # np.ndarray (n_descs, 3) uint64
+        self.rows_per_layer = rows_per_layer  # page rows in one layer block
+        self.span = span                  # dlist entries covering one page
+        self.cksum_mats = cksum_mats      # [(tensor (n_rows, row_bytes) uint8)]
+
+    def page_indices(self, pages: np.ndarray) -> np.ndarray:
+        """Flat dlist indices covering the given page rows (src/dst pair up 1:1)."""
+        if self.span == 1:
+            return pages.astype(np.int32)
+        offsets = np.arange(self.span, dtype=np.int32) * self.rows_per_layer
+        return (offsets[:, None] + pages.astype(np.int32)[None, :]).ravel().astype(np.int32)
+
+    def checksum(self, pages: np.ndarray) -> int:
+        total = 0
+        rows = torch.from_numpy(pages.astype(np.int64))
+        for mat in self.cksum_mats:
+            gathered = mat[rows].contiguous()
+            if gathered.dtype != torch.uint8:
+                gathered = gathered.view(torch.uint8)
+            total += int(torch.sum(gathered.view(torch.int64)).item())
+        return total
+
+    def page_bytes(self) -> int:
+        return int(self.descs[0, 1]) * self.span
+
+    def fingerprint(self) -> dict:
+        return {
+            "n_descs": int(len(self.descs)),
+            "span": self.span,
+            "item_bytes": int(self.descs[0, 1]),
+        }
+
+
+def _pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
     group = tree_cache.host_pool_group
     if group is None:
         raise RuntimeError("session migration needs a hierarchical cache")
-    regs: Dict[str, List[Tuple[int, int, int]]] = {}
+    geoms: Dict[str, PoolGeom] = {}
+
     kv = group.get_pool(PoolName.KV)
-    if kv.layout != "layer_first":
-        raise RuntimeError(
-            f"session migration supports layer_first KV layout, got {kv.layout}"
+    page_size = kv.page_size
+    if kv.layout == "layer_first":
+        ptrs, lens, items = kv.get_contiguous_buf_infos()
+        item = int(items[0])
+        n = int(lens[0]) // item
+        descs = np.vstack(
+            [
+                np.column_stack(
+                    [
+                        np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(p)),
+                        np.full(n, item, dtype=np.uint64),
+                        np.zeros(n, dtype=np.uint64),
+                    ]
+                )
+                for p in ptrs
+            ]
         )
-    ptrs, lens, items = kv.get_contiguous_buf_infos()
-    regs["kv"] = [
-        (int(p), int(l), int(i)) for p, l, i in zip(ptrs, lens, items)
-    ]
+        cksum_mats = [t.reshape(-1, page_size * t.shape[-1]) for t in kv.data_refs]
+        geoms["kv"] = PoolGeom("kv", [(int(p), int(l)) for p, l in zip(ptrs, lens)], descs, n, len(ptrs), cksum_mats)
+    elif kv.layout == "page_first":
+        buf = kv.kv_buffer  # (size, layer_num, 1, kv_cache_dim), contiguous
+        if not buf.is_contiguous():
+            raise RuntimeError("page_first KV buffer not contiguous")
+        row_elems = page_size * (buf.shape[1] * buf.shape[2] * buf.shape[3])
+        n = buf.shape[0] // page_size
+        flat = buf.reshape(n, row_elems)
+        item = int(row_elems * buf.element_size())
+        descs = np.column_stack(
+            [
+                np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(buf.data_ptr())),
+                np.full(n, item, dtype=np.uint64),
+                np.zeros(n, dtype=np.uint64),
+            ]
+        )
+        geoms["kv"] = PoolGeom("kv", [(int(buf.data_ptr()), int(buf.numel() * buf.element_size()))], descs, n, 1, [flat])
+    else:
+        raise RuntimeError(f"unsupported KV hicache layout {kv.layout}")
+
     indexer = group.get_pool(PoolName.INDEXER)
-    if getattr(indexer, "layout", "layer_first") != "layer_first":
-        raise RuntimeError(
-            f"session migration supports layer_first indexer layout, got "
-            f"{indexer.layout}"
+    if indexer.layout == "layer_first":
+        refs = list(indexer.index_k_data_refs)  # (page_num, stride) per layer
+        item = int(indexer.indexer_page_stride_size * indexer.dtype.itemsize)
+        # refs are (page_num, stride); nbytes / item = page rows per layer
+        n = int(refs[0].numel() * refs[0].element_size()) // item
+        descs = np.vstack(
+            [
+                np.column_stack(
+                    [
+                        np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(t.data_ptr())),
+                        np.full(n, item, dtype=np.uint64),
+                        np.zeros(n, dtype=np.uint64),
+                    ]
+                )
+                for t in refs
+            ]
         )
-    regs["indexer"] = [
-        (
-            int(t.data_ptr()),
-            int(t.nbytes()),
-            int(indexer.indexer_page_stride_size * indexer.dtype.itemsize),
+        cksum_mats = [t.reshape(t.shape[0], -1) for t in refs]
+        geoms["indexer"] = PoolGeom("indexer", [(int(t.data_ptr()), int(t.numel() * t.element_size())) for t in refs], descs, n, len(refs), cksum_mats)
+    elif indexer.layout == "page_first":
+        buf = indexer.index_k_with_scale_buffer  # (page_num, layer_num, 1, stride)
+        if not buf.is_contiguous():
+            raise RuntimeError("page_first indexer buffer not contiguous")
+        row_elems = buf.shape[1] * buf.shape[2] * buf.shape[3]
+        n = int(buf.shape[0])
+        item = int(row_elems * buf.dtype.itemsize)
+        flat = buf.reshape(n, row_elems)
+        descs = np.column_stack(
+            [
+                np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(buf.data_ptr())),
+                np.full(n, item, dtype=np.uint64),
+                np.zeros(n, dtype=np.uint64),
+            ]
         )
-        for t in indexer.index_k_data_refs
-    ]
-    return regs
+        geoms["indexer"] = PoolGeom("indexer", [(int(buf.data_ptr()), int(buf.numel() * buf.element_size()))], descs, n, 1, [flat])
+    else:
+        raise RuntimeError(f"unsupported indexer layout {indexer.layout}")
+    return geoms
 
 
-def _pool_row_tensors(tree_cache: Any) -> Dict[str, List[torch.Tensor]]:
-    """{pool_name: [per-layer tensor with page rows as dim 0]}."""
-    group = tree_cache.host_pool_group
-    out: Dict[str, List[torch.Tensor]] = {}
-    kv = group.get_pool(PoolName.KV)
-    out["kv"] = [t for t in kv.data_refs]
-    indexer = group.get_pool(PoolName.INDEXER)
-    out["indexer"] = [t for t in indexer.index_k_data_refs]
-    return out
-
-
-def _pool_checksum(row_tensors: Dict[str, List[torch.Tensor]], pool: str, rows: np.ndarray) -> int:
-    total = 0
-    for t in row_tensors[pool]:
-        gathered = t[torch.from_numpy(rows.astype(np.int64))]
-        total += int(torch.sum(gathered.view(torch.int64)).item())
-    return total
-
-
-def _fingerprint(regs: Dict[str, List[Tuple[int, int, int]]], page_size: int) -> dict:
+def _fingerprint(geoms: Dict[str, PoolGeom], page_size: int) -> dict:
     return {
         "page_size": page_size,
-        "pools": {
-            name: {"layers": len(v), "item_bytes": v[0][2]} for name, v in regs.items()
-        },
+        "pools": {name: g.fingerprint() for name, g in geoms.items()},
     }
 
 
@@ -374,8 +446,7 @@ class NixlPlane:
         self.tree_cache = tree_cache
         self.cxi_device_index = cxi_device_index
         self.agent = None
-        self.regs: Optional[Dict[str, List[Tuple[int, int, int]]]] = None
-        self.row_tensors: Optional[Dict[str, List[torch.Tensor]]] = None
+        self.geoms: Optional[Dict[str, PoolGeom]] = None
         # peer_name -> {pool: prep_handle}
         self.preps: Dict[str, Dict[str, Any]] = {}
         self._peers: set = set()
@@ -407,15 +478,14 @@ class NixlPlane:
                     f"NIXL backend {backend} unavailable; plugins="
                     f"{self.agent.get_plugin_list()}"
                 )
-            self.regs = _pool_layers(self.tree_cache)
-            self.row_tensors = _pool_row_tensors(self.tree_cache)
-            for pool, layer_regs in self.regs.items():
-                for ptr, nbytes, item in layer_regs:
+            self.geoms = _pool_geoms(self.tree_cache)
+            for geom in self.geoms.values():
+                for ptr, nbytes in geom.regions:
                     self.agent.register_memory([(ptr, nbytes, 0, "")], "DRAM")
             logger.info(
                 "[session-migration] NIXL agent up (%s), pools=%s",
                 backend,
-                {p: len(v) for p, v in self.regs.items()},
+                {p: {"descs": len(g.descs), "span": g.span} for p, g in self.geoms.items()},
             )
 
     @property
@@ -455,31 +525,13 @@ class NixlPlane:
                 return self.preps[peer_name]
             self.ensure()
             preps = {}
-            for pool, layer_regs in self.regs.items():
-                arrays = []
-                for ptr, nbytes, item in layer_regs:
-                    n = nbytes // item
-                    addrs = np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(ptr)
-                    arrays.append(
-                        np.column_stack(
-                            [
-                                addrs,
-                                np.full(n, item, dtype=np.uint64),
-                                np.zeros(n, dtype=np.uint64),
-                            ]
-                        )
-                    )
+            for pool, geom in self.geoms.items():
                 preps[pool] = self.agent.prep_xfer_dlist(
-                    peer_name, np.vstack(arrays), "DRAM"
+                    peer_name, geom.descs, "DRAM"
                 )
                 assert preps[pool] is not None, f"prep_xfer_dlist None for {pool}"
             self.preps[peer_name] = preps
             return preps
-
-    @staticmethod
-    def _expand_rows(rows: np.ndarray, num_layers: int, rows_per_layer: int) -> np.ndarray:
-        offsets = np.arange(num_layers, dtype=np.int32) * rows_per_layer
-        return (offsets[:, None] + rows.astype(np.int32)[None, :]).ravel().astype(np.int32)
 
     def write_pages(
         self,
@@ -487,7 +539,7 @@ class NixlPlane:
         peer_meta_b64: str,
         per_pool: Dict[str, Tuple[np.ndarray, np.ndarray]],
     ) -> float:
-        """WRITE pages to peer. per_pool: {pool: (src_rows, dst_rows)}.
+        """WRITE pages to peer. per_pool: {pool: (src_pages, dst_pages)}.
 
         Returns elapsed seconds of transfer (excluding prep).
         """
@@ -497,15 +549,13 @@ class NixlPlane:
         src_preps = self._prep_for_peer("")
         max_pages = _env_int(MIGRATION_MAX_PAGES_PER_XFER_ENV, _DEFAULT_MAX_PAGES_PER_XFER)
         t0 = time.perf_counter()
-        for pool, (src_rows, dst_rows) in per_pool.items():
-            item = self.regs[pool][0][2]
-            rows_per_layer = self.regs[pool][0][1] // item
-            n_layers = len(self.regs[pool])
-            for off in range(0, len(src_rows), max_pages):
-                s = src_rows[off : off + max_pages]
-                d = dst_rows[off : off + max_pages]
-                si = self._expand_rows(s, n_layers, rows_per_layer)
-                di = self._expand_rows(d, n_layers, rows_per_layer)
+        for pool, (src_pages, dst_pages) in per_pool.items():
+            geom = self.geoms[pool]
+            for off in range(0, len(src_pages), max_pages):
+                s = src_pages[off : off + max_pages]
+                d = dst_pages[off : off + max_pages]
+                si = geom.page_indices(s)
+                di = geom.page_indices(d)
                 notif = f"mig_{pool}_{off}".encode()
                 h = self.agent.make_prepped_xfer(
                     "WRITE", src_preps[pool], si, dst_preps[pool], di, notif
@@ -530,9 +580,9 @@ class NixlPlane:
                 raise TimeoutError("NIXL transfer timeout")
             time.sleep(0)
 
-    def checksum(self, pool: str, rows: np.ndarray) -> int:
+    def checksum(self, pool: str, pages: np.ndarray) -> int:
         self.ensure()
-        return _pool_checksum(self.row_tensors, pool, rows)
+        return self.geoms[pool].checksum(pages)
 
 
 # --------------------------------------------------------------------------
@@ -624,7 +674,7 @@ class SessionMigrationAgent:
     def _fingerprint(self) -> dict:
         if self._fp is None:
             self._fp = _fingerprint(
-                _pool_layers(self.tree_cache), self.tree_cache.page_size
+                _pool_geoms(self.tree_cache), self.tree_cache.page_size
             )
         return self._fp
 
@@ -695,7 +745,7 @@ class SessionMigrationAgent:
             }
             t_ck = time.perf_counter() - t_ck0
             nbytes = sum(
-                len(self.plane.regs[p]) * n * self.plane.regs[p][0][2]
+                len(per_pool[p][0]) * self.plane.geoms[p].page_bytes()
                 for p in per_pool
             )
             return {
