@@ -242,6 +242,7 @@ else:
     pass
 
 from sglang.kernels.ops.gemm.fused_a_gemm import (
+    dsv3_fused_a_gemm,
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
@@ -1951,6 +1952,9 @@ class DeepseekV2AttentionMLA(
         )
         self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
+        # SGLANG_GLM_DSV3_BF16_SMALLM_GEMV: bf16 copy of the fused qkv_a weight
+        # for the dsv3_fused_a small-M GEMV path (None when the flag is off).
+        self._qkv_a_bf16_smallm_weight: Optional[torch.Tensor] = None
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
@@ -2222,6 +2226,18 @@ class DeepseekV2AttentionMLA(
                 self.fused_qkv_a_proj_with_mqa,
                 hidden_states,
                 backend=self.fused_a_gemm_backend,
+            )
+        if (
+            self._qkv_a_bf16_smallm_weight is not None
+            and isinstance(hidden_states, torch.Tensor)
+            and 1 <= hidden_states.shape[0] <= 16
+            and not getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
+        ):
+            # SGLANG_GLM_DSV3_BF16_SMALLM_GEMV: small-M decode/verify batches
+            # take the dsv3 fused-a bf16 GEMV on the materialized bf16 weight
+            # copy (no per-token-group fp8 activation quant on this path).
+            return dsv3_fused_a_gemm(
+                hidden_states, self._qkv_a_bf16_smallm_weight.t()
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
@@ -2922,6 +2938,84 @@ class DeepseekV2Model(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states.finalize()
+
+
+def materialize_bf16_smallm_weights(model: nn.Module) -> None:
+    """SGLANG_GLM_DSV3_BF16_SMALLM_GEMV: build bf16 copies of the small
+    decode-step projections so M<=16 forwards can take the dsv3_fused_a
+    bf16 GEMV path (which skips the per-token-group fp8 activation quant).
+
+    Covers fused_qkv_a_proj_with_mqa and the non-fusion indexer's wq_b / wk /
+    weights_proj. Called from ModelRunner.init_attention_backends(), i.e.
+    after weight load and quant-method post-processing, before CUDA graph
+    capture. Layers whose scales were requantized to packed UE8M0 keep the
+    fp8 path (no bf16 decode implemented for that layout).
+    """
+    from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+    if get_exec().deterministic.enable_deterministic_inference:
+        logger.warning(
+            "SGLANG_GLM_DSV3_BF16_SMALLM_GEMV disabled under deterministic inference"
+        )
+        return
+
+    def _bf16_copy(layer: nn.Module) -> Optional[torch.Tensor]:
+        w = layer.weight
+        if getattr(layer, "set_lora", False):
+            return None
+        if w.dtype == torch.bfloat16:
+            out = w.data
+        elif w.dtype == torch.float8_e4m3fn:
+            scale = getattr(layer, "weight_scale_inv", None)
+            if scale is None:
+                return None
+            if getattr(scale, "format_ue8m0", False):
+                return None  # packed UE8M0 scales: no bf16 decode here
+            block = getattr(layer, "quant_method", None)
+            block = getattr(block, "weight_block_size", None) or [128, 128]
+            out = block_quant_dequant(
+                w.data, scale.data.to(torch.float32), block, torch.bfloat16
+            )
+        else:
+            return None
+        n, k = out.shape
+        # dsv3_fused_a_gemm constraints: hd_out % 16 == 0, hd_in % 256 == 0.
+        if n % 16 != 0 or k % 256 != 0:
+            return None
+        return out.contiguous()
+
+    total_bytes = 0
+    n_qkv_a = 0
+    n_indexer = 0
+    for m in model.modules():
+        if not isinstance(m, DeepseekV2AttentionMLA):
+            continue
+        if m.has_fused_proj:
+            w16 = _bf16_copy(m.fused_qkv_a_proj_with_mqa)
+            if w16 is not None:
+                m._qkv_a_bf16_smallm_weight = w16
+                total_bytes += w16.numel() * w16.element_size()
+                n_qkv_a += 1
+        indexer = getattr(m, "indexer", None)
+        if indexer is not None and not getattr(
+            indexer, "use_dsa_indexer_fusion", False
+        ):
+            for name in ("wq_b", "wk", "weights_proj"):
+                layer = getattr(indexer, name, None)
+                if layer is None:
+                    continue
+                w16 = _bf16_copy(layer)
+                if w16 is not None:
+                    setattr(indexer, f"_{name}_bf16_smallm_weight", w16)
+                    total_bytes += w16.numel() * w16.element_size()
+                    n_indexer += 1
+    logger.info(
+        "bf16 small-M GEMV weights materialized: %d qkv_a layers, %d indexer "
+        "projections, %.2f GB extra VRAM",
+        n_qkv_a,
+        n_indexer,
+        total_bytes / 1e9,
+    )
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):

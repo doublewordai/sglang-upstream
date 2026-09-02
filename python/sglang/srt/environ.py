@@ -1379,6 +1379,11 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # GLM-5.3 / DeepSeek-V2 small-M decode: materialize bf16 copies of the
+    # qkv_a and indexer (wq_b, wk, weights_proj) projections at load time and
+    # route M<=16 forwards through the dsv3_fused_a bf16 GEMV, skipping the
+    # per-token-group fp8 activation quant on those paths. Default OFF.
+    SGLANG_GLM_DSV3_BF16_SMALLM_GEMV = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

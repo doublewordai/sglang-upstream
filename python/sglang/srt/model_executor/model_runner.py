@@ -944,6 +944,16 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+        if envs.SGLANG_GLM_DSV3_BF16_SMALLM_GEMV.get():
+            # Post-load, pre-capture: build bf16 copies of the small decode
+            # projections (qkv_a + indexer wq_b/wk/weights_proj) for the
+            # dsv3_fused_a small-M GEMV path.
+            from sglang.srt.models.deepseek_v2 import (
+                materialize_bf16_smallm_weights,
+            )
+
+            materialize_bf16_smallm_weights(self.model)
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the

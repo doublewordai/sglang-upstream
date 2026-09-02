@@ -108,6 +108,7 @@ if _is_cuda:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
+from sglang.kernels.ops.gemm.fused_a_gemm import dsv3_fused_a_gemm
 from sglang.srt.distributed import (
     get_attn_tp_group,
 )
@@ -285,6 +286,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
+        # SGLANG_GLM_DSV3_BF16_SMALLM_GEMV: bf16 weight copies for the
+        # dsv3_fused_a small-M GEMV path (None unless materialized post-load
+        # by materialize_bf16_smallm_weights).
+        self._wq_b_bf16_smallm_weight: Optional[torch.Tensor] = None
+        self._wk_bf16_smallm_weight: Optional[torch.Tensor] = None
+        self._weights_proj_bf16_smallm_weight: Optional[torch.Tensor] = None
         if (
             config is not None
             and getattr(config, "index_k_norm_type", "layer") == "rms"
@@ -334,6 +341,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _indexer_cos_sin_cache(self) -> torch.Tensor:
         return self.rotary_emb.cos_sin_cache
 
+    def _smallm_bf16_linear(
+        self, name: str, layer: torch.nn.Module, x
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """SGLANG_GLM_DSV3_BF16_SMALLM_GEMV: route M<=16 rows through the
+        dsv3_fused_a bf16 GEMV when a bf16 weight copy was materialized for
+        this projection (skips the per-token-group fp8 activation quant).
+        Returns (out, bias) like the wrapped linear layer."""
+        w16 = getattr(self, f"_{name}_bf16_smallm_weight", None)
+        if (
+            w16 is not None
+            and isinstance(x, torch.Tensor)
+            and 1 <= x.shape[0] <= 16
+            and not getattr(layer, "set_lora", False)
+        ):
+            return dsv3_fused_a_gemm(x, w16.t()), None
+        return layer(x)
+
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ) -> torch.Tensor:
@@ -343,6 +367,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
+            if (
+                self._weights_proj_bf16_smallm_weight is not None
+                and isinstance(x, torch.Tensor)
+                and 1 <= x.shape[0] <= 16
+                and not getattr(self.weights_proj, "set_lora", False)
+            ):
+                # SGLANG_GLM_DSV3_BF16_SMALLM_GEMV small-M path (bf16 GEMV,
+                # no fp8 activation quant); fp32 out matches the mm below.
+                return dsv3_fused_a_gemm(
+                    x, self._weights_proj_bf16_smallm_weight.t()
+                ).float()
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
         weights, _ = self.weights_proj(x)
@@ -471,7 +506,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.half_device_sm_count
             ):
-                query, _ = self.wq_b(q_lora)
+                query, _ = self._smallm_bf16_linear("wq_b", self.wq_b, q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
                 q_rope, _ = torch.split(
                     query,
@@ -483,7 +518,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
-                    key, _ = self.wk(x)
+                    key, _ = self._smallm_bf16_linear("wk", self.wk, x)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -494,7 +529,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             current_stream.wait_stream(self.alt_stream)
         else:
-            query, _ = self.wq_b(q_lora)
+            query, _ = self._smallm_bf16_linear("wq_b", self.wq_b, q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -502,7 +537,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if self.use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
-                key, _ = self.wk(x)
+                key, _ = self._smallm_bf16_linear("wk", self.wk, x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -569,7 +604,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         positions: torch.Tensor,
     ):
         # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        key, _ = self._smallm_bf16_linear("wk", self.wk, x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
