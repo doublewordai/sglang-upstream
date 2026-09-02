@@ -520,9 +520,11 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        chunked_req_chunk_cap: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
+        self.chunked_req_chunk_cap = chunked_req_chunk_cap
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -1011,6 +1013,12 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+            # Adaptive small chunking: cap how far the in-flight chunked
+            # request advances this step; add_one_req can then admit waiting
+            # short/warm requests into the same prefill batch with the
+            # remaining chunk budget.
+            if self.chunked_req_chunk_cap is not None:
+                _rem_tokens = min(_rem_tokens, self.chunked_req_chunk_cap)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1062,7 +1070,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1176,8 +1184,14 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
-            # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            if self.chunked_req_chunk_cap is not None:
+                # See add_one_req: never start a second chunked request while
+                # one is in flight; cap the truncation otherwise.
+                if has_chunked_req or self.new_chunked_req is not None:
+                    return AddReqResult.CONTINUE
+                trunc_len = min(self.rem_chunk_tokens, self.chunked_req_chunk_cap)
+            else:
+                trunc_len = self.rem_chunk_tokens
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1211,7 +1225,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req=has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1377,6 +1391,19 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                if self.chunked_req_chunk_cap is not None:
+                    # Adaptive small chunking. A second chunked request must
+                    # not start while one is in flight (single chunked_req
+                    # slot); without the full-chunk budget drain this is now
+                    # reachable, so skip this request (CONTINUE) and let
+                    # later, shorter requests try. Otherwise cap the
+                    # truncation so this long request leaves chunk budget
+                    # for the waiting short/warm requests.
+                    if has_chunked_req or self.new_chunked_req is not None:
+                        return AddReqResult.CONTINUE
+                    chunk_tokens_limit = min(
+                        chunk_tokens_limit, self.chunked_req_chunk_cap
+                    )
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
