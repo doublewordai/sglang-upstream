@@ -3223,6 +3223,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            from sglang.srt.draft_capture import maybe_capture_draft_input
+
+            maybe_capture_draft_input(forward_batch, hidden_states)
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
