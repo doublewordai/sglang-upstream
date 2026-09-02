@@ -1379,6 +1379,17 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in: quantize the (otherwise bf16) LM head / draft shared head to
+    # blockwise fp8 [128, 128] at weight-load time (amax/448 fp32 scales, the
+    # same recipe as the GLM-5.3 FP8 checkpoint's other weights) and run the
+    # LM-head GEMM through the production w8a8 block-fp8 path. Halves the
+    # ~1.9 GB weight read that dominates the decode/verify LM-head cost
+    # (measured 1.87x faster at M=64 on GH200, lanes/lm-head-gemm).
+    # NOT bit-exact vs the bf16 GEMM (quantization error characterized in
+    # lanes/lm-head-gemm); requires N % 128 == 0 and K % 128 == 0 per rank,
+    # otherwise the head silently stays bf16. Takes precedence over
+    # --enable-fp32-lm-head when both are set.
+    SGLANG_LM_HEAD_FP8 = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

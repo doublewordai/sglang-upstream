@@ -179,6 +179,57 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """SGLANG_LM_HEAD_FP8: quantize a bf16 ParallelLMHead (the LM head or
+        the draft model's shared head) to blockwise fp8 [128, 128].
+
+        Uses amax/448 per-block fp32 scales -- the same recipe as the GLM-5.3
+        FP8 checkpoint's own weights (its stored scales are not powers of two).
+        The bf16 weight is freed; LogitsProcessor._compute_lm_head dispatches
+        to the w8a8 block-fp8 GEMM when the layer carries lm_head_fp8_weight.
+        Not bit-exact vs the bf16 matmul; error characterized in
+        grace-1m lanes/lm-head-gemm.
+        """
+        if not envs.SGLANG_LM_HEAD_FP8:
+            return
+        if type(layer).__name__ != "ParallelLMHead":
+            return
+        if hasattr(layer, "set_lora") and hasattr(layer, "apply_lora"):
+            return
+        weight = getattr(layer, "weight", None)
+        if weight is None or weight.dtype not in (torch.bfloat16, torch.float16):
+            return
+        if getattr(layer, "bias", None) is not None:
+            return
+        n, k = weight.shape
+        # per-token-group-128 activation quant needs K % 128 == 0; the
+        # blockwise GEMM needs N % 128 == 0 (padded vocab counts).
+        if n % 128 != 0 or k % 128 != 0:
+            logger.info(
+                "SGLANG_LM_HEAD_FP8: %s shape %s not block-128 aligned; keeping bf16",
+                type(layer).__name__,
+                tuple(weight.shape),
+            )
+            return
+        q_parts, s_parts = [], []
+        chunk_rows = 8192  # multiple of 128; bounds the fp32 transient
+        for i in range(0, n, chunk_rows):
+            chunk = weight[i : i + chunk_rows].float().view(-1, 128, k // 128, 128)
+            amax = chunk.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-4)
+            scale = amax / 448.0
+            q_parts.append(
+                (chunk / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(-1, k)
+            )
+            s_parts.append(scale.view(-1, k // 128))
+        layer.lm_head_fp8_weight = torch.cat(q_parts, dim=0)
+        layer.lm_head_fp8_scale = torch.cat(s_parts, dim=0)
+        del layer.weight
+        logger.info(
+            "SGLANG_LM_HEAD_FP8: quantized %s %s to fp8 block [128,128]",
+            type(layer).__name__,
+            tuple((n, k)),
+        )
+
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
