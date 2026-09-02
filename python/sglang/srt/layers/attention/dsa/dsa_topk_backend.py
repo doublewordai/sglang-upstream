@@ -120,17 +120,50 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
+            page_table_size_1 = (
+                attn_metadata.page_table_1[batch_idx_list]
+                if batch_idx_list is not None
+                else attn_metadata.page_table_1
+            )
+
+            # Single-pass prefill top-k (lane/topk-1pass): replaces the 2-pass
+            # topk_transform_prefill_kernel for exactly the launches that
+            # would take it -- PAGED and not decode-shaped (row_starts present,
+            # or expanded rows != sequences), topk <= 2048. Reads each logits
+            # row once (+0.78% sample) instead of twice.
+            prefill_bs = (
+                cu_seqlens_q_topk.shape[0] - 1 if cu_seqlens_q_topk is not None else None
+            )
+            if (
+                envs.SGLANG_DSA_TOPK_PREFILL_1PASS.get()
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and 0 < topk <= 2048
+                and prefill_bs is not None
+                and prefill_bs <= logits.shape[0]
+                and (row_starts is not None or prefill_bs != logits.shape[0])
+                and logits.dtype == torch.float32
+                and logits.dim() == 2
+                and logits.stride(1) == 1
+            ):
+                from sglang.kernels.ops.attention.dsa.topk_prefill_1pass import (
+                    fast_topk_transform_prefill_1pass,
+                )
+
+                return fast_topk_transform_prefill_1pass(
+                    score=logits,
+                    lengths=lengths,
+                    page_table_size_1=page_table_size_1,
+                    cu_seqlens_q=cu_seqlens_q_topk,
+                    topk=topk,
+                    row_starts=row_starts,
+                )
+
             from sgl_kernel import (
                 fast_topk_transform_fused,
                 fast_topk_transform_ragged_fused,
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                page_table_size_1 = (
-                    attn_metadata.page_table_1[batch_idx_list]
-                    if batch_idx_list is not None
-                    else attn_metadata.page_table_1
-                )
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
