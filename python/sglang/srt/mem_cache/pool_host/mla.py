@@ -249,6 +249,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     # ------------------------------------------------------------------
 
     @property
+    def _bulk_device_ok(self) -> bool:
+        dev = self.device_pool.device
+        dev_type = dev.type if isinstance(dev, torch.device) else str(dev).split(":")[0]
+        return dev_type == "cuda"
+
+    @property
     def supports_bulk_load(self) -> bool:
         """H2D bulk load: page_first host layout only (a run of consecutive
         host tokens is one contiguous multi-layer segment)."""
@@ -256,7 +262,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.layout == "page_first"
             and (self.kv_cache_dim * self.dtype.itemsize) % 8 == 0
             and getattr(self, "dcp_size", 1) == 1
-            and self.device_pool.device.type == "cuda"
+            and self._bulk_device_ok
         )
 
     @property
@@ -269,7 +275,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.layout == "layer_first"
             and (self.kv_cache_dim * self.dtype.itemsize) % 8 == 0
             and getattr(self, "dcp_size", 1) == 1
-            and self.device_pool.device.type == "cuda"
+            and self._bulk_device_ok
         )
 
     def _bulk_staging_tokens(self) -> int:
@@ -277,6 +283,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.page_size,
             bulk_copy.BULK_STAGING_BYTES // max(self.layout_dim, 1),
         )
+
+    _bulk_logged = False
+
+    def _log_bulk_engaged(self, what: str) -> None:
+        if not MLATokenToKVPoolHost._bulk_logged:
+            MLATokenToKVPoolHost._bulk_logged = True
+            logger.info(
+                "SGLANG_HICACHE_BULK_COPY engaged (%s path, layout=%s, "
+                "item=%d B, L=%d)",
+                what,
+                self.layout,
+                self.kv_cache_dim * self.dtype.itemsize,
+                self.layer_num,
+            )
 
     def load_to_device_bulk(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
@@ -291,6 +311,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         item = self.kv_cache_dim * self.dtype.itemsize
         row = self.layout_dim  # bytes per host token (all layers)
         L = self.layer_num
+        self._log_bulk_engaged("load")
 
         if host_indices.is_cuda:
             host_cpu = host_indices.detach().to("cpu")  # sync D2H of indices
@@ -357,6 +378,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert io_backend == "kernel"
         item = self.kv_cache_dim * self.dtype.itemsize
         L = self.layer_num
+        self._log_bulk_engaged("backup")
 
         if host_indices.is_cuda:
             host_cpu = host_indices.detach().to("cpu")
