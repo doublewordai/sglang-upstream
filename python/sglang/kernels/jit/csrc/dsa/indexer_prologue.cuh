@@ -104,7 +104,7 @@ SGL_DEVICE void hadamard_128_inplace(device::AlignedVector<float, 4>& data, uint
     data[i] *= scale;
     if constexpr (kRoundBf16) {
       // fast-hadamard-transform stores (x * scale) rounded to bf16.
-      data[i] = cast<float>(cast<DType>(data[i]));
+      data[i] = device::cast<float>(device::cast<DType>(data[i]));
     }
   }
 }
