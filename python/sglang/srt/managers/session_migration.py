@@ -162,22 +162,34 @@ class SchedulerExecutor:
 
 
 class PoolGeom:
-    """Per-pool NIXL geometry: registered regions + flat page-row dlist."""
+    """Per-pool NIXL geometry: base pointers + page-row descriptor math.
 
-    def __init__(self, name: str, regions, descs, rows_per_layer: int, span: int, cksum_mats):
+    A page row (64 host slots) is `span` contiguous chunks:
+      layer_first: one chunk per layer, base[l] + page * item
+      page_first:  one chunk spanning all layers, base[0] + page * item
+    """
+
+    def __init__(self, name: str, bases, item: int, rows_per_layer: int, span: int, cksum_mats, n_descs: int):
         self.name = name
-        self.regions = regions            # [(ptr, nbytes)] to register
-        self.descs = descs                # np.ndarray (n_descs, 3) uint64
-        self.rows_per_layer = rows_per_layer  # page rows in one layer block
-        self.span = span                  # dlist entries covering one page
-        self.cksum_mats = cksum_mats      # [(tensor (n_rows, row_bytes) uint8)]
+        self.bases = [int(b) for b in bases]   # region base ptrs (len == span for layer_first)
+        self.item = int(item)                  # bytes per page-row chunk
+        self.rows_per_layer = int(rows_per_layer)
+        self.span = int(span)                  # chunks per page row
+        self.cksum_mats = cksum_mats           # [(tensor (n_rows, row_bytes) uint8)]
+        self.n_descs = int(n_descs)
 
-    def page_indices(self, pages: np.ndarray) -> np.ndarray:
-        """Flat dlist indices covering the given page rows (src/dst pair up 1:1)."""
-        if self.span == 1:
-            return pages.astype(np.int32)
-        offsets = np.arange(self.span, dtype=np.int32) * self.rows_per_layer
-        return (offsets[:, None] + pages.astype(np.int32)[None, :]).ravel().astype(np.int32)
+    def page_descs(self, pages: np.ndarray) -> np.ndarray:
+        """(span*len(pages), 3) uint64 [addr, len, 0] descs for these pages."""
+        return _spec_page_descs(self.spec(), pages)
+
+    def spec(self) -> dict:
+        return {
+            "bases": self.bases,
+            "item": self.item,
+            "rows_per_layer": self.rows_per_layer,
+            "span": self.span,
+            "n_descs": self.n_descs,
+        }
 
     def checksum(self, pages: np.ndarray) -> int:
         total = 0
@@ -190,14 +202,33 @@ class PoolGeom:
         return total
 
     def page_bytes(self) -> int:
-        return int(self.descs[0, 1]) * self.span
+        return self.item * self.span
 
     def fingerprint(self) -> dict:
         return {
-            "n_descs": int(len(self.descs)),
+            "n_descs": self.n_descs,
             "span": self.span,
-            "item_bytes": int(self.descs[0, 1]),
+            "item_bytes": self.item,
         }
+
+
+def _spec_page_descs(spec: dict, pages: np.ndarray) -> np.ndarray:
+    """Build (span*len(pages), 3) DRAM descs from a geometry spec + page ids."""
+    p = np.asarray(pages, dtype=np.uint64)
+    item = np.uint64(spec["item"])
+    if spec["span"] == 1:
+        addrs = p * item + np.uint64(spec["bases"][0])
+        lens = np.full(len(p), spec["item"], dtype=np.uint64)
+        return np.column_stack([addrs, lens, np.zeros(len(p), dtype=np.uint64)])
+    chunks = []
+    for base in spec["bases"]:
+        addrs = p * item + np.uint64(base)
+        chunks.append(
+            np.column_stack(
+                [addrs, np.full(len(p), spec["item"], dtype=np.uint64), np.zeros(len(p), dtype=np.uint64)]
+            )
+        )
+    return np.vstack(chunks)
 
 
 def _pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
@@ -212,20 +243,8 @@ def _pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
         ptrs, lens, items = kv.get_contiguous_buf_infos()
         item = int(items[0])
         n = int(lens[0]) // item
-        descs = np.vstack(
-            [
-                np.column_stack(
-                    [
-                        np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(p)),
-                        np.full(n, item, dtype=np.uint64),
-                        np.zeros(n, dtype=np.uint64),
-                    ]
-                )
-                for p in ptrs
-            ]
-        )
         cksum_mats = [t.reshape(-1, page_size * t.shape[-1]) for t in kv.data_refs]
-        geoms["kv"] = PoolGeom("kv", [(int(p), int(l)) for p, l in zip(ptrs, lens)], descs, n, len(ptrs), cksum_mats)
+        geoms["kv"] = PoolGeom("kv", ptrs, item, n, len(ptrs), cksum_mats, n * len(ptrs))
     elif kv.layout == "page_first":
         buf = kv.kv_buffer  # (size, layer_num, 1, kv_cache_dim), contiguous
         if not buf.is_contiguous():
@@ -233,15 +252,9 @@ def _pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
         row_elems = page_size * (buf.shape[1] * buf.shape[2] * buf.shape[3])
         n = buf.shape[0] // page_size
         flat = buf.reshape(n, row_elems)
-        item = int(row_elems * buf.element_size())
-        descs = np.column_stack(
-            [
-                np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(buf.data_ptr())),
-                np.full(n, item, dtype=np.uint64),
-                np.zeros(n, dtype=np.uint64),
-            ]
+        geoms["kv"] = PoolGeom(
+            "kv", [buf.data_ptr()], int(row_elems * buf.element_size()), n, 1, [flat], n
         )
-        geoms["kv"] = PoolGeom("kv", [(int(buf.data_ptr()), int(buf.numel() * buf.element_size()))], descs, n, 1, [flat])
     else:
         raise RuntimeError(f"unsupported KV hicache layout {kv.layout}")
 
@@ -249,38 +262,21 @@ def _pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
     if indexer.layout == "layer_first":
         refs = list(indexer.index_k_data_refs)  # (page_num, stride) per layer
         item = int(indexer.indexer_page_stride_size * indexer.dtype.itemsize)
-        # refs are (page_num, stride); nbytes / item = page rows per layer
         n = int(refs[0].numel() * refs[0].element_size()) // item
-        descs = np.vstack(
-            [
-                np.column_stack(
-                    [
-                        np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(t.data_ptr())),
-                        np.full(n, item, dtype=np.uint64),
-                        np.zeros(n, dtype=np.uint64),
-                    ]
-                )
-                for t in refs
-            ]
-        )
         cksum_mats = [t.reshape(t.shape[0], -1) for t in refs]
-        geoms["indexer"] = PoolGeom("indexer", [(int(t.data_ptr()), int(t.numel() * t.element_size())) for t in refs], descs, n, len(refs), cksum_mats)
+        geoms["indexer"] = PoolGeom(
+            "indexer", [t.data_ptr() for t in refs], item, n, len(refs), cksum_mats, n * len(refs)
+        )
     elif indexer.layout == "page_first":
         buf = indexer.index_k_with_scale_buffer  # (page_num, layer_num, 1, stride)
         if not buf.is_contiguous():
             raise RuntimeError("page_first indexer buffer not contiguous")
         row_elems = buf.shape[1] * buf.shape[2] * buf.shape[3]
         n = int(buf.shape[0])
-        item = int(row_elems * buf.dtype.itemsize)
         flat = buf.reshape(n, row_elems)
-        descs = np.column_stack(
-            [
-                np.arange(n, dtype=np.uint64) * np.uint64(item) + np.uint64(int(buf.data_ptr())),
-                np.full(n, item, dtype=np.uint64),
-                np.zeros(n, dtype=np.uint64),
-            ]
+        geoms["indexer"] = PoolGeom(
+            "indexer", [buf.data_ptr()], int(row_elems * buf.dtype.itemsize()), n, 1, [flat], n
         )
-        geoms["indexer"] = PoolGeom("indexer", [(int(buf.data_ptr()), int(buf.numel() * buf.element_size()))], descs, n, 1, [flat])
     else:
         raise RuntimeError(f"unsupported indexer layout {indexer.layout}")
     return geoms
@@ -447,8 +443,6 @@ class NixlPlane:
         self.cxi_device_index = cxi_device_index
         self.agent = None
         self.geoms: Optional[Dict[str, PoolGeom]] = None
-        # peer_name -> {pool: prep_handle}
-        self.preps: Dict[str, Dict[str, Any]] = {}
         self._peers: set = set()
         self._peer_canonical: Dict[str, str] = {}
         self._lock = threading.RLock()
@@ -481,12 +475,19 @@ class NixlPlane:
                 )
             self.geoms = _pool_geoms(self.tree_cache)
             for geom in self.geoms.values():
-                for ptr, nbytes in geom.regions:
-                    self.agent.register_memory([(ptr, nbytes, 0, "")], "DRAM")
+                if geom.span == 1:
+                    self.agent.register_memory(
+                        [(geom.bases[0], geom.item * geom.n_descs, 0, "")], "DRAM"
+                    )
+                else:
+                    for b in geom.bases:
+                        self.agent.register_memory(
+                            [(b, geom.item * geom.rows_per_layer, 0, "")], "DRAM"
+                        )
             logger.info(
                 "[session-migration] NIXL agent up (%s), pools=%s",
                 backend,
-                {p: {"descs": len(g.descs), "span": g.span} for p, g in self.geoms.items()},
+                {p: g.fingerprint() for p, g in self.geoms.items()},
             )
 
     @property
@@ -507,13 +508,6 @@ class NixlPlane:
             canonical = self.agent.add_remote_agent(base64.b64decode(peer_meta_b64))
             self._peer_canonical[peer_name] = canonical
             self._peers.add(peer_name)
-            # Same-host UCCL peers get a deferred connection that the plugin
-            # only establishes on the NEXT register_memory (prepareLocalConn in
-            # uccl_backend.cpp). Re-register one existing region (ref-counted,
-            # no-op MR-wise) to trigger it now.
-            if self.geoms:
-                ptr, nbytes = self.geoms["kv"].regions[0]
-                self.agent.register_memory([(ptr, nbytes, 0, "")], "DRAM")
             return canonical
 
     def drain_notifs(self, seconds: float = 1.0) -> int:
@@ -530,64 +524,41 @@ class NixlPlane:
                 break
         return seen
 
-    def _prep_for_peer(self, peer_name: str) -> Dict[str, Any]:
-        with self._lock:
-            if peer_name in self.preps:
-                return self.preps[peer_name]
-            self.ensure()
-            canonical = self._peer_canonical.get(peer_name, peer_name)
-            preps = None
-            last_err = None
-            # loadRemoteMD is asynchronous: the remote agent's registrations
-            # become visible to the backend only after its handshake completes
-            # (observed as NIXL_ERR_NOT_FOUND from prepXferDlist). Retry a few
-            # seconds; this cost is paid once per peer pair.
-            for attempt in range(40):
-                try:
-                    preps = {}
-                    for pool, geom in self.geoms.items():
-                        h = self.agent.prep_xfer_dlist(canonical, geom.descs, "DRAM")
-                        assert h is not None, f"prep_xfer_dlist None for {pool}"
-                        preps[pool] = h
-                    break
-                except Exception as e:  # noqa: BLE001
-                    preps = None
-                    last_err = e
-                    time.sleep(0.25)
-            if preps is None:
-                raise RuntimeError(f"prep_xfer_dlist failed for {peer_name!r}: {last_err}")
-            self.preps[peer_name] = preps
-            return preps
-
     def write_pages(
         self,
         peer_name: str,
         peer_meta_b64: str,
         per_pool: Dict[str, Tuple[np.ndarray, np.ndarray]],
+        dst_specs: Dict[str, dict],
     ) -> float:
-        """WRITE pages to peer. per_pool: {pool: (src_pages, dst_pages)}.
+        """WRITE pages to peer via initialize_xfer (h2h-proven path).
 
-        Returns elapsed seconds of transfer (excluding prep).
+        per_pool: {pool: (src_pages, dst_pages)} page-row ids on each side;
+        dst_specs: {pool: peer geometry spec} (bases/item/span) so the dst
+        descriptors reference the PEER's registered addresses.
         """
         self.ensure()
-        self.add_peer(peer_name, peer_meta_b64)
-        dst_preps = self._prep_for_peer(peer_name)
-        src_preps = self._prep_for_peer("")
+        canonical = self.add_peer(peer_name, peer_meta_b64)
         max_pages = _env_int(MIGRATION_MAX_PAGES_PER_XFER_ENV, _DEFAULT_MAX_PAGES_PER_XFER)
         t0 = time.perf_counter()
         for pool, (src_pages, dst_pages) in per_pool.items():
             geom = self.geoms[pool]
+            spec = dst_specs[pool]
+            if (spec["span"] != geom.span or spec["item"] != geom.item
+                    or spec["n_descs"] != geom.n_descs):
+                raise RuntimeError(
+                    f"pool {pool} geometry mismatch: local {geom.fingerprint()} "
+                    f"vs remote {spec}"
+                )
             for off in range(0, len(src_pages), max_pages):
                 s = src_pages[off : off + max_pages]
                 d = dst_pages[off : off + max_pages]
-                si = geom.page_indices(s)
-                di = geom.page_indices(d)
+                sd = self.agent.get_xfer_descs(geom.page_descs(s), "DRAM")
+                dd = self.agent.get_xfer_descs(_spec_page_descs(spec, d), "DRAM")
                 notif = f"mig_{pool}_{off}".encode()
-                h = self.agent.make_prepped_xfer(
-                    "WRITE", src_preps[pool], si, dst_preps[pool], di, notif
-                )
+                h = self.agent.initialize_xfer("WRITE", sd, dd, canonical, notif)
                 if not h:
-                    raise RuntimeError("make_prepped_xfer returned None")
+                    raise RuntimeError("initialize_xfer returned None")
                 if self.agent.transfer(h) == "ERR":
                     raise RuntimeError(f"transfer ERR for {pool} pages {off}")
                 self._wait_done(h)
@@ -767,7 +738,7 @@ class SessionMigrationAgent:
                     return {"ok": False, "error": f"dst_rows too short for {pool}"}
                 per_pool[pool] = (man["rows"], d[:n])
             xfer_s = self.plane.write_pages(
-                msg["peer_name"], msg["peer_meta"], per_pool
+                msg["peer_name"], msg["peer_meta"], per_pool, msg["dst_spec"]
             )
             t_ck0 = time.perf_counter()
             checksums = {
@@ -840,6 +811,7 @@ class SessionMigrationAgent:
             dst_by_pool = {"kv": dst_rows, "indexer": dst_rows}
 
             # 3. Ask the holder to push into our rows.
+            dst_specs = {p: g.spec() for p, g in self.plane.geoms.items()}
             push_resp = tcp_rpc(
                 holder,
                 {
@@ -850,6 +822,7 @@ class SessionMigrationAgent:
                     "peer_name": self.plane.name,
                     "peer_meta": base64.b64encode(self.plane.metadata()).decode(),
                     "dst_rows": dst_by_pool,
+                    "dst_spec": dst_specs,
                     "fingerprint": self._fingerprint(),
                 },
                 timeout,
