@@ -334,7 +334,7 @@ struct Fp8BlockwiseSm90Kernel {
     RuntimeCheck(scales_b.dim() == 2, "scales_b must be 2D [K/128, N/128]");
     RuntimeCheck(static_cast<int>(scales_b.size(0)) == g, "scales_b rows must be K/128");
     RuntimeCheck(static_cast<int>(scales_b.size(1)) == nb, "scales_b cols must be ceil(N/128)");
-    RuntimeCheck(scales_b.stride(1) == 1, "scales_b must be row-major");
+    RuntimeCheck(scales_b.stride(1) == 1 || nb == 1, "scales_b must be row-major");
     RuntimeCheck(host::is_type<float>(scales_b.dtype()), "scales_b must be Float32");
 
     RuntimeCheck(out.dim() == 2, "out must be 2D [M, N]");
