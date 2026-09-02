@@ -588,6 +588,10 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Plan-then-IO swap-in split: the fused kernel plans only and a
+    # full-GPU-grid kernel copies the recorded miss plan (warp per row).
+    # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
+    SGLANG_HISPARSE_WIDE_GATHER = EnvBool(True)
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
