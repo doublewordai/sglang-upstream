@@ -394,6 +394,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Compose with the gemm-impl lane's dsv3 bf16 small-M GEMV: the merged
+        # wk_weights_proj weight is already bf16, so when that patch is merged
+        # (flag present) and enabled, route M<=16 through dsv3_fused_a_gemm
+        # instead of cuBLAS. No-op on this branch alone or at M>16.
+        if (
+            hasattr(envs, "SGLANG_GLM_DSV3_BF16_SMALLM_GEMV")
+            and envs.SGLANG_GLM_DSV3_BF16_SMALLM_GEMV.get()
+            and not torch.compiler.is_compiling()
+            and not isinstance(x, tuple)
+            and x.dim() == 2
+            and 0 < x.shape[0] <= 16
+            and x.shape[1] % 256 == 0
+            and self.wk_weights_proj.weight.shape[0] % 16 == 0
+            and not getattr(self.wk_weights_proj, "set_lora", False)
+        ):
+            from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import dsv3_fused_a_gemm
+
+            kw = dsv3_fused_a_gemm(x, self.wk_weights_proj.weight.t())
+            return kw.split([self.head_dim, self.n_heads], dim=-1)
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
