@@ -3049,9 +3049,32 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        # PD speculative padding (lane/adaptive-spec): requests transitioning
+        # staging->decode carry no draft state yet. Fabricate zeroed spec
+        # extras so the relay stash and the spec worker both see shape-valid
+        # state: zero topk_p -> zero confidence -> verify_len=1 (anchor-only,
+        # i.e. a plain decode step for the first round), dummy draft tokens
+        # that are never accepted. Without this, a bonus-only payload crashes
+        # FutureMap.stash (topk_p None) and breaks batch uniformity.
+        if self.spec_algorithm.is_eagle():
+            topk = get_spec().speculative_eagle_topk or 1
+            payload = RelayPayload(
+                bonus_tokens=last_tokens,
+                topk_p=torch.zeros(
+                    (len(reqs), topk), dtype=torch.float32, device=device
+                ),
+                topk_index=torch.zeros(
+                    (len(reqs), topk), dtype=torch.int64, device=device
+                ),
+                hidden_states=torch.zeros(
+                    (len(reqs), self.model_config.hidden_size),
+                    dtype=self.model_config.dtype,
+                    device=device,
+                ),
+            )
+        else:
+            payload = RelayPayload(bonus_tokens=last_tokens)
+        self.future_map.stash(batch.req_pool_indices, payload)
         batch.input_ids = None
 
         if batch.return_logprob:
