@@ -372,7 +372,12 @@ class TpModelWorker(BaseTpWorker):
 
         # Sync random seed across TP workers.
         # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
+        # Draft workers skip it too: under PP+spec (prefill arm) only the
+        # LAST stage builds a draft worker, so a world-group broadcast there
+        # would deadlock against the non-draft stages; all ranks share one
+        # ServerArgs, so server_args.random_seed is what the broadcast
+        # delivers anyway.
+        if server_args.is_ep_joiner or self.is_draft_worker:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(
