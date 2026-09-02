@@ -1439,7 +1439,11 @@ class HiSparseCoordinator:
             )
 
         num_reqs = req_pool_indices.size(0)
-        if num_newest != 1:
+        # num_newest == 1 is ambiguous between plain decode and verify
+        # position 0 (both pass 1): under speculation (num_draft_tokens > 1)
+        # the target only runs TARGET_VERIFY forwards, so route to the verify
+        # path; without speculation there are no verify calls at all.
+        if num_newest != 1 or self.num_draft_tokens > 1:
             return self._verify_swap_in(
                 req_pool_indices,
                 compressed_seq_lens,
@@ -1490,12 +1494,13 @@ class HiSparseCoordinator:
         """MTP target-verify swap-in for one (layer, position) call.
 
         The caller (dsa_backend's verify branch) invokes this per layer and per
-        draft position p = num_newest-1, positions in order. Anchors run the
-        fused kernel per position (synchronously -- their own attention needs
-        the rows) recording per-position plans; the last position's call issues
-        the whole group's multi-position copies on the prefetch stream. Skip
-        layers wait for their group's copies and return the anchor's stashed
-        per-position slot table (lockstep layout).
+        draft position p = num_newest-1 (p = 0 passes num_newest=1, same as
+        decode — swap_in_selected_pages routes on num_draft_tokens).
+        Anchors run the fused kernel per position (synchronously -- their own
+        attention needs the rows) recording per-position plans; the last
+        position's call issues the whole group's multi-position copies on the
+        prefetch stream. Skip layers wait for their group's copies and return
+        the anchor's stashed per-position slot table (lockstep layout).
         """
         assert self.num_draft_tokens > 1, "verify swap-in without draft tokens"
         p = num_newest - 1

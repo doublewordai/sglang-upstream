@@ -47,7 +47,7 @@ PATTERN = [i % 4 != (2 if i >= 4 else 0) for i in range(LAYER_NUM)]
 # -> [F, T, T, T, F, T, T, T]  (index_topk_freq=4 shape)
 ANCHORS = [i for i, s in enumerate(PATTERN) if not s]
 SKIPS = [i for i, s in enumerate(PATTERN) if s]
-FILL_LEN = 1500  # > DEVICE_BUFFER_SIZE -> misses come from the host pool
+FILL_LEN = 1088  # dbs + page: > DEVICE_BUFFER_SIZE, page-aligned (host alloc)
 STEPS = 4
 ACCEPT_PER_STEP = 2
 
@@ -272,24 +272,28 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
         plus position-fresh tokens, and positions p>=1 include a few draft
         tokens [seq_len, seq_len+p] (they resolve to the reserved page via the
         newest-token window, exactly as production verify selections do).
+        Selections are duplicate-free, as production top-k of distinct token
+        positions is: the kernel's shared-memory hash is only deterministic
+        for distinct tokens.
         """
         tks = []
         core = []
         for r, seq_len in enumerate(seq_lens):
-            core.append(
-                torch.tensor(
-                    rng.sample(range(seq_len), TOP_K // 2), dtype=torch.int32
-                )
-            )
+            core.append(set(rng.sample(range(seq_len), TOP_K // 2)))
         for p in range(N_POS):
             rows = []
             for r, seq_len in enumerate(seq_lens):
-                drafts = torch.arange(seq_len, seq_len + p + 1, dtype=torch.int32)
-                fresh_n = TOP_K - core[r].numel() - drafts.numel()
-                fresh = torch.tensor(
-                    rng.sample(range(seq_len), fresh_n), dtype=torch.int32
-                )
-                rows.append(torch.cat([core[r], drafts, fresh]))
+                drafts = set(range(seq_len, seq_len + p + 1))
+                fresh_n = TOP_K - len(core[r]) - len(drafts)
+                pool = [
+                    t
+                    for t in rng.sample(range(seq_len), min(4 * fresh_n, seq_len))
+                    if t not in core[r]
+                ]
+                fresh = set(rng.sample(pool, fresh_n))
+                sel = sorted(core[r] | drafts | fresh)
+                assert len(sel) == TOP_K, f"selection size {len(sel)} != {TOP_K}"
+                rows.append(torch.tensor(sel, dtype=torch.int32))
             tks.append(torch.stack(rows).contiguous().to("cuda"))
         return tks
 
@@ -440,7 +444,6 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
         ]
 
         def captured_step():
-            self.prefetch.coordinator.num_real_reqs[0] = rpi.shape[0]
             out = torch.empty(
                 (rpi.shape[0] * N_POS, TOP_K), dtype=torch.int32, device="cuda"
             )
@@ -456,6 +459,10 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
                     )
                     outv[:, p].copy_(pt)
             return out
+
+        # num_real_reqs is a persistent device tensor updated before replay
+        # (CPU->CUDA copies are illegal inside capture unless pinned).
+        self.prefetch.coordinator.num_real_reqs[0] = rpi.shape[0]
 
         # Warm up (JIT-compile all kernel instantiations) on a side stream so
         # capture never sees a compile, then reset the mutated LRU/KV state.
