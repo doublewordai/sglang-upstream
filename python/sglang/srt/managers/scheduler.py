@@ -564,6 +564,8 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
+        self.maybe_init_session_migration()
+
         if (
             get_disagg().disaggregation_mode == "decode"
             and get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1731,6 +1733,9 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1774,6 +1779,9 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1945,6 +1953,41 @@ class Scheduler(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
+
+    def maybe_init_session_migration(self) -> None:
+        """Start the session-migration agent when SGLANG_RANK_MIGRATION_PORT_BASE
+        is set (prefill-arm DP ranks push session host pages to each other)."""
+        self.session_migration_agent = None
+        port_base = os.environ.get("SGLANG_RANK_MIGRATION_PORT_BASE")
+        if not port_base:
+            return
+        try:
+            from sglang.srt.managers.session_migration import (
+                MIGRATION_STATS_FILE_ENV,
+                SessionMigrationAgent,
+            )
+
+            dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            # Pin the UCCL agent to this rank's physical CXI device (the CUDA
+            # device id is remapped by CUDA_VISIBLE_DEVICES).
+            cxi = None
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible:
+                ids = [int(x) for x in visible.split(",") if x.strip() != ""]
+                if 0 <= self.ps.gpu_id < len(ids):
+                    cxi = ids[self.ps.gpu_id]
+            agent = SessionMigrationAgent(
+                tree_cache=self.tree_cache,
+                dp_rank=dp_rank,
+                port=int(port_base) + dp_rank,
+                cxi_device_index=cxi,
+                stats_file=os.environ.get(MIGRATION_STATS_FILE_ENV),
+            )
+            agent.start()
+            self.session_migration_agent = agent
+        except Exception:
+            logger.exception("session-migration agent init failed; disabled")
+            self.session_migration_agent = None
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
