@@ -106,10 +106,13 @@ class DPBudget:
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
         # HiSparse host-pool admission state per rank (host-pool
-        # backpressure). Free host tokens are what a decode rank can still
-        # pin; 0/0 means "not reported" (non-hisparse ranks).
+        # backpressure). Free/pinned host tokens are what a decode rank can
+        # still pin / has pinned (active + retained rows); 0/0 means "not
+        # reported" (non-hisparse ranks). Pinned is the early signal a
+        # controller can act on before the pool limit.
         self.host_pool_free_tokens = [0] * dp_size
         self.host_pool_total_tokens = [0] * dp_size
+        self.host_pool_pinned_tokens = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -126,6 +129,9 @@ class DPBudget:
             )
             self.host_pool_total_tokens[load.dp_rank] = getattr(
                 load, "host_pool_total_tokens", 0
+            )
+            self.host_pool_pinned_tokens[load.dp_rank] = getattr(
+                load, "host_pool_pinned_tokens", 0
             )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):

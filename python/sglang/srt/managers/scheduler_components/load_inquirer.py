@@ -121,9 +121,10 @@ class SchedulerLoadInquirer:
             )
 
         # HiSparse host KV pool state (host-pool backpressure): the decode
-        # arm pins MLA latent in the host pool, so free host tokens are the
-        # admission constraint the dispatcher/metrics need to see.
-        host_pool_free_tokens = host_pool_total_tokens = host_pool_wait_events = 0
+        # arm pins MLA latent in the host pool, so free/pinned host tokens
+        # are the admission constraint the dispatcher/metrics need to see.
+        host_pool_free_tokens = host_pool_total_tokens = host_pool_pinned_tokens = 0
+        host_pool_wait_events = 0
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
             and getattr(self, "enable_hisparse", False)
@@ -133,6 +134,7 @@ class SchedulerLoadInquirer:
                 host_pool = self.hisparse_coordinator.mem_pool_host
                 host_pool_free_tokens = int(host_pool.available_size())
                 host_pool_total_tokens = int(host_pool.size)
+                host_pool_pinned_tokens = host_pool_total_tokens - host_pool_free_tokens
                 host_pool_wait_events = int(
                     self.get_disagg_decode_prealloc_queue().host_pool_wait_events
                 )
@@ -235,6 +237,7 @@ class SchedulerLoadInquirer:
             num_active_tokens=num_active_tokens,
             host_pool_free_tokens=host_pool_free_tokens,
             host_pool_total_tokens=host_pool_total_tokens,
+            host_pool_pinned_tokens=host_pool_pinned_tokens,
             host_pool_wait_events=host_pool_wait_events,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
