@@ -76,6 +76,7 @@ def sparse_mla_fp8_decode_fwd(
     partial_o: torch.Tensor | None = None,   # [b, P, 64, 512] f32
     partial_ml: torch.Tensor | None = None,  # [b, P, 64, 2] f32
     out: torch.Tensor | None = None,         # [b, 64, 512] bf16
+    debug: torch.Tensor | None = None,       # [b, 12] f32 (E pre-pass dump)
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns (out, partial_o, partial_ml)."""
     assert q.dtype == torch.bfloat16 and q.is_contiguous()
@@ -96,8 +97,10 @@ def sparse_mla_fp8_decode_fwd(
 
     dispatch_fn, combine_fn = _get_entries()
     stream = _get_current_stream_raw(dev.index or 0)
+    if debug is None:
+        debug = torch.empty(0, dtype=torch.float32, device=dev)
     dispatch_fn(
-        q, kv, indices, seqlens, partial_o, partial_ml,
+        q, kv, indices, seqlens, partial_o, partial_ml, debug,
         num_splits, topk, 1 if tail_sentinel else 0, sm_scale, stream,
     )
     combine_fn(partial_o, partial_ml, out, num_splits, stream)

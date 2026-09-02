@@ -26,10 +26,12 @@ limitations under the License.
 //     in the epilogue); the 4 per-128-group KV scales are applied EXACTLY on
 //     the per-group WGMMA accumulators (fp32) before summing; the rope part
 //     stays bf16 on both sides (exact; it carries most of the logit energy).
-//   * PV: p_tilde_g = p * s_v[j,g] * 2^E_g quantized e4m3 per output group so
-//     the stored V bytes are consumed raw; 2^E_g is a per-(partition, group)
-//     power of two from the partition's max s_v (folded back out at the
-//     partial store, so partials are scale-free).
+//   * PV (v1b numerics): p_tilde_g = p * s_v[j,g] kept in BF16 (8-bit
+//     mantissa, huge range: no 2^E normalization needed) and V consumed as
+//     the raw fp8 VALUES converted to bf16 (lossless) through an MN-major-B
+//     bf16 WGMMA -- no Vt transpose at all (bf16 WGMMA accepts MN-major B,
+//     so the K-tile layout is reused directly). Error vs the fp8-P design:
+//     ~0.2% of RMS (prod level) instead of ~2.2% (measured, see lane docs).
 //   * Split-KV partials (m, l, O) in fp32 + a separate combine kernel.
 //
 // v1a: synchronous (single-buffered K/Vt, __syncthreads between phases);
@@ -101,10 +103,11 @@ struct SparseMlaFp8DecodeKernel {
   using SmemLayoutKRope = decltype(tile_to_shape(
       GMMA::Layout_K_SW128_Atom<bf16_t>{}, Shape<Int<B_TOPK>, Int<D_ROPE>>{}, Step<_1, _2>{}));
 
-  // Vt group layout: (128 d, 64 j) K-major in j, contiguous 8 KB prefix of
-  // the (256, 64) half layout written by the transpose utility.
-  using SmemLayoutVtGroup = decltype(tile_to_shape(
-      GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<128>, Int<B_TOPK>>{}, Step<_1, _2>{}));
+  // V group layout (PV B operand, MN-major): (N=128 d, K=64 j), d contiguous.
+  // The producer converts the raw fp8 nope bytes to bf16 values here.
+  using SmemLayoutVGroupMN = decltype(tile_to_shape(
+      GMMA::Layout_MN_SW128_Atom<bf16_t>{}, Shape<_128, Int<B_TOPK>>{}));
+  static constexpr int V_GROUP_ELEMS = cosize_v<SmemLayoutVGroupMN>;  // 8192 bf16 = 16 KB
 
   // MMA atoms
   using TiledMMA_QK = decltype(make_tiled_mma(
@@ -112,15 +115,7 @@ struct SparseMlaFp8DecodeKernel {
   using TiledMMA_QK_Rope = decltype(make_tiled_mma(
       SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{}, Layout<Shape<_1, _1, _1>>{}));
   using TiledMMA_PV = decltype(make_tiled_mma(
-      GMMA::MMA_64x128x32_F32E4M3E4M3_RS_TN{}, Layout<Shape<_1, _1, _1>>{}));
-
-  // V transpose utility (src layout == our SmemLayoutK)
-  using SmemTransposeV = SmemTransposeFp8_64x64<B_TOPK, D_V>;
-  using SmemLayoutTransposeV_t = typename SmemTransposeV::SmemLayoutTransposeV;
-  // producer writes Vt halves through the STSM-composed transpose layout
-  using SmemTransposeV_half_t = SmemTransposeFp8_64x64<B_TOPK, D_V / 2>;
-  using SmemLayoutTransposeVt_half_t = typename SmemTransposeV_half_t::SmemLayoutTransposeVt;
-  static constexpr int HALF_VT_ELEMS = cosize_v<typename SmemTransposeV_half_t::SmemLayoutVt>;  // (256,64) fp8 = 16 KB
+      SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));
 
   struct SharedMemoryPlan {
     array_aligned<fp8_t, cosize_v<SmemLayoutQ>> q;             // 32 KB
@@ -128,13 +123,10 @@ struct SparseMlaFp8DecodeKernel {
     array_aligned<fp8_t, cosize_v<SmemLayoutK>> k;             // 32 KB
     array_aligned<bf16_t, cosize_v<SmemLayoutKRope>> k_rope;   // 8 KB
     array_aligned<float, NUM_GROUPS * B_TOPK> k_scales;        // [g][j] 1 KB
-    array_aligned<fp8_t, 2 * HALF_VT_ELEMS> vt;                // 2 x (256,64) = 32 KB
+    array_aligned<bf16_t, NUM_GROUPS * V_GROUP_ELEMS> v;       // 4 x (128d,64j) bf16 = 64 KB
     array_aligned<bool, B_TOPK> valid;                         // index >= 0?
     array_aligned<int, B_TOPK> row_idx;                        // clamped row per block slot
-    array_aligned<float, NUM_GROUPS> s2e;                      // 2^E_g
-    array_aligned<float, NUM_GROUPS> inv2e;                    // 2^-E_g
     array_aligned<float, 128> qmax_scratch;                    // q per-row scale s_q[h]
-    array_aligned<float, NUM_GROUPS> group_max_scratch;
   };
 
   // ====================================================================
@@ -176,43 +168,6 @@ struct SparseMlaFp8DecodeKernel {
     // Producer WG: E pre-pass, q load + per-row fp8 quantization
     // ----------------------------------------------------------------
     if (warpgroup_idx == 2) {
-      // ---- E pre-pass: per-group max of s_v over the partition's rows ----
-      if (idx_in_warpgroup == 0) {
-        CUTE_UNROLL
-        for (int g = 0; g < NUM_GROUPS; ++g) plan.group_max_scratch[g] = 0.f;
-      }
-      asm volatile("bar.sync 7, 128;\n" ::: "memory");
-      for (int blk = part; blk < nblocks; blk += P) {
-        const int* gIdx = params.indices + (int64_t)req * params.topk + blk * B_TOPK;
-        for (int i = idx_in_warpgroup; i < B_TOPK; i += 128) {
-          int t = __ldg(gIdx + i);
-          if (t >= 0) {
-            const float* sc = reinterpret_cast<const float*>(
-                params.kv + (int64_t)t * ROW_BYTES + SCALE_OFF);
-            float4 s4 = __ldg(reinterpret_cast<const float4*>(sc));
-            atomicMax(reinterpret_cast<int*>(&plan.group_max_scratch[0]), __float_as_int(s4.x));
-            atomicMax(reinterpret_cast<int*>(&plan.group_max_scratch[1]), __float_as_int(s4.y));
-            atomicMax(reinterpret_cast<int*>(&plan.group_max_scratch[2]), __float_as_int(s4.z));
-            atomicMax(reinterpret_cast<int*>(&plan.group_max_scratch[3]), __float_as_int(s4.w));
-          }
-        }
-      }
-      asm volatile("bar.sync 7, 128;\n" ::: "memory");
-      if (idx_in_warpgroup == 0) {
-        CUTE_UNROLL
-        for (int g = 0; g < NUM_GROUPS; ++g) {
-          float m = plan.group_max_scratch[g];
-          // 2^E: s_max * 2^E <= 224 (half of e4m3 max 448: headroom for p <= 1)
-          int e = 0;
-          if (m > 0.f) {
-            e = (int)floorf(log2f(224.f / m));
-            e = max(0, min(30, e));
-          }
-          plan.s2e[g] = exp2f((float)e);
-          plan.inv2e[g] = 1.0f / plan.s2e[g];
-        }
-      }
-
       // ---- q: per-row max over the nope 512 (bf16) ----
       // thread (h = iw % 64, half = iw / 64): nope 8-elem chunks k8 in [half*32, half*32+32)
       {
@@ -273,7 +228,7 @@ struct SparseMlaFp8DecodeKernel {
       fence_view_async_shared();
     }
 
-    __syncthreads();  // publish q / s_q / s2e / inv2e
+    __syncthreads();  // publish q / s_q
 
     // ----------------------------------------------------------------
     // Main block loop
@@ -296,12 +251,12 @@ struct SparseMlaFp8DecodeKernel {
       Tensor rAcc = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});  // 32 f32
       Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});    // 32 f32 (scores/p)
       Tensor rPt = make_tensor<float>(rP.layout());                                       // 32 f32 scratch
-      // fp8 P register layout (A operand of the PV RS GMMA); must be declared
+      // bf16 P register layout (A operand of the PV RS GMMA); must be declared
       // inside a __device__ function (decltype of a __device__ auto function)
-      using rP_fp8_layout_t = decltype(flash::convert_layout_acc_Aregs<TiledMMA_PV>(
+      using rP_a_layout_t = decltype(flash::convert_layout_acc_Aregs<TiledMMA_PV>(
           partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{}).layout()));
-      Tensor rP_fp8_g0 = make_tensor<fp8_t>(rP_fp8_layout_t{});
-      Tensor rP_fp8_g1 = make_tensor<fp8_t>(rP_fp8_layout_t{});
+      Tensor rP_bf16_g0 = make_tensor<bf16_t>(rP_a_layout_t{});
+      Tensor rP_bf16_g1 = make_tensor<bf16_t>(rP_a_layout_t{});
       Tensor rO_g0 = partition_fragment_C(TiledMMA_PV{}, Shape<Int<B_H>, Int<128>>{});  // 64 f32
       Tensor rO_g1 = partition_fragment_C(TiledMMA_PV{}, Shape<Int<B_H>, Int<128>>{});  // 64 f32
       cute::fill(rO_g0, 0.0f);
@@ -318,10 +273,6 @@ struct SparseMlaFp8DecodeKernel {
       }
 
       const int my_g0 = warpgroup_idx * 2;  // first V group of this WG
-      const float s2e0 = plan.s2e[my_g0];
-      const float s2e1 = plan.s2e[my_g0 + 1];
-      const float inv20 = plan.inv2e[my_g0];
-      const float inv21 = plan.inv2e[my_g0 + 1];
 
       for (int blk = part; blk < nblocks; blk += P) {
         __syncthreads();  // wait for producer's K/Vt for this block
@@ -335,8 +286,12 @@ struct SparseMlaFp8DecodeKernel {
             Tensor sK_t0 = make_tensor(make_smem_ptr(plan.k.data() + (2 * g) * B_TOPK * 64), SmemLayoutKTiles<1>{});
             Tensor sQ_t1 = make_tensor(make_smem_ptr(plan.q.data() + (2 * g + 1) * B_H * 64), SmemLayoutQTiles<1>{});
             Tensor sK_t1 = make_tensor(make_smem_ptr(plan.k.data() + (2 * g + 1) * B_TOPK * 64), SmemLayoutKTiles<1>{});
-            gemm_ss(g == 0, TiledMMA_QK{}, sQ_t0, sK_t0, rAcc, idx_in_warpgroup);
+            // CLEAR rAcc per group: each group's accumulator is descaled on its own
+            gemm_ss(true, TiledMMA_QK{}, sQ_t0, sK_t0, rAcc, idx_in_warpgroup);
             gemm_ss(false, TiledMMA_QK{}, sQ_t1, sK_t1, rAcc, idx_in_warpgroup);
+            // WGMMA is async: drain before reading the accumulator
+            warpgroup_commit_batch();
+            warpgroup_wait<0>();
             // descale-add: rP += rAcc * s_k[j, g]  (scales in [g][j] layout)
             CUTE_UNROLL
             for (int i = 0; i < size(rAcc); ++i) {
@@ -347,6 +302,8 @@ struct SparseMlaFp8DecodeKernel {
           // rope: exact bf16 on both sides; rAcc = rope contribution only
           Tensor sQR = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRope{});
           gemm_ss(true, TiledMMA_QK_Rope{}, sQR, sKR, rAcc, idx_in_warpgroup);
+          warpgroup_commit_batch();
+          warpgroup_wait<0>();
         }
 
         // ---------------- scores + masking + online softmax ----------------
@@ -359,6 +316,7 @@ struct SparseMlaFp8DecodeKernel {
             rP(i) = plan.valid[j] ? lg : -INFINITY;
           }
 
+          // row maxima (both rows) first
           float new_max[2];
           CUTE_UNROLL
           for (int r = 0; r < 2; ++r) {
@@ -371,12 +329,26 @@ struct SparseMlaFp8DecodeKernel {
             cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
             cur_max *= sm_scale;
             new_max[r] = max(rM[r], cur_max);
-            float scale_o = exp2f(rM[r] - new_max[r]);
+          }
+          // rescale rO PER ROW: element i belongs to fragment row
+          // (head == get_AorC_row_idx(0)) or (head == ...+8). Applying both rows'
+          // scale factors to the whole fragment (the old bug) compounds wrong-row
+          // factors whenever the two rows' maxima move differently -- which
+          // masked-heavy blocks make frequent.
+          {
+            const int r0_head = get_AorC_row_idx(0, idx_in_warpgroup);
             CUTE_UNROLL
             for (int i = 0; i < size(rO_g0); ++i) {
-              rO_g0(i) *= scale_o;
-              rO_g1(i) *= scale_o;
+              int rsel = (get<0>(cPV(i)) == r0_head) ? 0 : 1;
+              float s = exp2f(rM[rsel] - new_max[rsel]);
+              rO_g0(i) *= s;
+              rO_g1(i) *= s;
             }
+          }
+          // p and l per row
+          CUTE_UNROLL
+          for (int r = 0; r < 2; ++r) {
+            float scale_l = exp2f(rM[r] - new_max[r]);
             float cur_sum = 0.f;
             CUTE_UNROLL
             for (int i = r * 2; i < size(rP); i += 4) {
@@ -386,46 +358,47 @@ struct SparseMlaFp8DecodeKernel {
               rP(i + 1) = p1;
               cur_sum += p0 + p1;
             }
-            rL[r] = rL[r] * scale_o + cur_sum;
+            rL[r] = rL[r] * scale_l + cur_sum;
           }
           rM[0] = new_max[0];
           rM[1] = new_max[1];
         }
 
-        // ---------------- P quantization (both groups) ----------------
+        // ---------------- P quantization (both groups, bf16) ----------------
         {
+          // p~_g = p * s_v[j,g] in bf16 (A-operand layout); no 2^E needed.
           CUTE_UNROLL
           for (int i = 0; i < size(rP); ++i) {
             int j = get<1>(cQK(i));
-            rPt(i) = rP(i) * plan.k_scales[my_g0 * B_TOPK + j] * s2e0;
+            rPt(i) = rP(i) * plan.k_scales[my_g0 * B_TOPK + j];
           }
-          flash::permute_Cregs_fp8(rPt);
           {
             Tensor rPt_acc = make_tensor(rPt.data(), flash::convert_layout_acc_Aregs<TiledMMA_PV>(rPt.layout()));
-            flash::convert_type_out(rPt_acc, rP_fp8_g0);
+            flash::convert_type_out(rPt_acc, rP_bf16_g0);
           }
           CUTE_UNROLL
           for (int i = 0; i < size(rP); ++i) {
             int j = get<1>(cQK(i));
-            rPt(i) = rP(i) * plan.k_scales[(my_g0 + 1) * B_TOPK + j] * s2e1;
+            rPt(i) = rP(i) * plan.k_scales[(my_g0 + 1) * B_TOPK + j];
           }
-          flash::permute_Cregs_fp8(rPt);
           {
             Tensor rPt_acc = make_tensor(rPt.data(), flash::convert_layout_acc_Aregs<TiledMMA_PV>(rPt.layout()));
-            flash::convert_type_out(rPt_acc, rP_fp8_g1);
+            flash::convert_type_out(rPt_acc, rP_bf16_g1);
           }
         }
 
         // ---------------- PV (two group GEMMs into rO halves) ----------------
         {
-          // WG w owns V dims [w*256, w*256+256) = Vt half w, groups 0,1 within it
-          Tensor sVt0 = make_tensor(
-              make_smem_ptr(plan.vt.data() + warpgroup_idx * HALF_VT_ELEMS), SmemLayoutVtGroup{});
-          Tensor sVt1 = make_tensor(
-              make_smem_ptr(plan.vt.data() + warpgroup_idx * HALF_VT_ELEMS + cosize_v<SmemLayoutVtGroup>),
-              SmemLayoutVtGroup{});
-          gemm_rs(false, TiledMMA_PV{}, rP_fp8_g0, sVt0, rO_g0, idx_in_warpgroup);
-          gemm_rs(false, TiledMMA_PV{}, rP_fp8_g1, sVt1, rO_g1, idx_in_warpgroup);
+          // WG w owns V groups {2w, 2w+1}; B = MN-major (N=128 d, K=64 j) tiles
+          Tensor sVg0 = make_tensor(
+              make_smem_ptr(plan.v.data() + my_g0 * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
+          Tensor sVg1 = make_tensor(
+              make_smem_ptr(plan.v.data() + (my_g0 + 1) * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
+          gemm_rs(false, TiledMMA_PV{}, rP_bf16_g0, sVg0, rO_g0, idx_in_warpgroup);
+          gemm_rs(false, TiledMMA_PV{}, rP_bf16_g1, sVg1, rO_g1, idx_in_warpgroup);
+          // drain before the next block rescales rO (and before the partial store)
+          warpgroup_commit_batch();
+          warpgroup_wait<0>();
         }
 
         __syncthreads();  // release the K/Vt buffers to the producer
@@ -444,13 +417,13 @@ struct SparseMlaFp8DecodeKernel {
         for (int i = 0; i < size(rO_g0); ++i) {
           auto cc = cPV(i);
           params.partial_o[po_base + (int64_t)get<0>(cc) * D_V + my_g0 * 128 + get<1>(cc)] =
-              rO_g0(i) * inv20;
+              rO_g0(i);
         }
         CUTE_UNROLL
         for (int i = 0; i < size(rO_g1); ++i) {
           auto cc = cPV(i);
           params.partial_o[po_base + (int64_t)get<0>(cc) * D_V + (my_g0 + 1) * 128 + get<1>(cc)] =
-              rO_g1(i) * inv21;
+              rO_g1(i);
         }
         if (warpgroup_idx == 0 && idx_in_warpgroup % 4 == 0) {
           int r0 = get_AorC_row_idx(0, idx_in_warpgroup);
@@ -513,34 +486,28 @@ struct SparseMlaFp8DecodeKernel {
         fence_view_async_shared();
         asm volatile("bar.sync 7, 128;\n" ::: "memory");
 
-        // ---- Vt transpose: two (256, 64) halves ----
+        // ---- V conversion: raw fp8 nope bytes -> bf16 values (4 group tiles) ----
+        // v_true = fp8 * s_v; we keep p_tilde = p * s_v instead, so the V
+        // buffer holds the RAW fp8 VALUES widened to bf16 (lossless).
         {
-          Tensor sV_src = as_position_independent_swizzle_tensor(
-              make_tensor(make_smem_ptr(plan.k.data()), SmemLayoutTransposeV_t{}));
-          Tensor sVt_dst0 = as_position_independent_swizzle_tensor(
-              make_tensor(make_smem_ptr(plan.vt.data()), SmemLayoutTransposeVt_half_t{}));
-          Tensor sVt_dst1 = as_position_independent_swizzle_tensor(make_tensor(
-              make_smem_ptr(plan.vt.data() + HALF_VT_ELEMS),
-              SmemLayoutTransposeVt_half_t{}));
-          SmemTransposeV smem_transpose_v;
-          // half 0 (d 0..255, groups 0-1): src k-tiles 0..3 -> vt half 0
+          Tensor sKfull = make_tensor(make_smem_ptr(plan.k.data()), SmemLayoutK{});
           CUTE_UNROLL
-          for (int j = 0; j < 4; j += 2) {
-            smem_transpose_v.transpose_pair(
-                flatten(sV_src(_, 0, j)), flatten(sVt_dst0(_, 0, j)),
-                flatten(sV_src(_, 0, j + 1)), flatten(sVt_dst0(_, 0, j + 1)));
-          }
-          // half 1 (d 256..511, groups 2-3): src k-tiles 4..7 -> vt half 1
-          CUTE_UNROLL
-          for (int j = 4; j < 8; j += 2) {
-            smem_transpose_v.transpose_pair(
-                flatten(sV_src(_, 0, j)), flatten(sVt_dst1(_, 0, j - 4)),
-                flatten(sV_src(_, 0, j + 1)), flatten(sVt_dst1(_, 0, j - 3)));
+          for (int g = 0; g < NUM_GROUPS; ++g) {
+            Tensor sVg = make_tensor(
+                make_smem_ptr(plan.v.data() + g * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
+            // 64 j x 128 d / 128 threads = 64 elements per thread per group
+            CUTE_UNROLL
+            for (int e = 0; e < 64; ++e) {
+              int flat = idx_in_warpgroup * 64 + e;
+              int j = flat / 128;
+              int d = flat % 128;
+              sVg(d, j) = (bf16_t)((float)sKfull(j, g * 128 + d));
+            }
           }
         }
-        // STSM (generic proxy) writes must be visible to WGMMA readers
+        // generic-proxy writes must be visible to WGMMA readers
         fence_view_async_shared();
-        __syncthreads();  // K/Vt/scales/valid ready for consumers
+        __syncthreads();  // K/V/scales/valid ready for consumers
 
         // consumers compute; they __syncthreads at the end of the block
         __syncthreads();

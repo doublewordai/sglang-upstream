@@ -42,6 +42,7 @@ void sparse_mla_fp8_decode_dispatch(
     tvm::ffi::TensorView seqlens,
     tvm::ffi::TensorView partial_o,
     tvm::ffi::TensorView partial_ml,
+    tvm::ffi::TensorView debug,
     int64_t num_splits,
     int64_t topk,
     int64_t tail_sentinel,
@@ -62,6 +63,7 @@ void sparse_mla_fp8_decode_dispatch(
   params.partial_o = static_cast<float*>(partial_o.data_ptr());
   params.partial_ml = static_cast<float*>(partial_ml.data_ptr());
   params.tail_sentinel = (int)tail_sentinel;
+  params.debug = debug.data_ptr() != nullptr ? static_cast<float*>(debug.data_ptr()) : nullptr;
   sm90::decode::SparseMlaFp8DecodeKernel::run(params);
 }
 

@@ -34,6 +34,7 @@ struct SparseMlaFp8DecodeParams {
   float* __restrict__ partial_o;         // [num_reqs, P, num_heads, d_v]
   float* __restrict__ partial_ml;        // [num_reqs, P, num_heads, 2] (m, l) in exp2 units
   int tail_sentinel;                     // 1: rows beyond seqlens are all -1 (skip blocks)
+  float* __restrict__ debug;             // optional [num_reqs, 12] (nullable): E pre-pass dump
 
   cudaStream_t stream;
 };
