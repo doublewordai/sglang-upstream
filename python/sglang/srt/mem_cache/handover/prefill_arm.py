@@ -150,6 +150,7 @@ class PrefillExport:
         model_path: str,
         staged: bool = False,
         with_checksums: bool = True,
+        staging_cache: Optional[Dict] = None,
     ) -> "PrefillExport":
         # Flush any completed write-through acks so host_value rows are final.
         writing_check = getattr(tree, "writing_check", None)
@@ -201,7 +202,11 @@ class PrefillExport:
 
         staging: Dict[str, List[torch.Tensor]] = {}
         if staged:
-            staging = cls._stage(tree, manifest, pools)
+            staging, t_alloc, t_gather = cls._stage(
+                tree, manifest, pools, staging_cache
+            )
+            manifest._stage_alloc_s = t_alloc  # diagnostics
+            manifest._stage_gather_s = t_gather
             src_pages = manifest.flat_page_rows()  # arange over staging rows
         else:
             src_pages = manifest.flat_page_rows()
@@ -241,31 +246,52 @@ class PrefillExport:
     # -- staging -----------------------------------------------------------
 
     @staticmethod
-    def _stage(tree, manifest, pools) -> Dict[str, List[torch.Tensor]]:
+    def _stage(tree, manifest, pools, staging_cache=None):
         """Gather exported pages into per-pool contiguous pinned staging buffers.
 
         Staging page j holds canonical page j; the push uses src pages
-        0..num_pages-1 with each pool's own item_len.
+        0..num_pages-1 with each pool's own item_len. ``staging_cache`` (a
+        dict) lets callers reuse pinned allocations across handovers — the
+        cudaHostAlloc of a fresh multi-GB staging buffer costs ~150 MB/s, so
+        production pre-warms it; returns (buffers, t_alloc_s, t_gather_s).
         """
         rows = manifest.flat_page_rows()  # source rows (pre-stage)
         n = len(rows)
         out: Dict[str, List[torch.Tensor]] = {}
         rows_t = torch.as_tensor(rows, dtype=torch.long)
+        # NOTE: index_select uses torch's intra-op thread pool. On Isambard
+        # the default pool sizes to all visible cores (288) while the job's
+        # cpuset is 16 -> OMP thrash measured at 0.05 GB/s vs 4.4 GB/s at 16
+        # threads / 11 GB/s single-thread. The engine sets its own counts;
+        # standalone callers must too.
+        t_alloc = 0.0
+        t_gather = 0.0
         for name, pool in pools.items():
             bufs = _per_layer_host_buffers(pool)
             item_len = _pool_item_len(pool)
-            staging = [
-                torch.empty((n, item_len), dtype=torch.uint8, pin_memory=True)
-                for _ in bufs
-            ]
+            key = (name, len(bufs), item_len)
+            cached = (staging_cache or {}).get(key)
+            if cached is not None and cached[0].shape[0] >= n:
+                staging = [c[:n] for c in cached]
+            else:
+                t0 = time.perf_counter()
+                staging = [
+                    torch.empty((n, item_len), dtype=torch.uint8, pin_memory=True)
+                    for _ in bufs
+                ]
+                t_alloc += time.perf_counter() - t0
+            if staging_cache is not None:
+                staging_cache[key] = staging
             errors = []
 
             def copy_layer(i: int) -> None:
                 try:
-                    staging[i].copy_(_gather_rows(bufs[i], rows_t, item_len))
+                    src2d = bufs[i].view(-1, item_len)
+                    staging[i].copy_(src2d.index_select(0, rows_t))
                 except Exception as e:  # noqa: BLE001
                     errors.append(e)
 
+            t0 = time.perf_counter()
             threads = [
                 threading.Thread(target=copy_layer, args=(i,)) for i in range(len(bufs))
             ]
@@ -273,10 +299,11 @@ class PrefillExport:
                 t.start()
             for t in threads:
                 t.join()
+            t_gather += time.perf_counter() - t0
             if errors:
                 raise errors[0]
             out[name] = staging
-        return out
+        return out, t_alloc, t_gather
 
     # -- fingerprint ---------------------------------------------------------
 
@@ -315,14 +342,6 @@ class PrefillExport:
                 logger.warning("release_host on node %s with zero counter", n.id)
         self.nodes = []
 
-
-def _gather_rows(buf: torch.Tensor, rows: torch.Tensor, item_len: int) -> torch.Tensor:
-    """Gather ``rows`` (page-row ids) of ``item_len`` bytes from a flat uint8 buffer."""
-    if len(rows) == 0:
-        return torch.empty(0, item_len, dtype=torch.uint8)
-    flat = buf.view(-1)
-    idx = rows[:, None] * item_len + torch.arange(item_len, dtype=torch.long)[None, :]
-    return flat[idx]
 
 
 # ---------------------------------------------------------------------------
