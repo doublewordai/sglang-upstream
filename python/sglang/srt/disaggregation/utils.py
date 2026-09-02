@@ -402,7 +402,8 @@ class MetadataBuffers:
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
-    def get_buf_infos(self):
+    def _aux_bufs(self):
+        """Aux buffers in transfer order (single source for infos + range)."""
         bufs = [
             self.output_ids,
             self.cached_tokens,
@@ -429,6 +430,20 @@ class MetadataBuffers:
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
+        return bufs
+
+    def get_spec_aux_range(self):
+        """[start, end) indices of the speculative-decode aux components
+        (topk_p, topk_index, hidden_states, dsa_topk_indices) in the
+        get_buf_infos() buffer list. bootstrap_room stays outside. Under PP,
+        prefill stages other than the last skip exactly this range when
+        sending aux data (KVArgs.aux_send_spec_bufs)."""
+        bufs = self._aux_bufs()
+        start = bufs.index(self.output_topk_p)
+        return start, len(bufs) - 1
+
+    def get_buf_infos(self):
+        bufs = self._aux_bufs()
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]

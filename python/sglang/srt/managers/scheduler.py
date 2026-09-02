@@ -926,6 +926,23 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # PP + speculative decoding (prefill arm only, enforced in
+        # check_server_args): the EAGLE draft layer consumes the target's
+        # final hidden states, which exist only on the LAST pipeline stage.
+        # Earlier stages run plain target extends and forward hidden states
+        # as today; they must not build a draft worker, a draft KV pool, or
+        # register draft KV data pointers with the transfer backend.
+        if (
+            self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            assert self.server_args.disaggregation_mode == "prefill", (
+                "PP + speculative decoding is only supported on the prefill arm"
+            )
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding. It builds its draft
         # from this process's own config: what differs for the draft — the
         # target's context length, the draft load format, its attention backend
@@ -1020,8 +1037,10 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
-        # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        # Dispatch the model worker. Under PP+spec (prefill arm) only the
+        # last stage has a draft worker; earlier stages drive the plain
+        # target worker (with pp_proxy_tensors threading).
+        if self.draft_worker is None:
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1325,9 +1344,16 @@ class Scheduler(
             else None
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.draft_worker is not None
+            and self.spec_algorithm.carries_draft_hidden_states()
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
+            # worker, so a single accessor covers both shapes. Under PP+spec
+            # only the last stage has a draft worker; earlier stages use the
+            # 16-fp32 padding layout and never send the spec aux components
+            # (see KVArgs.aux_send_spec_bufs), so the layout mismatch with the
+            # decode side is never exercised.
             draft_runner = self.draft_worker.draft_worker.draft_runner
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
@@ -3764,12 +3790,16 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
-            elif not batch.spec_algorithm.is_none():
+            elif not batch.spec_algorithm.is_none() and self.draft_worker is not None:
                 # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
+                # future_map relay / on_publish). PP stages without a draft
+                # worker (all but the last, under PP+spec) take the plain
+                # path below so pp_proxy_tensors keep flowing between stages.
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3787,11 +3817,9 @@ class Scheduler(
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                # Plain path: non-spec everywhere, and PP+spec stages without
+                # a draft worker. pp_proxy_tensors is None when not PP.
+                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs

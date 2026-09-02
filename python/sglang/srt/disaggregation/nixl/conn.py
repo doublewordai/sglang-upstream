@@ -2028,7 +2028,17 @@ class NixlKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
+        # PP + spec: non-last prefill stages skip the spec aux components
+        # (their hidden-state rows use the 16-fp32 padding layout and are
+        # never filled); the last stage is the single writer of those fields.
+        spec_range = getattr(self.kv_args, "aux_spec_buf_range", None)
+        skip_spec = spec_range is not None and not getattr(
+            self.kv_args, "aux_send_spec_bufs", True
+        )
+
         for i, _ in enumerate(dst_aux_ptrs):
+            if skip_spec and spec_range[0] <= i < spec_range[1]:
+                continue
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * dst_aux_index

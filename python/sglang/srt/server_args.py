@@ -9207,9 +9207,20 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            if self.speculative_algorithm is not None:
+                # PP + speculation is wired only for the PD-disaggregation
+                # PREFILL arm: earlier PP stages run plain target extends and
+                # forward hidden states as today; only the LAST stage builds
+                # the EAGLE draft worker (the draft layer consumes the
+                # target's final hidden states, which only exist there) and
+                # transfers draft KV + aux data alongside its target KV.
+                assert self.disaggregation_mode == "prefill", (
+                    "Pipeline parallelism with speculative decoding is only "
+                    "supported with --disaggregation-mode prefill"
+                )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

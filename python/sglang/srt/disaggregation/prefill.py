@@ -253,6 +253,12 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        # PP + spec: only the last PP stage owns the draft hidden states /
+        # DSA top-k that fill the spec aux components; earlier stages skip
+        # them at send time (their rows are zero/stale and share the decode
+        # side's destination row).
+        kv_args.aux_spec_buf_range = self.metadata_buffers.get_spec_aux_range()
+        kv_args.aux_send_spec_bufs = self.pp_rank == self.pp_size - 1
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 

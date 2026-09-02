@@ -39,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -1106,17 +1110,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
+            # Target prefill. Under PP this runs on the LAST stage: the
+            # incoming pp_proxy_tensors carry the previous stage's hidden
+            # states; the outgoing draft extend is stage-local.
             target_capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                capture_hidden_mode=target_capture_mode,
+                pp_proxy_tensors=pp_proxy_tensors,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
