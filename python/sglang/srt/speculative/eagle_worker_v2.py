@@ -285,8 +285,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+        target_model = self.target_worker.model_runner.model
+        from sglang.srt.layers.utils.common import PPMissingLayer
+
+        # PP+spec (prefill arm): the target's embed_tokens lives on the FIRST
+        # PP stage; on the LAST stage (the only one with a draft worker) it is
+        # a PPMissingLayer. The draft's own NextN model builds an
+        # embed_tokens loaded from the same checkpoint, so keep that and
+        # share only the lm_head (which lives on the last stage).
+        target_embed = getattr(target_model.model, "embed_tokens", None)
+        if isinstance(target_embed, PPMissingLayer):
+            embed = None
+            head = target_model.lm_head.weight
+        else:
+            embed, head = target_model.get_embed_and_head()
+        target_lm_head = getattr(target_model, "lm_head", None)
 
         def maybe_share_target_lm_head():
             if (
@@ -322,7 +335,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            self.draft_runner.model.set_embed_and_head(embed, head)
+            if embed is None:
+                self.draft_runner.model.set_embed_and_head(
+                    self.draft_runner.model.model.embed_tokens.weight, head
+                )
+            else:
+                self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
     def init_attention_backend(self):
