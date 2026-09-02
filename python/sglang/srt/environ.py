@@ -450,6 +450,12 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    # Bulk host<->device HiCache transfers: coalesce page-granular index sets
+    # into contiguous runs and move them with cudaMemcpyBatchAsync (copy
+    # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
+    # copies; affects the HiCache H2D load path (page_first host pools) and
+    # the layer_first D2H backup path (hisparse staging backup).
+    SGLANG_HICACHE_BULK_COPY = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
