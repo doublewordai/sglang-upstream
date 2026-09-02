@@ -89,11 +89,11 @@ def _ptr_of(t: torch.Tensor) -> int:
 def _pattern_roundtrip(t: torch.Tensor) -> bool:
     """Write + read back a pattern at head, tail and stride; True iff intact."""
     v = t.flatten().view(torch.uint8)
-    v[:1024] = torch.arange(1024, dtype=torch.uint8)
-    v[-1024:] = torch.arange(1024, dtype=torch.uint8) + 1
     stride = max(1, v.numel() // 4096)
     sel = v[::stride]
     sel.copy_(torch.arange(sel.numel(), dtype=torch.uint8))
+    v[:1024] = torch.arange(1024, dtype=torch.uint8)
+    v[-1024:] = torch.arange(1024, dtype=torch.uint8) + 1
     assert v[0].item() == 0 and v[-1].item() == 0
     assert bool(torch.equal(v[::stride], torch.arange(sel.numel(), dtype=torch.uint8)))
     return True
@@ -102,13 +102,13 @@ def _pattern_roundtrip(t: torch.Tensor) -> bool:
 def _gpu_roundtrip(t: torch.Tensor) -> None:
     if not torch.cuda.is_available():
         return
-    n = min(t.numel(), 64 * MIB)
-    host = t.view(torch.uint8)[:n]
-    host[: 8 * MIB] = torch.arange(8 * MIB, dtype=torch.uint8) % 251
     cudart = torch.cuda.cudart()
     rc = cudart.cudaHostRegister(t.data_ptr(), t.numel(), 0)
     assert int(rc) == 0, f"cudaHostRegister failed rc={int(rc)}"
     try:
+        n = min(t.numel(), 64 * MIB)
+        host = t.flatten().view(torch.uint8)[:n]
+        host[: 8 * MIB] = torch.arange(8 * MIB, dtype=torch.uint8) % 251
         dev = host.cuda(non_blocking=False)
         back = dev.cpu()
         assert torch.equal(back, host), "GPU H2D/D2H roundtrip mismatch"
