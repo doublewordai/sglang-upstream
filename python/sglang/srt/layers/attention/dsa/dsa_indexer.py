@@ -883,7 +883,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if (
+            envs.SGLANG_DSA_DECODE_MQA_LOGITS_TRITON.get()
+            and _is_cuda
+            and self.paged_mqa_logits_backend.is_deepgemm()
+            and forward_batch.forward_mode.is_target_verify()
+            and B > 0
+            and 2 <= next_n <= 64
+            and self.n_heads == 32
+            and self.head_dim == 128
+            and q_fp8[:q_offset].is_contiguous()
+        ):
+            # Decode-shaped Triton kernel: reads each request's index-K ONCE
+            # for all its next_n draft-token query rows. The DeepGEMM SM90
+            # path below uses the split form (one request per query row),
+            # re-reading the request's whole index-K once per draft token.
+            from sglang.kernels.ops.attention.dsa.decode_mqa_logits import (
+                decode_mqa_logits as _decode_mqa_logits_triton,
+            )
+
+            logits = _decode_mqa_logits_triton(
+                q_fp8[:q_offset].view(B, next_n, self.n_heads, self.head_dim),
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d.view(B, next_n),
+                block_tables[::next_n],
+                max_seq_len,
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,

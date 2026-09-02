@@ -1367,6 +1367,11 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Decode-shaped Triton paged-MQA logits kernel
+    # (kernels/ops/attention/dsa/decode_mqa_logits.py) replacing the DeepGEMM
+    # split call at target-verify: every index-K row is read once per request
+    # for all its draft tokens instead of once per query row.
+    SGLANG_DSA_DECODE_MQA_LOGITS_TRITON = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
