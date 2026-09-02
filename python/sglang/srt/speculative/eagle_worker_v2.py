@@ -71,6 +71,11 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.eagle_adaptive import (
+    EagleAdaptiveVerifyScheduler,
+    build_eagle_ragged_layout,
+    eagle_ragged_verify_enabled,
+)
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
@@ -182,6 +187,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
+        self._init_adaptive_verify()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
@@ -246,6 +252,79 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
+
+    def _init_adaptive_verify(self) -> None:
+        """Compact ragged verify scheduling (lane/adaptive-spec).
+
+        Requires: EAGLE chain draft (topk=1, num_draft_tokens = steps+1), CUDA,
+        no token map / rejection sampling (the per-step confidence comes from
+        the fused topk1 postprocess kernel), and SGLANG_RAGGED_VERIFY_MODE=compact.
+        Without a table the schedule degenerates to verify-all (still useful:
+        constant-layout ragged graphs).
+        """
+        self.adaptive_scheduler: Optional[EagleAdaptiveVerifyScheduler] = None
+        self.ragged_verify_enabled = eagle_ragged_verify_enabled()
+        if not envs.SGLANG_EAGLE_ADAPTIVE_VERIFY.get():
+            if self.ragged_verify_enabled and self.topk == 1:
+                logger.info(
+                    "EAGLE ragged verify: compact graphs active, adaptive "
+                    "scheduling off (SGLANG_EAGLE_ADAPTIVE_VERIFY unset) -> "
+                    "verify-all through the ragged graphs."
+                )
+            return
+        if self.speculative_algorithm is not SpeculativeAlgorithm.EAGLE:
+            logger.warning(
+                "SGLANG_EAGLE_ADAPTIVE_VERIFY requires speculative-algorithm "
+                "EAGLE (NextN); ignoring."
+            )
+            return
+        if self.topk != 1:
+            logger.warning(
+                "SGLANG_EAGLE_ADAPTIVE_VERIFY requires topk=1 chains "
+                "(speculative-eagle-topk=1); ignoring."
+            )
+            return
+        if not _is_cuda or get_spec().speculative_use_rejection_sampling:
+            logger.warning(
+                "SGLANG_EAGLE_ADAPTIVE_VERIFY requires CUDA without rejection "
+                "sampling; ignoring."
+            )
+            return
+        try:
+            self.adaptive_scheduler = EagleAdaptiveVerifyScheduler(
+                num_steps=self.speculative_num_steps,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+            )
+        except ValueError as e:
+            logger.warning("EAGLE adaptive verify disabled: %s", e)
+            self.adaptive_scheduler = None
+
+    def _adaptive_confidence(
+        self, draft_input: EagleDraftInput, bs: int
+    ) -> Optional[torch.Tensor]:
+        """[bs, num_steps] per-draft-token P_draft; None when this step's draft
+        did not run the fused topk=1 chain path (capacity / token-map fallback).
+        Column 0 rides draft_input.topk_p (set by draft-extend, relayed by the
+        overlap FutureMap); columns 1.. come from the draft chain buffer.
+        """
+        if self.adaptive_scheduler is None:
+            return None
+        if self.hot_token_id is not None:
+            return None
+        conf_buf = self._topk1_conf_prealloc
+        if conf_buf is None or conf_buf.shape[0] < bs:
+            return None
+        if (
+            draft_input.topk_p is None
+            or draft_input.topk_p.shape[0] < bs
+            or draft_input.topk_p.shape[1] < 1
+        ):
+            return None
+        root_p = draft_input.topk_p[:bs, 0].to(torch.float32).reshape(bs, 1)
+        if self.speculative_num_steps <= 1:
+            return root_p
+        rest = conf_buf[:bs, 1 : self.speculative_num_steps]
+        return torch.cat([root_p, rest], dim=1)
 
     def _init_dsa_index_share_state(self) -> None:
         # Populate DSA index-share fields from the draft runner's hf_config.
@@ -542,6 +621,36 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
+        ragged_layout = None
+        draft_confidences = None
+        if self.ragged_verify_enabled and not batch.forward_mode.is_idle():
+            # Schedule per-request verify lengths AFTER the draft: the
+            # confidences (draft_input.topk_p for step 0 + the chain buffer
+            # for steps 1..) are only complete once the draft has run.
+            bs = batch.seq_lens.shape[0]
+            if self.adaptive_scheduler is not None:
+                draft_confidences = self._adaptive_confidence(draft_input, bs)
+            if draft_confidences is not None:
+                verify_lens = self.adaptive_scheduler.schedule_verify_lens(
+                    confidence=draft_confidences
+                )
+            else:
+                # Adaptive off/degenerate or the chain path did not run this
+                # step: full-width layout through the ragged graphs.
+                verify_lens = torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            ragged_layout = build_eagle_ragged_layout(
+                verify_lens=verify_lens,
+                model_runner=self.target_worker.model_runner,
+                device=self.device,
+            )
+            # ragged_layout is None when the total exceeds the captured grid:
+            # fall back to the uniform non-ragged verify for this step.
+
         return build_eagle_verify_input(
             batch,
             draft_input,
@@ -555,6 +664,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_draft_tokens=self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
+            ragged_layout=ragged_layout,
+            draft_confidences=draft_confidences,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -675,6 +786,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            draft_probs=(
+                                self._topk1_conf_prealloc[
+                                    : topk_index.shape[0]
+                                ]
+                                if self.adaptive_scheduler is not None
+                                else None
+                            ),
                         )
                     else:
                         topk_index = torch.argmax(
@@ -979,7 +1097,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            if self.adaptive_scheduler is not None:
+                # Real root confidence P_draft(draft token 0) for the adaptive
+                # verify scheduler (rides topk_p through the overlap relay).
+                probs = torch.softmax(
+                    draft_logits_output.next_token_logits.to(torch.float32),
+                    dim=-1,
+                )
+                ret_topk_p = probs.gather(
+                    1, ret_topk_index.to(torch.int64)
+                ).to(torch.float32)
+            else:
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(

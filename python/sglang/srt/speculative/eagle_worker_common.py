@@ -327,6 +327,8 @@ def build_eagle_verify_input(
     num_draft_tokens: int,
     tree_mask_mode: TreeMaskMode,
     device: str,
+    ragged_layout=None,
+    draft_confidences: Optional[torch.Tensor] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -385,6 +387,18 @@ def build_eagle_verify_input(
         fill_prefix_mask=fill_mask,
     )
 
+    if ragged_layout is not None:
+        # Truncate each request's chain at verify_len: the node at
+        # verify_len-1 gets no children, so the greedy/sampling accept kernels
+        # stop exactly there (unverified nodes do not exist this round). For
+        # verify_len == num_draft_tokens this writes the chain end (-1) again.
+        verify_lens_64 = ragged_layout.verify_lens.to(torch.int64)
+        rows = torch.arange(
+            verify_lens_64.shape[0], device=verify_lens_64.device
+        )
+        last_col = (verify_lens_64 - 1).clamp(min=0)
+        retrieve_next_token[rows, last_col] = -1
+
     return EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,
@@ -400,6 +414,8 @@ def build_eagle_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
         draft_probs=draft_probs,
+        ragged_verify_layout=ragged_layout,
+        draft_confidences=draft_confidences,
     )
 
 
@@ -565,6 +581,30 @@ def run_eagle_verify(
         is_verify=True,
     )
     logits_output = forward_batch_output.logits_output
+
+    ragged_layout = getattr(verify_input, "ragged_verify_layout", None)
+    if ragged_layout is not None and not batch.forward_mode.is_idle():
+        # Compact -> strided [bs * num_draft_tokens] with 0.0 fill beyond each
+        # request's verify window: the accept kernels and draft-extend keep
+        # consuming the uniform strided layout (links truncated at verify_len,
+        # so filled rows are never accepted).
+        from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+            ScatterCompactToStrided,
+        )
+
+        logits_output.next_token_logits = ScatterCompactToStrided.execute(
+            compact=logits_output.next_token_logits,
+            layout=ragged_layout,
+            fill_value=0.0,
+            verify_num_draft_tokens=num_draft_tokens,
+        )
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = ScatterCompactToStrided.execute(
+                compact=logits_output.hidden_states,
+                layout=ragged_layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=num_draft_tokens,
+            )
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None

@@ -132,7 +132,9 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        # EAGLE here is the NextN/MTP chain draft (topk=1); the ragged path
+        # asserts chain trees. EAGLE3 tree / FROZEN_KV_MTP are not wired.
+        return self.is_dspark() or self is SpeculativeAlgorithm.EAGLE
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the

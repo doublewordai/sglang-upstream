@@ -1141,6 +1141,14 @@ class Envs:
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # EAGLE adaptive verify (lane/adaptive-spec): per-request verify lengths from
+    # draft confidence + an SPS cost table. Requires SGLANG_RAGGED_VERIFY_MODE=compact.
+    SGLANG_EAGLE_ADAPTIVE_VERIFY = EnvBool(False)
+    # Path to an SPS cost table JSON (SpsCostTable or SpsAdditiveCostTable format,
+    # see dspark_sps.py) for the EAGLE adaptive verify budget scheduler. Without
+    # it the schedule degenerates to verify-all (full width through the ragged
+    # graphs) and a warning is logged.
+    SGLANG_EAGLE_SPS_TABLE = EnvStr("")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift

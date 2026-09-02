@@ -507,51 +507,65 @@ def eagle_prepare_for_verify(
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
     if not batch.forward_mode.is_idle():
-        # Assign cache locations
-        bs = len(batch.req_pool_indices)
-        batch.input_ids = verify_input.draft_token
-        maybe_detect_oob(
-            batch.input_ids,
-            0,
-            batch.model_config.vocab_size,
-            "v2 prepare_for_verify input_ids",
-        )
-        device = batch.device
-        # Uniform variant: end offsets (= start + draft_token_num) are computed
-        # inside the kernel, keeping the eager `seq_lens + N` add off the host
-        # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
-
-        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
-            batch, verify_input.draft_token_num
-        )
-        # pd/mtp-hisparse: steer the draft positions' KV writes into the
-        # hisparse device buffer (decode does this in prepare_for_decode).
-        coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
-        if coord is not None:
-            coord.map_verify_locs_to_buffer(
-                batch.seq_lens,
-                batch.out_cache_loc,
-                batch.req_pool_indices,
-                batch.seq_lens_cpu,
-                getattr(batch, "req_pool_indices_cpu", None),
-                verify_input.draft_token_num,
+        ragged_layout = getattr(verify_input, "ragged_verify_layout", None)
+        if ragged_layout is not None:
+            # Compact ragged verify (lane/adaptive-spec): front-packed per-request
+            # verify windows, padded to the token tier; see the helper.
+            _eagle_prepare_ragged_verify(
+                verify_input,
+                req_to_token_pool,
+                batch,
+                target_worker,
+                ragged_layout,
+            )
+        else:
+            # Assign cache locations
+            bs = len(batch.req_pool_indices)
+            batch.input_ids = verify_input.draft_token
+            maybe_detect_oob(
+                batch.input_ids,
+                0,
+                batch.model_config.vocab_size,
+                "v2 prepare_for_verify input_ids",
+            )
+            device = batch.device
+            # Uniform variant: end offsets (= start + draft_token_num) are computed
+            # inside the kernel, keeping the eager `seq_lens + N` add off the host
+            # critical path (bs=1 MTP inter-phase seam).
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
             )
 
-        prepare_mamba_track_for_verify(batch)
+            batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+                batch, verify_input.draft_token_num
+            )
+            # pd/mtp-hisparse: steer the draft positions' KV writes into the
+            # hisparse device buffer (decode does this in prepare_for_decode).
+            coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+            if coord is not None:
+                coord.map_verify_locs_to_buffer(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    batch.req_pool_indices,
+                    batch.seq_lens_cpu,
+                    getattr(batch, "req_pool_indices_cpu", None),
+                    verify_input.draft_token_num,
+                )
 
-        # TBO's split_spec_info reads these; no-verify-sync leaves both None.
-        verify_input.seq_lens_cpu = batch.seq_lens_cpu
-        verify_input.seq_lens_sum = (
-            int(batch.seq_lens_cpu.sum()) if batch.seq_lens_cpu is not None else None
-        )
+            prepare_mamba_track_for_verify(batch)
+
+            # TBO's split_spec_info reads these; no-verify-sync leaves both None.
+            verify_input.seq_lens_cpu = batch.seq_lens_cpu
+            verify_input.seq_lens_sum = (
+                int(batch.seq_lens_cpu.sum())
+                if batch.seq_lens_cpu is not None
+                else None
+            )
 
     # Get a forward batch
     batch.forward_mode = (
@@ -586,6 +600,107 @@ def eagle_prepare_for_verify(
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
     return verify_forward_batch, can_run_cuda_graph
+
+
+def _eagle_prepare_ragged_verify(
+    verify_input,
+    req_to_token_pool,
+    batch,
+    target_worker,
+    ragged_layout,
+):
+    """Compact ragged verify prep (lane/adaptive-spec).
+
+    - input_ids / positions: front-packed per request (prefix + within),
+      padded to graph_num_tokens; ghost rows carry token 0 / position 0.
+    - out_cache_loc: per-request window locs for the verified positions only;
+      ghost rows carry a dedicated sacrificial full-pool loc (hisparse: steered
+      once to the spare reserved-page row; plain pools: loc 0, matching the
+      DSpark ghost convention).
+    - hisparse steering mirrors map_verify_locs_to_buffer with per-request
+      verify_lens instead of a uniform window.
+    - batch.seq_lens stays the committed prefix: the DSA backend derives
+      cache_seqlens = seq_lens + verify_lens from the layout itself.
+    """
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_extend_cache_locs_func,
+    )
+    from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+        CompactRowIndex,
+    )
+
+    bs = len(batch.req_pool_indices)
+    device = batch.device
+    ndt = verify_input.draft_token_num
+    verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
+
+    req_id, within, valid = CompactRowIndex.execute(
+        verify_lens=verify_lens,
+        padded_total=ragged_layout.graph_num_tokens,
+        device=device,
+    )
+    safe_req = req_id.clamp(max=bs - 1) if bs > 0 else req_id
+    ids_2d = verify_input.draft_token.view(bs, ndt)
+    verify_ids = torch.where(
+        valid,
+        ids_2d[safe_req, within.clamp(max=ndt - 1)].to(torch.int64),
+        torch.zeros((), dtype=torch.int64, device=device),
+    )
+    batch.input_ids = verify_ids
+    maybe_detect_oob(
+        batch.input_ids[: int(ragged_layout.total_verify_tokens or 0)],
+        0,
+        batch.model_config.vocab_size,
+        "ragged prepare_for_verify input_ids",
+    )
+
+    prefix = batch.seq_lens.to(torch.int64)
+    positions = torch.where(
+        valid, prefix[safe_req] + within, torch.zeros_like(within)
+    )
+    verify_input.positions = positions
+
+    real_locs = assign_extend_cache_locs_func(
+        req_pool_indices=batch.req_pool_indices,
+        req_to_token=req_to_token_pool.req_to_token,
+        start_offset=batch.seq_lens,
+        end_offset=batch.seq_lens + verify_lens.to(batch.seq_lens.dtype),
+        batch_size=bs,
+        draft_token_num=ndt,
+        device=device,
+    )
+    coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+    if coord is not None:
+        ghost_loc = coord.ragged_ghost_cache_loc(num_draft_tokens=ndt)
+    else:
+        ghost_loc = 0
+    locs = torch.nn.functional.pad(
+        real_locs, (0, ragged_layout.graph_num_tokens - real_locs.shape[0])
+    )
+    batch.out_cache_loc = torch.where(
+        valid, locs, torch.full_like(locs, ghost_loc)
+    )
+
+    if coord is not None:
+        coord.map_verify_locs_to_buffer_ragged(
+            batch.seq_lens,
+            batch.out_cache_loc,
+            batch.req_pool_indices,
+            batch.seq_lens_cpu,
+            getattr(batch, "req_pool_indices_cpu", None),
+            ragged_layout,
+            ndt,
+        )
+
+    prepare_mamba_track_for_verify(batch)
+
+    verify_input.seq_lens_cpu = batch.seq_lens_cpu
+    verify_input.seq_lens_sum = (
+        int(batch.seq_lens_cpu.sum()) if batch.seq_lens_cpu is not None else None
+    )
+    # Ragged forwards carry 1 (DP global_num_tokens scaling contract).
+    verify_input.num_tokens_per_req = 1
+    verify_input.num_tokens_for_logprob_per_req = 1
 
 
 def _seeded_verify_coins(
