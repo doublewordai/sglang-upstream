@@ -1313,7 +1313,21 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and self.is_draft_worker:
+            # pd/mtp-hisparse: the MTP draft's KV (one layer) stays device-resident
+            # at the allocator's full LOGICAL size instead of joining the host tier.
+            # The draft shares the target's hisparse allocator, whose indices span
+            # size * host_to_device_ratio; a plain pool of that size is indexed by
+            # them directly, and retained (never reused) logical indices keep the
+            # draft rows of a retained prefix valid exactly like the target's
+            # device-resident indexer keys.
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            PoolCls = DSATokenToKVPool
+            max_total_num_tokens = max_total_num_tokens * int(
+                parse_hisparse_config(self.server_args).host_to_device_ratio
+            )
+        elif get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 

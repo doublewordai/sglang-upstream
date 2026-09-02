@@ -351,7 +351,10 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        # pd/mtp-hisparse: only the target runner owns the host tier and its
+        # coordinator; the MTP draft runner runs the plain DSA path over a
+        # device-resident pool sized to the logical index space.
+        self.enable_hisparse = server_args.enable_hisparse and not is_draft_worker
 
         self.init_startup_observability()
 
