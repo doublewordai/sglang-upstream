@@ -475,12 +475,34 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
             captured_step()
         torch.cuda.current_stream().wait_stream(warm)
         torch.cuda.synchronize()
+        # Reset the warmup's mutations and bring BOTH stacks back to the
+        # canonical pre-step state (admission + verify slot mapping, exactly
+        # like the eager test's per-step prep).
         for stack in (self.sync, self.prefetch):
             stack.reset()
             for req in reqs:
                 idx = stack.req_to_token_pool.alloc([req])
                 self.assertIsNotNone(idx)
                 self._admit(stack, req, FILL_LEN)
+        new_rpi = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, device="cuda"
+        )
+        rpi.copy_(new_rpi)  # the graph reads this tensor at replay time
+        sls = torch.tensor(seq_lens, dtype=torch.int64, device="cuda")
+        for stack in (self.sync, self.prefetch):
+            per_req = [
+                self._alloc_step_tokens(stack, req, seq_lens[i], N_POS)
+                for i, req in enumerate(reqs)
+            ]
+            out_cache_loc = torch.cat(per_req, dim=0).to("cuda")
+            stack.coordinator.map_verify_locs_to_buffer(
+                sls, out_cache_loc, new_rpi, sls.cpu(), new_rpi.cpu(), N_POS
+            )
+            # The warmup fetched rows into the prefetch stack's device pool;
+            # scrub BOTH pools to a finite sentinel so unwritten rows compare equal and any
+            # row a step does not rewrite is visibly the sentinel on both sides.
+            for lid in range(LAYER_NUM):
+                stack.device_pool.kv_buffer[lid].fill_(-777.0)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
