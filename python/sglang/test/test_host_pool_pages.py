@@ -88,7 +88,7 @@ def _ptr_of(t: torch.Tensor) -> int:
 
 def _pattern_roundtrip(t: torch.Tensor) -> bool:
     """Write + read back a pattern at head, tail and stride; True iff intact."""
-    v = t.view(torch.uint8)
+    v = t.flatten().view(torch.uint8)
     v[:1024] = torch.arange(1024, dtype=torch.uint8)
     v[-1024:] = torch.arange(1024, dtype=torch.uint8) + 1
     stride = max(1, v.numel() // 4096)
