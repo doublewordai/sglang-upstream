@@ -1379,6 +1379,12 @@ class Envs:
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
     SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+
+    # Decode-shaped Triton paged-MQA logits kernel
+    # (kernels/ops/attention/dsa/decode_mqa_logits.py) replacing the DeepGEMM
+    # split call at target-verify: every index-K row is read once per request
+    # for all its draft tokens instead of once per query row.
+    SGLANG_DSA_DECODE_MQA_LOGITS_TRITON = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     # Prefill-shaped PAGED DSA top-k: use the single-pass JIT kernel
