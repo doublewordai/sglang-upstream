@@ -140,6 +140,11 @@ if _is_cuda:
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
+    from sglang.kernels.ops.attention.dsa.indexer_prologue import (
+        fused_k_indexer_prologue,
+        fused_k_indexer_prologue_store,
+        fused_q_indexer_prologue,
+    )
     from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
         logits_head_gate_graph,
         scale_head_gate_graph,
@@ -301,6 +306,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.k_norm = LayerNorm(
                 self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
             )
+        # lane/indexer-prologue: fusion that KEEPS the Hadamard rotation inside
+        # the fused prologue kernels, so the index-K cache and q_fp8 keep the
+        # production (un-fused) arithmetic. Requires the LayerNorm-type k_norm
+        # (GLM-5.3); the RMSNorm variant has no bias and is not covered.
+        self.dsa_fusion_keep_hadamard = (
+            self.use_dsa_indexer_fusion
+            and envs.SGLANG_DSA_INDEXER_FUSION_KEEP_HADAMARD.get()
+            and isinstance(self.k_norm, LayerNorm)
+        )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -415,13 +429,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Compose with the gemm-impl lane's dsv3 bf16 small-M GEMV: the merged
+        # wk_weights_proj weight is already bf16, so when that patch is merged
+        # (flag present) and enabled, route M<=16 through dsv3_fused_a_gemm
+        # instead of cuBLAS. No-op on this branch alone or at M>16.
+        if (
+            hasattr(envs, "SGLANG_GLM_DSV3_BF16_SMALLM_GEMV")
+            and envs.SGLANG_GLM_DSV3_BF16_SMALLM_GEMV.get()
+            and not torch.compiler.is_compiling()
+            and not isinstance(x, tuple)
+            and x.dim() == 2
+            and 0 < x.shape[0] <= 16
+            and x.shape[1] % 256 == 0
+            and self.wk_weights_proj.weight.shape[0] % 16 == 0
+            and not getattr(self.wk_weights_proj, "set_lora", False)
+        ):
+            from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import dsv3_fused_a_gemm
+
+            kw = dsv3_fused_a_gemm(x, self.wk_weights_proj.weight.t())
+            return kw.split([self.head_dim, self.n_heads], dim=-1)
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
-        return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+        # keep-hadamard mode rotates inside the fused prologue kernels instead,
+        # so the unfused-style paths (piecewise/CP) keep the production rotation.
+        if self.use_dsa_indexer_fusion and not self.dsa_fusion_keep_hadamard:
+            return x
+        return rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # When kv_len <= index_topk the top-k selects ALL valid positions, so the
@@ -633,6 +670,46 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
+        if self.dsa_fusion_keep_hadamard:
+            # lane/indexer-prologue: LayerNorm + RoPE + Hadamard + fp8 quant
+            # (+ paged store) in one launch, production arithmetic.
+            if (
+                not _is_fp8_fnuz
+                and out_cache_loc is not None
+                and can_use_dsa_fused_store(
+                    torch.bfloat16, out_cache_loc.dtype, page_size
+                )
+            ):
+                fused_k_indexer_prologue_store(
+                    key_raw,
+                    pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                    out_cache_loc,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self.head_dim**-0.5,
+                    self._indexer_cos_sin_cache,
+                    positions,
+                    page_size,
+                )
+                return
+            key = fused_k_indexer_prologue(
+                key_raw,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self.head_dim**-0.5,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant,
+                out_cache_loc=out_cache_loc,
+            )
+            return
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
@@ -705,6 +782,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
+            if self.dsa_fusion_keep_hadamard:
+                return fused_q_indexer_prologue(
+                    q.contiguous(),
+                    weights_raw,
+                    self.n_heads**-0.5,
+                    self.softmax_scale,
+                    self.head_dim**-0.5,
+                    self._indexer_cos_sin_cache,
+                    positions,
+                )
             return fused_q_indexer_rope_first_quant(
                 q.contiguous(),
                 weights_raw,
@@ -732,13 +819,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
-        q_fp8, weights = fused_q_indexer_rope_first_quant(
-            q.contiguous(),
-            weights_raw,
-            q_scale_gate,
-            self._indexer_cos_sin_cache,
-            positions,
-        )
+        if self.dsa_fusion_keep_hadamard:
+            q_fp8, weights = fused_q_indexer_prologue(
+                q.contiguous(),
+                weights_raw,
+                self.n_heads**-0.5,
+                self.softmax_scale,
+                self.head_dim**-0.5,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
+        else:
+            q_fp8, weights = fused_q_indexer_rope_first_quant(
+                q.contiguous(),
+                weights_raw,
+                q_scale_gate,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(
                 key,
