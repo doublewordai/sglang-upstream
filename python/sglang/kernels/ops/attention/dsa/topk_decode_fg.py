@@ -46,7 +46,7 @@ def _get_workspace(batch: int, cap: int, device: torch.device) -> torch.Tensor:
     key = (batch, cap, str(device))
     ws = _WORKSPACE_CACHE.get(key)
     if ws is None:
-        n_ints = batch * (2 * 256 + 4 + 4 + 4) + 3 * batch * cap
+        n_ints = batch * (2 * 256 + 4 + 4 + 4 + 3) + 3 * batch * cap
         ws = torch.zeros(n_ints, dtype=torch.int32, device=device)
         _WORKSPACE_CACHE[key] = ws
     return ws
@@ -84,7 +84,7 @@ def topk_decode_fg(
     if lengths.dtype != torch.int32 or lengths.stride(0) != 1:
         lengths = lengths.to(dtype=torch.int32).contiguous()
 
-    out = scores.new_full((batch, topk), -1, dtype=torch.int32)
+    out = torch.empty((batch, topk), dtype=torch.int32, device=scores.device)
     stats = (
         torch.zeros((batch, 4), dtype=torch.int32, device=scores.device)
         if return_stats

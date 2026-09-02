@@ -74,7 +74,7 @@ namespace {
 
 constexpr uint32_t kRadix = 256;
 constexpr uint32_t kBlock = 256;      // all kernels use 256-thread blocks
-constexpr uint32_t kChunk = 2048;     // elements per K1/K3 block (8/thread)
+constexpr uint32_t kChunk = 4096;     // elements per K1/K3 block (16/thread)
 constexpr uint32_t kSlice = 2048;     // candidates per K4a block (8/thread)
 constexpr uint32_t kMaxTopK = 2048;
 
