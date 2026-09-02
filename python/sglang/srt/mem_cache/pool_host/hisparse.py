@@ -8,9 +8,38 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+class HostPoolExhaustedError(RuntimeError):
+    """The HiSparse host KV pool has no whole pages left for a request.
+
+    Raised by :meth:`HiSparseHostPoolMixin.alloc_paged_token_slots`. Decode
+    pre-allocation treats it as a "not yet" admission signal (the request
+    stays queued and is retried after eviction frees host rows), never as a
+    scheduler-fatal error. Subclasses ``RuntimeError`` so pre-existing
+    handlers keep working.
+    """
+
+
 class HiSparseHostPoolMixin:
     def _round_up_to_page_size(self, size: int) -> int:
         return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def host_pages_needed(
+        self, start_pos: int, num_tokens: int, allocated_len: int
+    ) -> int:
+        """Whole pages ``alloc_paged_token_slots`` would newly allocate for
+        [start_pos, start_pos+num_tokens) given an already-allocated length.
+        Mirrors the accounting in alloc_paged_token_slots exactly, so an
+        admission pre-check agrees with the allocation it guards."""
+        if num_tokens <= 0:
+            return 0
+        page_end = self._round_up_to_page_size(start_pos + num_tokens)
+        if page_end <= allocated_len:
+            return 0
+        return (page_end - allocated_len) // self.page_size
+
+    def has_free_pages(self, num_pages: int) -> bool:
+        """Whether ``alloc_page(num_pages)`` can succeed right now."""
+        return num_pages * self.page_size <= self.available_size()
 
     def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
         host_locs = self.alloc(num_pages * self.page_size)
@@ -60,7 +89,7 @@ class HiSparseHostPoolMixin:
                     start_pos,
                     num_tokens,
                 )
-                raise RuntimeError(
+                raise HostPoolExhaustedError(
                     f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
                 )
 

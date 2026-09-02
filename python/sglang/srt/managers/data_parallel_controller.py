@@ -105,6 +105,11 @@ class DPBudget:
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        # HiSparse host-pool admission state per rank (host-pool
+        # backpressure). Free host tokens are what a decode rank can still
+        # pin; 0/0 means "not reported" (non-hisparse ranks).
+        self.host_pool_free_tokens = [0] * dp_size
+        self.host_pool_total_tokens = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -116,6 +121,12 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.host_pool_free_tokens[load.dp_rank] = getattr(
+                load, "host_pool_free_tokens", 0
+            )
+            self.host_pool_total_tokens[load.dp_rank] = getattr(
+                load, "host_pool_total_tokens", 0
+            )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -851,13 +862,14 @@ class DataParallelController:
         if logger.isEnabledFor(logging.INFO):
             ranks, matched = self.prefix_index.longest_match(keys)
             logger.info(
-                "prefix_affinity dispatch rid=%s len=%d matched=%d on %s -> dp%d loads=%s",
+                "prefix_affinity dispatch rid=%s len=%d matched=%d on %s -> dp%d loads=%s host_free_tok=%s",
                 req.rid,
                 len(req.input_ids),
                 matched,
                 ranks,
                 target,
                 [self._rank_load(r) for r in self._active_workers],
+                [self.dp_budget.host_pool_free_tokens[r] for r in self._active_workers],
             )
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
         if target < self.dp_budget.dp_size:

@@ -1196,6 +1196,21 @@ class HiSparseCoordinator:
             req.rid,
         )
 
+    def unadopt_prefix(self, req: Req) -> None:
+        """Roll back adopt_prefix: clear this request's host-row table.
+
+        The rows themselves stay owned by the radix side table
+        (``logical_to_host_row``); only the per-request view is dropped, so a
+        retried pre-allocation re-adopts them cleanly. Used when host-pool
+        exhaustion aborts a partially-completed pre-allocation.
+        """
+        idx = req.req_pool_idx
+        n = int(self.req_adopted_len[idx])
+        if n > 0:
+            self.req_to_host_pool[idx, :n] = -1
+        self.req_to_host_pool_allocated_len[idx] = 0
+        self.req_adopted_len[idx] = 0
+
     def release_for_retention(self, req: Req) -> None:
         """request_finished minus the host-row free: device buffer slots,
         mapping rows and per-request tables are released; host bytes survive

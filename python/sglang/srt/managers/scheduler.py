@@ -4307,6 +4307,23 @@ class Scheduler(
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        if (
+            self.enable_hisparse
+            and self.hisparse_coordinator is not None
+            and hasattr(self, "disagg_decode_prealloc_queue")
+        ):
+            # Host-pool backpressure: per-rank HiSparse host KV pool state so
+            # routers/ops can see the admission constraint (free host tokens).
+            host_pool = self.hisparse_coordinator.mem_pool_host
+            ret["hisparse_host_pool"] = {
+                "free_tokens": int(host_pool.available_size()),
+                "total_tokens": int(host_pool.size),
+                "page_size": int(host_pool.page_size),
+                "prealloc_wait_events": int(
+                    self.disagg_decode_prealloc_queue.host_pool_wait_events
+                ),
+            }
+
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 

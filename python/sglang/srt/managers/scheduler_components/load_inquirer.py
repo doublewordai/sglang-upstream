@@ -120,6 +120,25 @@ class SchedulerLoadInquirer:
                 for req in queue
             )
 
+        # HiSparse host KV pool state (host-pool backpressure): the decode
+        # arm pins MLA latent in the host pool, so free host tokens are the
+        # admission constraint the dispatcher/metrics need to see.
+        host_pool_free_tokens = host_pool_total_tokens = host_pool_wait_events = 0
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and getattr(self, "enable_hisparse", False)
+            and getattr(self, "hisparse_coordinator", None) is not None
+        ):
+            try:
+                host_pool = self.hisparse_coordinator.mem_pool_host
+                host_pool_free_tokens = int(host_pool.available_size())
+                host_pool_total_tokens = int(host_pool.size)
+                host_pool_wait_events = int(
+                    self.get_disagg_decode_prealloc_queue().host_pool_wait_events
+                )
+            except (AttributeError, TypeError) as e:
+                logger.debug(f"HiSparse host pool metrics not available: {e}")
+
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
@@ -214,6 +233,9 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
+            host_pool_free_tokens=host_pool_free_tokens,
+            host_pool_total_tokens=host_pool_total_tokens,
+            host_pool_wait_events=host_pool_wait_events,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),
