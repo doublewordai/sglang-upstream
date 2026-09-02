@@ -1441,7 +1441,7 @@ class ServerArgs:
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         NS("serving"),
-    ] = False
+    ] = True
     reasoning_parser: A[Optional[str], NS("serving")] = None
     default_chat_template_kwargs: A[
         Optional[Dict[str, Any]],
