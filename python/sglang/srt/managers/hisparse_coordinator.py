@@ -788,6 +788,63 @@ class HiSparseCoordinator:
             device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
 
+    def _fast_backup_eligible(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> bool:
+        """Steady-state conditions for the GPU-side backup fast path.
+
+        True when no first-step skip is pending (each request's first decode step
+        after staging must take the generic path once) and every request's host
+        pool already covers this step's position (no page growth needed). Both
+        checks read CPU state only -- no device sync.
+        """
+        page_size = self.mem_pool_host.page_size
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            if self._skip_first[req_idx]:
+                return False
+            page_end = (
+                (int(seq_lens_cpu[i]) - 1 + page_size - 1) // page_size * page_size
+            )
+            if page_end > int(self.req_to_host_pool_allocated_len[req_idx]):
+                return False
+        return True
+
+    def _fast_backup_previous_token(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """GPU-side steady-state backup of the previous token (compress_ratio == 1).
+
+        backup_indices == the whole batch, so backup_req_indices/prev positions
+        are plain arithmetic and both loc vectors are single gathers. The launch
+        block mirrors the generic path exactly (same stream waits and events).
+        """
+        prev_pos = seq_lens - 1 - 1  # (seq_len - 1) // 1 - 1
+        buffer_slot = prev_pos.clamp(max=self.device_buffer_size)
+        host_locs = self.req_to_host_pool[req_pool_indices, prev_pos]
+        device_locs = self.req_to_device_buffer[req_pool_indices, buffer_slot]
+
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            self._backup_done_event.record()
+            host_locs.record_stream(self.decode_backup_stream)
+            device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
     def _eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,
@@ -807,6 +864,20 @@ class HiSparseCoordinator:
         - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
           token was produced this step.
         """
+        # [lane attn-streams] Steady-state fast path (SGLANG_HISPARSE_FAST_BACKUP,
+        # compress_ratio == 1): every request backs up its previous token, so the
+        # index list is the whole batch and both loc vectors are two gathers --
+        # no python-list -> pageable-H2D round-trip (measured ~2.2 ms host/step on
+        # GH200) and no per-request python loop. Falls back to the generic path on
+        # first-step skips or host-page growth.
+        if (
+            envs.SGLANG_HISPARSE_FAST_BACKUP.get()
+            and self.compress_ratio == 1
+            and self._fast_backup_eligible(seq_lens_cpu, req_pool_indices_cpu)
+        ):
+            self._fast_backup_previous_token(seq_lens, req_pool_indices)
+            return
+
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.

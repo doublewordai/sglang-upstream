@@ -1249,6 +1249,13 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+        # [lane attn-streams] Static FlashMLA schedule cache (long-context decode:
+        # every dsa_cache_seqlens entry equals dsa_index_topk, so the schedule is
+        # a per-bs constant) and the set of batch sizes whose paged-mqa schedule
+        # refresh was captured in-graph. See SGLANG_DSA_IN_GRAPH_METADATA.
+        self._flashmla_const_cache: Dict = {}
+        self._paged_mqa_in_graph: set = set()
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -1658,7 +1665,15 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        # [lane attn-streams] Skip when the refresh was captured in-graph (the
+        # captured refresh runs on every replay and reads the same static lens).
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and bs in self._paged_mqa_in_graph
+            and forward_mode.is_decode_or_idle()
+        ):
+            pass
+        elif is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -1863,7 +1878,14 @@ class DeepseekSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        # [lane attn-streams] Skip when the refresh was captured in-graph.
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and bs in self._paged_mqa_in_graph
+            and forward_mode.is_decode_or_idle()
+        ):
+            pass
+        elif is_cuda():
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
             else:
@@ -3431,6 +3453,57 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
         )
+
+    def _static_flashmla_for_decode(self, bs: int):
+        """[lane attn-streams] Constant FlashMLA schedule for [topk]*bs decode.
+
+        When every request's context length is >= dsa_index_topk, compute_dsa_seqlens
+        clips all rows to topk, so the schedule (and num_splits) depend only on bs.
+        The per-step recompute in the precompute path is then step-invariant and a
+        cached entry can be reused (bit-identical inputs -> bit-identical outputs).
+        """
+        entry = self._flashmla_const_cache.get(bs)
+        if entry is None:
+            lens = torch.full(
+                (bs,), self.dsa_index_topk, dtype=torch.int32, device=self.device
+            )
+            entry = self._compute_flashmla_metadata(cache_seqlens=lens, seq_len_q=1)
+            self._flashmla_const_cache[bs] = entry
+        return entry
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """[lane attn-streams] Capture the lens-dependent DeepGEMM metadata
+        refreshes inside the graph (SGLANG_DSA_IN_GRAPH_METADATA).
+
+        The fused decode metadata kernel (eager, pre-replay) fills the static
+        cache_seqlens buffer; the captured refresh below then rebuilds the
+        paged-mqa schedule / topk-v2 plan / ctx-lens mirror from it on every
+        replay, so the eager per-step refresh in _apply_cuda_graph_metadata /
+        init_forward_metadata_replay_cuda_graph_from_precomputed can be skipped.
+        """
+        if not envs.SGLANG_DSA_IN_GRAPH_METADATA.get():
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        bs = forward_batch.batch_size
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is None or metadata.paged_mqa_schedule_metadata is None:
+            return
+        lens2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+        if metadata.paged_mqa_ctx_lens_2d is None:
+            object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", lens2d)
+        else:
+            metadata.paged_mqa_ctx_lens_2d.copy_(lens2d)
+        metadata.paged_mqa_schedule_metadata.copy_(
+            deep_gemm.get_paged_mqa_logits_metadata(
+                lens2d, 64, deep_gemm.get_num_sms()
+            )
+        )
+        if metadata.topk_v2_plan is not None:
+            from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+            metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+        self._paged_mqa_in_graph.add(bs)
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata
