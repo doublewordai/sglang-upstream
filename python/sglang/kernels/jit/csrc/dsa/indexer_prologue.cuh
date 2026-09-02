@@ -76,7 +76,7 @@ load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id
 // (3 in-thread + 4 shuffle stages; identical pairing and fp32 add/sub ops),
 // so with identical fp32 inputs the result is bit-identical.
 template <bool kRoundBf16, typename DType>
-SGL_DEVICE void hadamard_128_inplace(float data[4], uint32_t lane_id, float scale) {
+SGL_DEVICE void hadamard_128_inplace(device::AlignedVector<float, 4>& data, uint32_t lane_id, float scale) {
   {
     const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
     data[0] = a0 + a1;
