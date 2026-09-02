@@ -175,8 +175,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                # spec workers don't support pipeline parallelism: run the
+                # draft as a stage-local pp_size=1 runner. Under PP+spec
+                # (prefill arm) this worker exists only on the LAST stage,
+                # whose pp-group rank holds the single NextN layer.
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
