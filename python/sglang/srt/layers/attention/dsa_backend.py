@@ -2017,10 +2017,62 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if forward_batch.forward_mode.is_target_verify():
+                # pd/mtp-hisparse: TARGET_VERIFY dispatches to forward_extend
+                # (base AttentionBackend.forward routes every non-decode mode
+                # here), so the verify page table must be built HERE, not in
+                # forward_decode. The generic translate below cannot be used:
+                # full_to_hisparse_device_index_mapping is write-steering
+                # state (alloc_device_buffer clears it at admission; only the
+                # current step's new tokens are ever set), so it would point
+                # the whole committed history at device row 0.
+                # Instead run one swap-in per draft position p (query rows
+                # p, n+p, 2n+p, ...): position p's causal range is
+                # [0, seq_len + p + 1) and its window of p+1 tokens written
+                # this step resolves via num_newest=p+1 (1:1 slots below
+                # device_buffer_size, reserved page above). Results are
+                # interleaved back to row order.
+                assert topk_indices is not None, (
+                    "hisparse target-verify requires the indexer's topk "
+                    "positions"
+                )
+                n = self.speculative_num_draft_tokens
+                topk_pos = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                bs = topk_pos.shape[0] // n
+                tk = topk_pos.view(bs, n, -1)
+                out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
+                outv = out.view(bs, n, -1)
+                for p in range(n):
+                    pt = self.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens + (p + 1),
+                        tk[:, p].contiguous(),
+                        layer.layer_id,
+                        num_newest=p + 1,
+                    )
+                    outv[:, p].copy_(pt)
+                if (
+                    envs.SGLANG_MTP_DEBUG.get()
+                    and layer.layer_id == 0
+                    and not getattr(self, "_mtp_dbg_fe_logged", False)
+                ):
+                    self._mtp_dbg_fe_logged = True
+                    logger.warning(
+                        "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
+                        "row0[:12] %s | seq_lens %s out_cache_loc %s",
+                        tuple(out.shape),
+                        out[0, :12].tolist(),
+                        forward_batch.seq_lens[:4].tolist(),
+                        forward_batch.out_cache_loc[:8].tolist(),
+                    )
+                page_table_1 = out
+            else:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = (
+                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        page_table_1
+                    ).to(torch.int32)
+                )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2268,32 +2320,15 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
-            if forward_batch.forward_mode.is_target_verify():
-                # pd/mtp-hisparse: one swap-in per draft position p (query rows
-                # p, n+p, 2n+p, ...); position p sees the window of p+1 tokens
-                # written this step. Results are interleaved back to row order.
-                n = self.speculative_num_draft_tokens
-                bs = topk_indices.shape[0] // n
-                tk = topk_indices.view(bs, n, -1)
-                out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
-                outv = out.view(bs, n, -1)
-                for p in range(n):
-                    pt = self.hisparse_coordinator.swap_in_selected_pages(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens + (p + 1),
-                        tk[:, p].contiguous(),
-                        layer.layer_id,
-                        num_newest=p + 1,
-                    )
-                    outv[:, p].copy_(pt)
-                page_table_1 = out
-            else:
-                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    topk_indices,
-                    layer.layer_id,
-                )
+            # NOTE: TARGET_VERIFY never reaches forward_decode (base
+            # AttentionBackend.forward routes it to forward_extend); the
+            # hisparse verify page table is built in forward_extend.
+            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                topk_indices,
+                layer.layer_id,
+            )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
@@ -3419,7 +3454,13 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                # pd/mtp-hisparse: the verify page table is built by the
+                # per-position swap-in from POSITIONS; the fused topk would
+                # emit logical locs (real-page-table domain) instead.
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
