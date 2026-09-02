@@ -1660,9 +1660,29 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
+            "hicache_host_pool_tokens": self._get_hicache_host_pool_tokens(),
         }
 
         return result_dict
+
+    def _get_hicache_host_pool_tokens(self) -> Optional[int]:
+        """Token capacity of this rank's hierarchical-cache host tier, if any.
+
+        A fixed --hicache-size buys a host tier whose token capacity depends
+        on the per-token host bytes of this rank's layer set, on PP-group
+        synchronization and on page alignment, so only this process knows it
+        once the pool is allocated. The DP controller sizes its prefix
+        affinity index from this value; see
+        retained_tokens_per_device_token in data_parallel_controller.
+        """
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        size = getattr(host_pool, "size", None)
+        if size is None:
+            return None
+        try:
+            return int(size)
+        except (TypeError, ValueError):
+            return None
 
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
