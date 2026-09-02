@@ -299,6 +299,11 @@ class HiSparseCoordinator:
         # N steps from commit_verify_tokens (outside the CUDA graph).
         self._miss_log_every = int(envs.SGLANG_HISPARSE_MISS_LOG.get())
         self._miss_log_seen = 0
+        # Debug guard: sample each step's swap-in selection and verify the
+        # distinct-positions invariant off-graph (see _run_swap_in_kernel).
+        self._debug_check_topk = bool(envs.SGLANG_DEBUG_HISPARSE_CHECK_TOPK.get())
+        self._debug_topk_stash = None
+        self._debug_topk_num_reqs = 0
         self._miss_src_v = None
         self._miss_dst_v = None
         self._miss_count_v = None
@@ -789,8 +794,29 @@ class HiSparseCoordinator:
     def _log_verify_misses(
         self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
     ) -> None:
-        """Diagnostic (SGLANG_HISPARSE_MISS_LOG=N): every N verify steps, log the
-        per-position miss counts recorded by the last anchor group's plans."""
+        """Diagnostics (SGLANG_HISPARSE_MISS_LOG=N / SGLANG_DEBUG_HISPARSE_CHECK_TOPK):
+        every N verify steps, log the per-position miss counts recorded by the
+        last anchor group's plans; with the topk check on, also verify the
+        distinct-positions invariant of the last swap-in selection."""
+        if self._debug_check_topk and self._debug_topk_stash is not None:
+            sel = self._debug_topk_stash[: self._debug_topk_num_reqs].cpu()
+            for r in range(sel.shape[0]):
+                row = sel[r].tolist()
+                seen, dups = set(), []
+                for t in row:
+                    if t < 0:
+                        continue
+                    if t in seen:
+                        dups.append(t)
+                    else:
+                        seen.add(t)
+                if dups:
+                    raise RuntimeError(
+                        "HiSparse swap-in selection contains duplicate positions "
+                        f"(req row {r}: {sorted(set(dups))[:8]}...); the fused "
+                        "kernel requires distinct positions per row "
+                        "(miss-compaction race)."
+                    )
         if (
             self._miss_log_every <= 0
             or self._miss_count_v is None
@@ -1341,6 +1367,16 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         if num_newest != 1:
             assert not self.is_dsv4_hisparse, "MTP verify swap-in: DSA hisparse only"
+        if self._debug_check_topk:
+            # Invariant (green-contexts finding): every row of top_k_result must
+            # contain DISTINCT token positions. The kernel's miss compaction
+            # assumes miss_offset < my_token_idx; duplicate positions clobber a
+            # pending scratch read (inter-warp race, run-to-run divergence).
+            # Production top-k is distinct by construction; this debug guard
+            # (SGLANG_DEBUG_HISPARSE_CHECK_TOPK=1) samples the last call's
+            # selection per step and raises if the invariant is violated.
+            self._debug_topk_stash = top_k_result.detach()
+            self._debug_topk_num_reqs = num_reqs
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla

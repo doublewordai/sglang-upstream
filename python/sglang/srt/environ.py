@@ -591,6 +591,9 @@ class Envs:
     # Diagnostic: log HiSparse verify-step miss counts (per draft position,
     # last anchor group's plans) every N verify steps; 0 = off.
     SGLANG_HISPARSE_MISS_LOG = EnvInt(0)
+    # Debug: verify each step's swap-in selection contains distinct token
+    # positions (kernel miss-compaction invariant; see hisparse_coordinator).
+    SGLANG_DEBUG_HISPARSE_CHECK_TOPK = EnvBool(False)
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
