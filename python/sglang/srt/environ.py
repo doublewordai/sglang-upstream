@@ -1367,6 +1367,11 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Full-grid decode-time top-k (jit/csrc/dsa/topk_decode_fg.cuh) replacing
+    # sgl_kernel fast_topk_v2 on decode/verify shapes (row_starts is None,
+    # batch <= 64, fp32/bf16). Same selection semantics; each row is read
+    # exactly twice by the whole grid instead of one block per row.
+    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

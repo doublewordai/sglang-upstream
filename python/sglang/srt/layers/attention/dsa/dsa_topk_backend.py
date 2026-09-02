@@ -37,6 +37,31 @@ class DSATopKBackend(Enum):
     def should_use_topk_v2(self) -> bool:
         return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
+    @staticmethod
+    def _should_use_decode_fg(
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor],
+    ) -> bool:
+        """Gate the full-grid decode top-k kernel (SGLANG_DSA_TOPK_DECODE_FG).
+
+        Only decode / spec-verify shapes: raw-position selection with
+        row_starts is None, a small expanded batch, and fp32/bf16 logits with
+        unit inner stride (the DeepGEMM indexer output). Everything else
+        (prefill row_starts, huge batches, other dtypes) keeps fast_topk_v2.
+        """
+        return (
+            envs.SGLANG_DSA_TOPK_DECODE_FG.get()
+            and row_starts is None
+            and score.dim() == 2
+            and score.stride(1) == 1
+            and 0 < topk <= 2048
+            and 0 < score.shape[0] <= 64
+            and score.dtype in (torch.float32, torch.bfloat16)
+            and score.is_cuda
+        )
+
     def topk_func(
         self,
         score: torch.Tensor,
@@ -45,6 +70,13 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
+            if self._should_use_decode_fg(score, lengths, topk, row_starts):
+                from sglang.kernels.ops.attention.dsa.topk_decode_fg import (
+                    topk_decode_fg,
+                )
+
+                return topk_decode_fg(score, lengths, topk)
+
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
