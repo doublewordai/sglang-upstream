@@ -2017,6 +2017,31 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
+            if (
+                envs.SGLANG_MTP_DEBUG.get()
+                and forward_batch.forward_mode.is_target_verify()
+                and layer.layer_id == 0
+                and not getattr(self, "_mtp_dbg_fe_logged", False)
+            ):
+                self._mtp_dbg_fe_logged = True
+                _xlat = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                )
+                _tot = _xlat.numel()
+                _zeros = int((_xlat == 0).sum().item())
+                _negs = int((_xlat < 0).sum().item())
+                logger.warning(
+                    "MTP_DEBUG fwd_extend verify L0: pt %s zeros %d/%d negs %d "
+                    "| row0 logical %s | row0 xlat %s | seq_lens %s out_cache_loc %s",
+                    tuple(page_table_1.shape),
+                    _zeros,
+                    _tot,
+                    _negs,
+                    page_table_1[0, :12].tolist(),
+                    _xlat[0, :12].tolist(),
+                    forward_batch.seq_lens[:4].tolist(),
+                    forward_batch.out_cache_loc[:8].tolist(),
+                )
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
@@ -2269,6 +2294,15 @@ class DeepseekSparseAttnBackend(
 
         if self.hisparse_coordinator is not None:
             if forward_batch.forward_mode.is_target_verify():
+                if (
+                    envs.SGLANG_MTP_DEBUG.get()
+                    and not getattr(self, "_mtp_dbg_fd_logged", False)
+                ):
+                    self._mtp_dbg_fd_logged = True
+                    logger.warning(
+                        "MTP_DEBUG fwd_DECODE verify branch reached (UNEXPECTED: "
+                        "target-verify should dispatch to forward_extend)"
+                    )
                 # pd/mtp-hisparse: one swap-in per draft position p (query rows
                 # p, n+p, 2n+p, ...); position p sees the window of p+1 tokens
                 # written this step. Results are interleaved back to row order.
