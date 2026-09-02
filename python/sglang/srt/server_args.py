@@ -3470,6 +3470,20 @@ class ServerArgs:
         "Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
         NS("serving"),
     ] = False
+    enable_delta_tokenizer: A[
+        bool,
+        "Cache the previous prompt/ids per session and tokenize only the appended "
+        "suffix on warm turns (exact ids; falls back to a full encode when no "
+        "special-token boundary is shared). Speeds up agent traffic that resends "
+        "the full conversation every turn.",
+        NS("serving"),
+    ] = False
+    delta_tokenizer_max_sessions: A[
+        int,
+        "[Only used if --enable-delta-tokenizer is set] LRU capacity (sessions) of "
+        "the delta tokenizer cache.",
+        NS("serving"),
+    ] = 64
     dynamic_batch_tokenizer_batch_size: A[
         int,
         "[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
