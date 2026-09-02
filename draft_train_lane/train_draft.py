@@ -24,7 +24,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from draft_data import RealData, SyntheticData, make_batch  # noqa: E402
-from draft_model import HIDDEN, DraftNextN, draft_loss  # noqa: E402
+from draft_model import HIDDEN, DraftNextN, chain_loss, draft_loss  # noqa: E402
 
 
 def build_model(weights_dir: str, device) -> DraftNextN:
@@ -93,6 +93,12 @@ def main():
     ap.add_argument("--micro-bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--feature-weight", type=float, default=1.0)
+    ap.add_argument("--chain-weight", type=float, default=0.0,
+                    help=">0 mixes EAGLE-3.1-style chain-rollout loss (depth stability)")
+    ap.add_argument("--chain-len", type=int, default=8)
+    ap.add_argument("--chains-per-window", type=int, default=2)
+    ap.add_argument("--chain-detach", action="store_true",
+                    help="detach the draft's own hidden feedback (no BPTT through the chain)")
     ap.add_argument("--val-every", type=int, default=50)
     ap.add_argument("--val-windows", type=int, default=16)
     ap.add_argument("--save-every", type=int, default=200)
@@ -201,6 +207,22 @@ def main():
             loss, m = draft_loss(
                 model, tokens, prev, pos, args.feature_weight, return_metrics=True
             )
+            if args.chain_weight > 0:
+                closs, cm = chain_loss(
+                    model,
+                    tokens[:1],
+                    prev[:1],
+                    pos[:1],
+                    args.feature_weight,
+                    chain_len=args.chain_len,
+                    n_chains=args.chains_per_window,
+                    detach_feedback=args.chain_detach,
+                    return_metrics=True,
+                )
+                loss = loss + args.chain_weight * closs
+                m = dict(m)
+                m["chain_ce"] = cm["ce"]
+                m["chain_top1_d0123"] = cm["top1_by_depth"][:4]
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -215,6 +237,11 @@ def main():
                 "top1": m["top1"],
                 "tok_s": step * 10 * step_tokens / max(dt, 1e-9),
             }
+            if "chain_ce" in m:
+                msg["chain_ce"] = m["chain_ce"]
+                msg["chain_top1_by_depth"] = [
+                    round(x, 4) for x in m["chain_top1_d0123"]
+                ]
             print(json.dumps(msg), flush=True)
             logf.write(json.dumps(msg) + "\n")
             logf.flush()

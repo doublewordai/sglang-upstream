@@ -262,3 +262,86 @@ def draft_loss(
             )
         return loss, {"ce": ce.item(), "mse": mse.item(), "top1": top1, "top4": top4}
     return loss
+
+
+def chain_loss(
+    model,
+    tokens: torch.Tensor,  # [B, n]
+    prev_hidden: torch.Tensor,  # [B, n, H] target hiddens at t-1
+    positions: torch.Tensor,  # [B, n]
+    feature_weight: float = 1.0,
+    chain_len: int = 8,
+    n_chains: int = 2,
+    detach_feedback: bool = False,
+    return_metrics: bool = False,
+    generator: torch.Generator | None = None,
+):
+    """EAGLE-3.1-style chain fine-tune (depth-stability variant).
+
+    Seeds a chain with the TARGET hidden at one window position (exactly the
+    inference re-seed after each verify), then rolls the draft's OWN hidden
+    forward for chain_len steps: step j's input is
+    eh_proj([enorm(Emb(x_{s+j})); hnorm(g_{j-1})]) with g_{-1} = target hidden.
+    The layer is re-run over the growing chain prefix (equivalent to inference's
+    accumulated draft KV: each position's input is fixed once computed).
+
+    Loss per step: CE(lm_head(g_j), x_{s+j+1}) + feature_weight *
+    MSE(g_j, h_target_{s+j}). Metrics report top-1 BY DEPTH, which is the
+    diagnostic for the deep-draft drift the 3.1 architecture addresses.
+    """
+    B, n = tokens.shape
+    device = tokens.device
+    losses = []
+    m = {"ce": [], "mse": [], "top1_by_depth": [0] * chain_len, "chains": 0}
+    for b in range(B):
+        for c in range(n_chains):
+            lo = 1
+            hi = n - chain_len - 1
+            if hi <= lo:
+                continue
+            if generator is not None:
+                s = int(torch.randint(lo, hi, (1,), generator=generator, device=device))
+            else:
+                s = int(torch.randint(lo, hi, (1,), device=device))
+            gs = []
+            for j in range(chain_len):
+                L = j + 1
+                prev = [prev_hidden[b, s - 1]] + [
+                    g.detach() if detach_feedback else g for g in gs
+                ]
+                prev_chunk = torch.stack(prev).unsqueeze(0)  # [1, L, H]
+                tok_chunk = tokens[b, s : s + L].unsqueeze(0)  # [1, L]
+                pos_chunk = positions[b, s : s + L].unsqueeze(0)  # [1, L]
+                g_all, lg_all = model(
+                    tok_chunk, prev_chunk, pos_chunk, compute_logits=True
+                )
+                g_j = g_all[0, -1]  # [H]
+                gs.append(g_j)
+                # next-token CE from the last position's logits (computed inside
+                # the model call: FSDP params are only valid there)
+                lg = lg_all[0, -1]
+                label = tokens[b, s + j + 1]
+                ce = torch.nn.functional.cross_entropy(
+                    lg.float().unsqueeze(0), label.unsqueeze(0)
+                )
+                # feature loss vs the target hidden at s+j
+                feat = prev_hidden[b, s + j]
+                mse = torch.nn.functional.mse_loss(g_j.float(), feat.float())
+                losses.append(ce + feature_weight * mse)
+                m["ce"].append(ce.item())
+                m["mse"].append(mse.item())
+                with torch.no_grad():
+                    if int(lg.argmax()) == int(label):
+                        m["top1_by_depth"][j] += 1
+                m["chains"] += 1
+    if not losses:
+        z = torch.zeros(1, device=device, requires_grad=True)
+        return (z, m) if return_metrics else z
+    loss = torch.stack(losses).mean()
+    if return_metrics:
+        m["ce"] = sum(m["ce"]) / len(m["ce"])
+        m["mse"] = sum(m["mse"]) / len(m["mse"])
+        if m["chains"]:
+            m["top1_by_depth"] = [x / m["chains"] for x in m["top1_by_depth"]]
+        return loss, m
+    return loss
