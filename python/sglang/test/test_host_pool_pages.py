@@ -92,9 +92,13 @@ def _pattern_roundtrip(t: torch.Tensor) -> bool:
     stride = max(1, v.numel() // 4096)
     sel = v[::stride]
     sel.copy_(torch.arange(sel.numel(), dtype=torch.uint8))
-    v[:1024] = torch.arange(1024, dtype=torch.uint8)
-    v[-1024:] = torch.arange(1024, dtype=torch.uint8) + 1
-    assert v[0].item() == 0 and v[-1].item() == 0
+    h = min(1024, v.numel())
+    v[:h] = torch.arange(h, dtype=torch.uint8)
+    if v.numel() > h:
+        v[-h:] = torch.arange(h, dtype=torch.uint8) + 1
+    assert v[0].item() == 0
+    if v.numel() > h:
+        assert v[-1].item() == 0, (v[-1].item(),)
     assert bool(torch.equal(v[::stride], torch.arange(sel.numel(), dtype=torch.uint8)))
     return True
 
