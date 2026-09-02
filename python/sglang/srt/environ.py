@@ -588,6 +588,13 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # HiSparse IO streams (write-staging / decode-backup / shared-index
+    # prefetch / the swap-in gather) bound to a CUDA green context holding this
+    # many SMs (0 = normal streams, feature off). Bounded SM footprint for the
+    # hicache-like side traffic so it cannot steal SMs from the decode critical
+    # path; CUDA-graph capture works across primary+green streams (verified on
+    # GH200, driver 565.57.01 / CUDA 13 userspace).
+    SGLANG_HISPARSE_GREEN_CTX_SMS = EnvInt(0)
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
