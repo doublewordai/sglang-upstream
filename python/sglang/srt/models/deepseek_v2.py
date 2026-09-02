@@ -451,6 +451,10 @@ class DeepseekV2MLP(nn.Module):
                 x = gate_up.new_empty((M, N // 2))
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                _PMOE_FUSED_ACT_QUANT,
+            )
+
             if (
                 _PMOE_FUSED_ACT_QUANT
                 and self.swiglu_limit is None
