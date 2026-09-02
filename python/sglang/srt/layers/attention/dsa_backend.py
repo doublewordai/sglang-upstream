@@ -879,6 +879,10 @@ class DeepseekSparseAttnBackend(
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
         real_page_table = self._transform_table_1_to_real(page_table)
+        if real_page_table is page_table:
+            # Never alias: the per-token gather below must not rewrite the
+            # per-request page table the PAGED transform reads.
+            real_page_table = page_table.clone()
         if real_page_table.shape[0] != T:
             # Per-request table -> per-token rows via the row->request map
             # (ghost rows read row 0's pages; never dereferenced, cache 0).
@@ -952,15 +956,16 @@ class DeepseekSparseAttnBackend(
         tier = int(live_layout.graph_num_tokens)
         key = (bs, tier)
         if key not in self.ragged_verify_cuda_graph_metadata:
+            # Capture (or first use). The page-table buffer must be FULL WIDTH
+            # (like the uniform verify capture): capture-time seq_lens are fill
+            # values, and replay copies real (long) contexts into it.
             metadata = self._build_ragged_target_verify_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 layout=live_layout,
-                seq_lens_cpu=seq_lens_cpu,
-                page_table_width=self.req_to_token.shape[1]
-                if seq_lens_cpu is None
-                else None,
+                seq_lens_cpu=None,
+                page_table_width=self.req_to_token.shape[1],
             )
             self.ragged_verify_cuda_graph_metadata[key] = metadata
             self._ragged_capture_layouts[key] = live_layout
@@ -1027,13 +1032,15 @@ class DeepseekSparseAttnBackend(
             compute_cu_seqlens(metadata.dsa_cache_seqlens_int32[:size])[1:]
         )
 
-        real_page_table = self._transform_table_1_to_real(metadata.page_table_1)
-        if real_page_table.shape[0] != T:
+        real_src = self._transform_table_1_to_real(metadata.page_table_1)
+        if real_src is metadata.page_table_1:
+            real_src = metadata.page_table_1.clone()
+        if real_src.shape[0] != T:
             gather_rows = torch.where(
                 valid, safe_req, torch.zeros_like(safe_req)
             )
-            real_page_table = real_page_table[gather_rows]
-        metadata.real_page_table[:T].copy_(real_page_table)
+            real_src = real_src[gather_rows]
+        metadata.real_page_table[:T].copy_(real_src)
 
         seqlens_32_2d = seqlens_expanded.contiguous().view(-1, 1)
         self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
