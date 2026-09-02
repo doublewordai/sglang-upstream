@@ -652,6 +652,10 @@ class ModelRunner:
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
+            allow_pp_mtp=(
+                self.server_args.pp_size > 1
+                and self.server_args.disaggregation_mode == "prefill"
+            ),
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
