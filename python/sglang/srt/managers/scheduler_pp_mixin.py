@@ -102,9 +102,9 @@ class SchedulerPPMixin:
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work_nonblocking(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        self.send_req_work += self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
                             async_send=True,
                         )
@@ -938,6 +938,32 @@ class SchedulerPPMixin:
         for p2p_work in work:
             p2p_work.work.wait()
         work.clear()
+
+    def _pp_commit_comm_work_nonblocking(self: Scheduler, work: List[P2PWork]) -> None:
+        """Commit async req-send works, but never block on incomplete ones.
+
+        A downstream PP stage can legitimately park in _pp_recv_proxy_tensors
+        (e.g. it scheduled a batch whose upstream is still gated on a HiCache
+        storage prefetch) and stop consuming the req channel. Blocking here
+        wedges this loop BEFORE get_next_batch_to_run -> check_hicache_events
+        can observe the local prefetch completion, so the upstream can never
+        produce the proxy tensors the downstream is waiting for: pipeline
+        deadlock. Incomplete works stay in the list and are retried on the
+        next iteration; the send buffers are small (pickled req lists), so
+        carrying them for the duration of a storage prefetch is safe.
+        """
+        pending = []
+        for p2p_work in work:
+            w = p2p_work.work
+            try:
+                completed = w.is_completed()
+            except Exception:
+                completed = None
+            if completed is False:
+                pending.append(p2p_work)
+            else:
+                w.wait()
+        work[:] = pending
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
