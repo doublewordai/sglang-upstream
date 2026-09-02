@@ -34,6 +34,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -830,6 +831,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
+                cold_trace(
+                    "dec_handshake_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
@@ -1148,6 +1154,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
+            _pa_t0 = time.perf_counter()
             try:
                 dst_kv_indices = self._pre_alloc(
                     decode_req.req,
@@ -1164,6 +1171,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 self._note_host_pool_wait(0)
                 break
+            if cold_trace_enabled():
+                cold_trace(
+                    "dec_prealloc_alloc",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                    dt_ms=(time.perf_counter() - _pa_t0) * 1000,
+                    input_len=origin_input_len,
+                    prefix_len=prefix_len,
+                    total_prefix_len=total_prefix_len,
+                )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1368,6 +1385,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            cold_trace(
+                "dec_metadata_sent",
+                rid=decode_req.req.rid,
+                room=decode_req.req.bootstrap_room,
+                dst_tokens=len(kv_indices),
+                dst_pages=len(page_indices),
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2234,6 +2258,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                cold_trace(
+                    "dec_kv_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
@@ -2478,6 +2507,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled():
+            for req in can_run_list:
+                cold_trace("dec_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

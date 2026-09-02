@@ -49,6 +49,7 @@ from fastapi import BackgroundTasks
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -810,6 +811,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        if cold_trace_enabled() and isinstance(obj, GenerateReqInput) and obj.is_single:
+            cold_trace(
+                "tm_recv",
+                rid=obj.rid,
+                room=getattr(obj, "bootstrap_room", None),
+                mode=str(self.server_args.disaggregation_mode),
+                n_in=(len(obj.input_ids) if obj.input_ids is not None else -1),
+                stream=1 if obj.stream else 0,
+            )
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
