@@ -453,7 +453,8 @@ class DeepseekV2MLP(nn.Module):
             if (
                 _PMOE_FUSED_ACT_QUANT
                 and self.swiglu_limit is None
-                and self.down_proj.weight.dtype == torch.uint8
+                and self.down_proj.weight.dtype
+                in (torch.uint8, torch.float8_e4m3fn)
                 and hasattr(self.down_proj, "weight_scale_inv")
             ):
                 # prefill-moe lane: fused SiLU*mul + fp8 group quant (bit-exact
