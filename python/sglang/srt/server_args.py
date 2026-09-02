@@ -804,6 +804,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    chunked_prefill_size_small: A[
+        Optional[int],
+        "When set (with chunked prefill enabled), while a short or warm request is waiting in the local queue, chunked prefills advance in chunks of this size instead of --chunked-prefill-size, so the waiting request can join the next prefill step instead of waiting for a full-size chunk to retire. Short = at most 16384 new (uncached) tokens; warm = prefix cache hit of at least 90 percent. Like --chunked-prefill-size this is a global size that is divided by dp_size under DP attention. Default None (off: always use --chunked-prefill-size).",
+        NS("schedule"),
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -6728,6 +6733,10 @@ class ServerArgs:
             assert self.tp_size % self.dp_size == 0
             original_chunked_prefill_size = self.chunked_prefill_size
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
+            if self.chunked_prefill_size_small is not None:
+                self.chunked_prefill_size_small = (
+                    self.chunked_prefill_size_small // self.dp_size
+                )
             logger.warning(
                 f"DP attention is enabled. chunked prefill size is adjusted "
                 f"from {original_chunked_prefill_size} to {self.chunked_prefill_size}."

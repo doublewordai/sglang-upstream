@@ -208,6 +208,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1189,6 +1190,21 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Adaptive small chunking (--chunked-prefill-size-small): while a
+        # short or warm request waits, chunked prefills advance in small
+        # chunks so the waiting request can join the next prefill step.
+        self.chunked_prefill_size_small = get_schedule().chunked_prefill_size_small
+        if self.chunked_prefill_size_small is not None and (
+            self.chunked_prefill_size is None
+            or self.chunked_prefill_size_small <= 0
+            or self.chunked_prefill_size_small >= self.chunked_prefill_size
+        ):
+            logger.warning(
+                f"--chunked-prefill-size-small={self.chunked_prefill_size_small} "
+                f"is ignored (chunked prefill must be enabled and its size "
+                f"{self.chunked_prefill_size} must be larger); using fixed chunks."
+            )
+            self.chunked_prefill_size_small = None
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -3210,6 +3226,38 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _adaptive_chunk_small_waiting(self) -> bool:
+        """True if a short or warm request is waiting in the local queue.
+
+        Short: at most 16384 new (uncached) tokens. Warm: prefix cache hit of
+        at least 90%. Long prompts need a radix match to classify; the result
+        is cached on the request and refreshed every 64 scheduler steps (the
+        matched prefix can grow while the request waits).
+        """
+        short_new_tokens = 16384
+        warm_prefix_ratio = 0.9
+        reclassify_interval = 64
+        for req in self.waiting_queue:
+            fill_len = len(req.origin_input_ids) + len(req.output_ids)
+            if fill_len <= short_new_tokens:
+                return True
+            state = getattr(req, "_adaptive_chunk_prefix_state", None)
+            if (
+                state is None
+                or self.forward_ct - state[0] >= reclassify_interval
+            ):
+                match_prefix_for_req(self.tree_cache, req)
+                hit = int(req.num_matched_prefix_tokens)
+                req._adaptive_chunk_prefix_state = (self.forward_ct, hit)
+            else:
+                hit = state[1]
+            if (
+                fill_len - hit <= short_new_tokens
+                or hit >= warm_prefix_ratio * fill_len
+            ):
+                return True
+        return False
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3275,6 +3323,26 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # Adaptive small chunking: while a short/warm request waits, cap how
+        # far any chunked prefill advances this step; the remaining chunk
+        # budget lets the waiting request join this step's prefill batch.
+        chunked_req_chunk_cap = None
+        if self.chunked_prefill_size_small is not None:
+            small_waiting = self._adaptive_chunk_small_waiting()
+            if small_waiting:
+                chunked_req_chunk_cap = min(
+                    self.chunked_prefill_size_small, chunked_prefill_size
+                )
+            logger.debug(
+                "[adaptive-chunk] small_waiting=%s chunk_budget=%d "
+                "chunked_req_cap=%s waiting_queue=%d chunked_req_inflight=%s",
+                small_waiting,
+                chunked_prefill_size,
+                chunked_req_chunk_cap,
+                len(self.waiting_queue),
+                self.chunked_req is not None,
+            )
+
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
         attn_backend = self.tp_worker.model_runner.attn_backend
@@ -3300,6 +3368,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            chunked_req_chunk_cap=chunked_req_chunk_cap,
         )
 
         if self.chunked_req is not None:
