@@ -332,6 +332,16 @@ class DeepseekSparseAttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self._hisparse_verify_pt = None
         self._hisparse_verify_page_table = _dsa_hisparse_verify_page_table.__get__(self)
+        # pd/mtp-hisparse: allocate the verify page table before any CUDA-graph
+        # capture (a tensor allocated inside capture lives in that graph's pool).
+        _n_draft = int(get_spec().speculative_num_draft_tokens or 0)
+        if self.hisparse_coordinator is not None and _n_draft > 1:
+            _max_reqs = int(model_runner.req_to_token_pool.size)
+            self._hisparse_verify_pt = torch.empty(
+                (_max_reqs * _n_draft, int(self.hisparse_coordinator.top_k)),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
