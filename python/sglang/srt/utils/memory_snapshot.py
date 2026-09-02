@@ -1,14 +1,18 @@
 """Env-gated CUDA memory snapshot / peak tracking for allocation tracing.
 
-Enabled by setting SGLANG_MEM_SNAPSHOT_DIR=<dir>. Inert otherwise (no history
-recording, no dumps, hooks are cheap no-ops).
+Enabled by setting SGLANG_MEM_SNAPSHOT_DIR=<dir>. Inert otherwise.
+
+How it works: ModelRunner.forward is wrapped per-instance (the model itself is
+invoked via model.forward(...) which bypasses nn.Module hooks, but the decoder
+layers are called via Module.__call__ so a layer pre-hook works for mid-forward
+dumps). A stack handles the draft/target nesting of speculative decoding; peak
+stats are reset only at the outermost forward.
 
 Env knobs:
-  SGLANG_MEM_SNAPSHOT_DIR          directory for pickle snapshots + peak.jsonl
+  SGLANG_MEM_SNAPSHOT_DIR          directory for pickle snapshots + peaks.jsonl
   SGLANG_MEM_SNAPSHOT_MAX_ENTRIES  history ring size (default 200000)
   SGLANG_MEM_SNAPSHOT_LAYER        decoder layer index for mid-forward dumps (default 40)
   SGLANG_MEM_SNAPSHOT_MIDFORWARD   comma list mode:count of mid-forward snapshot triggers
-                                   (default "DECODE:1,TARGET_VERIFY:1,EXTEND:2")
   SGLANG_MEM_SNAPSHOT_EVERY        track peaks on every Nth batch of each mode (default 10)
 """
 
@@ -20,7 +24,7 @@ import os
 import pickle
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
@@ -45,9 +49,9 @@ _EVERY = int(os.getenv("SGLANG_MEM_SNAPSHOT_EVERY", "10"))
 _history_on = False
 _midforward_left: Dict[str, int] = dict(_MIDFORWARD)
 _mode_counts: Dict[str, int] = defaultdict(int)
-_installed = set()
+_layer_hook_installed = False
 _pending_midforward = False
-_last_info: Dict[str, Any] = {}
+_stack: list = []  # outermost-first list of info dicts
 
 GB = 1024**3
 
@@ -72,7 +76,7 @@ def _dump_snapshot(tag: str):
             return
         _ensure_history()
         os.makedirs(_DIR, exist_ok=True)
-        snap = torch.cuda.memory.snapshot()
+        snap = torch.cuda.memory._snapshot()
         path = os.path.join(_DIR, f"snap_{tag}_{time.time():.3f}.pkl")
         with open(path, "wb") as f:
             pickle.dump(snap, f)
@@ -96,115 +100,117 @@ def memsnap_phase(tag: str):
         _dump_snapshot(tag)
 
 
-def install_memsnap_hooks(model_runner, model):
-    """Register per-model-call peak tracking + optional mid-forward snapshot.
-
-    Called once per ModelRunner after its model exists. The runner's forward()
-    calls memsnap_forward_begin() with the ForwardBatch; the module hooks here
-    do reset/measure around the nn.Module call (covers eager and graph capture;
-    replay does not allocate).
-    """
-    global _installed
-    if not _ENABLED or model is None or id(model) in _installed:
-        return
-    _installed.add(id(model))
-    _ensure_history()
-
+def _find_layers(model):
     import torch.nn as nn
 
-    # find the decoder layer ModuleList (model.model.layers for GLM/DS-style)
-    layers = None
     cand = getattr(model, "model", model)
     layers = getattr(cand, "layers", None)
-    if not isinstance(layers, nn.ModuleList) or len(layers) <= _LAYER:
-        logger.info(f"[mem-snap] no decoder layer list with >{_LAYER} layers found; mid-forward dump disabled")
-        layers = None
+    if isinstance(layers, nn.ModuleList) and len(layers) > _LAYER:
+        return layers
+    return None
 
-    def _pre(module, args):
-        global _pending_midforward
-        if not _last_info.get("track", False):
-            return
-        torch.cuda.reset_peak_memory_stats()
-        _pending_midforward = _should_midforward()
 
-    def _post(module, args, output):
-        global _pending_midforward
-        if not _last_info.get("track", False):
-            _pending_midforward = False
-            return
-        try:
-            info = dict(_last_info)
-            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-            row = {
-                "t": time.time(),
-                "mode": info.get("mode", "?"),
-                "bs": info.get("bs", 0),
-                "ntok": info.get("ntok", 0),
-                "alloc_before": info.get("alloc_before", 0),
-                "peak": peak,
-                "transient": peak - info.get("alloc_before", 0),
-            }
-            os.makedirs(_DIR, exist_ok=True)
-            with open(os.path.join(_DIR, "peaks.jsonl"), "a") as f:
-                f.write(json.dumps(row) + "\n")
-            logger.info(
-                f"[mem-snap] peak mode={row['mode']} bs={row['bs']} ntok={row['ntok']} "
-                f"alloc_before={row['alloc_before'] / GB:.3f} peak={peak / GB:.3f} "
-                f"transient={(peak - row['alloc_before']) / GB:.3f} GiB"
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[mem-snap] post-hook failed: {e}")
+def install_memsnap_hooks(model_runner, model):
+    """Wrap ModelRunner.forward + install the layer mid-forward dump hook."""
+    global _layer_hook_installed
+    if not _ENABLED or getattr(model_runner, "_memsnap_wrapped", False):
+        return
+    _ensure_history()
+
+    layers = _find_layers(model)
 
     def _layer_pre(module, args):
         global _pending_midforward
         if _pending_midforward and not torch.cuda.is_current_stream_capturing():
             _pending_midforward = False
-            info = dict(_last_info)
+            info = _stack[-1] if _stack else {}
             _dump_snapshot(
                 f"midforward_{info.get('mode', '?')}_bs{info.get('bs', 0)}_tok{info.get('ntok', 0)}"
             )
 
-    model.register_forward_pre_hook(_pre)
-    model.register_forward_hook(_post)
-    if layers is not None:
+    if layers is not None and not _layer_hook_installed:
         layers[_LAYER].register_forward_pre_hook(_layer_pre)
+        _layer_hook_installed = True
+
+    orig_forward = model_runner.forward
+
+    def wrapped(forward_batch, *args, **kwargs):
+        _begin(forward_batch)
+        try:
+            return orig_forward(forward_batch, *args, **kwargs)
+        finally:
+            _end()
+
+    model_runner.forward = wrapped
+    model_runner._memsnap_wrapped = True
     logger.info(
-        f"[mem-snap] hooks installed (layer={_LAYER if layers is not None else None}, "
+        f"[mem-snap] forward wrapped (layer={_LAYER if layers is not None else None}, "
         f"midforward={_MIDFORWARD}, every={_EVERY})"
     )
 
 
-def _should_midforward() -> bool:
-    mode = str(_last_info.get("mode", ""))
-    if _midforward_left.get(mode, 0) > 0:
-        _midforward_left[mode] -= 1
-        return True
-    return False
-
-
-def memsnap_forward_begin(forward_batch: "ForwardBatch"):
-    """Called at the top of ModelRunner.forward() with the live ForwardBatch."""
+def _begin(forward_batch: "ForwardBatch"):
     if not _ENABLED:
         return
     try:
-        mode = str(getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode)).split(".")[-1]
+        mode = (
+            str(getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode))
+            .split(".")[-1]
+        )
         bs = int(getattr(forward_batch, "batch_size", 0) or 0)
-        ntok = int(getattr(forward_batch, "input_ids", None).numel()) if getattr(forward_batch, "input_ids", None) is not None else 0
+        ii = getattr(forward_batch, "input_ids", None)
+        ntok = int(ii.numel()) if ii is not None else 0
         _mode_counts[mode] += 1
-        # track first 3 batches of every mode, then every _EVERY-th
-        if _mode_counts[mode] <= 3 or _mode_counts[mode] % _EVERY == 0:
-            _last_info.update(
-                mode=mode,
-                bs=bs,
-                ntok=ntok,
-                alloc_before=torch.cuda.memory_allocated(),
-                track=True,
-            )
-        else:
-            _last_info.update(track=False)
+        track = _mode_counts[mode] <= 3 or _mode_counts[mode] % _EVERY == 0
+        info: Dict[str, Any] = {
+            "mode": mode,
+            "bs": bs,
+            "ntok": ntok,
+            "track": track,
+        }
+        outermost = not _stack
+        _stack.append(info)
+        if track and outermost:
+            info["alloc_before"] = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            global _pending_midforward
+            if _midforward_left.get(mode, 0) > 0:
+                _midforward_left[mode] -= 1
+                _pending_midforward = True
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"[mem-snap] forward_begin failed: {e}")
+        logger.warning(f"[mem-snap] begin failed: {e}")
 
 
-def should_track_current() -> bool:
-    return bool(_last_info.get("track", False))
+def _end():
+    if not _ENABLED or not _stack:
+        return
+    info = _stack.pop()
+    if not info.get("track", False) or _stack:
+        return  # inner (draft) call or untracked: no row
+    try:
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        alloc_before = info.get("alloc_before", 0)
+        row = {
+            "t": time.time(),
+            "mode": info.get("mode", "?"),
+            "bs": info.get("bs", 0),
+            "ntok": info.get("ntok", 0),
+            "alloc_before": alloc_before,
+            "peak": peak,
+            "transient": peak - alloc_before,
+        }
+        os.makedirs(_DIR, exist_ok=True)
+        with open(os.path.join(_DIR, "peaks.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
+        logger.info(
+            f"[mem-snap] peak mode={row['mode']} bs={row['bs']} ntok={row['ntok']} "
+            f"alloc_before={alloc_before / GB:.3f} peak={row['peak'] / GB:.3f} "
+            f"transient={row['transient'] / GB:.3f} GiB"
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[mem-snap] end failed: {e}")
+
+
+def memsnap_forward_begin(forward_batch: "ForwardBatch"):
+    """Kept for compatibility; wrapping happens in install_memsnap_hooks."""
+    return
