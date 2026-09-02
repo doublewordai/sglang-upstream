@@ -2777,6 +2777,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "blob",
                 "shm",
             ],
         ),
