@@ -224,8 +224,46 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
 
-        self.write_staging_stream = device_module.Stream()
-        self.decode_backup_stream = device_module.Stream()
+        self.green_ctx = None
+        self._swapin_stream = None
+        green_sms = int(envs.SGLANG_HISPARSE_GREEN_CTX_SMS.get() or 0)
+        if green_sms > 0 and not is_hip():
+            try:
+                import torch as _torch
+
+                dev_idx = (
+                    _torch.device(device).index
+                    if _torch.device(device).index is not None
+                    else _torch.cuda.current_device()
+                )
+                self.green_ctx = _torch.cuda.GreenContext.create(
+                    green_sms, dev_idx
+                )
+                logger.info(
+                    "HiSparse: green context with %d SMs for IO streams "
+                    "(backup/prefetch/swap-in)",
+                    green_sms,
+                )
+            except Exception as e:  # pragma: no cover - driver-dependent
+                logger.warning(
+                    "HiSparse: GreenContext.create(%d) failed (%r); using "
+                    "normal streams",
+                    green_sms,
+                    e,
+                )
+                self.green_ctx = None
+        self.write_staging_stream = self._make_io_stream()
+        self.decode_backup_stream = self._make_io_stream()
+        # A dedicated green stream for the swap-in gather (issued inside the
+        # captured attention flow; fork+join events are capture-safe). Normal
+        # path keeps swap-in on the caller's current stream.
+        if self.green_ctx is not None:
+            self._swapin_stream = self._make_io_stream()
+            self._swapin_on_green = bool(
+                envs.SGLANG_HISPARSE_SWAPIN_GREEN_CTX.get()
+            )
+        else:
+            self._swapin_on_green = False
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -327,7 +365,7 @@ class HiSparseCoordinator:
         # copies overlap compute with little contention.
         self._prefetch_copy_blocks = 4
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
-        self.prefetch_stream = device_module.Stream()
+        self.prefetch_stream = self._make_io_stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
@@ -337,6 +375,13 @@ class HiSparseCoordinator:
             layer_num,
         )
 
+    def _make_io_stream(self):
+        """A stream for hisparse IO, bound to the green context when the
+        SGLANG_HISPARSE_GREEN_CTX_SMS flag is set (else a normal stream)."""
+        if self.green_ctx is not None:
+            return self.green_ctx.Stream()
+        return device_module.Stream()
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -345,6 +390,8 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
+        if self._swapin_stream is not None:
+            self._swapin_stream.synchronize()
         if self.enable_prefetch:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
@@ -1435,6 +1482,41 @@ class HiSparseCoordinator:
             skip_io=self.skip_io,
         )
 
+    def _maybe_green_swap_in(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        record_plan: bool = False,
+        num_newest: int = 1,
+    ) -> torch.Tensor:
+        """Swap-in on the green-context stream when the flag is set (fork+join
+        with events; capture-safe inside CUDA graphs), else on the current
+        stream. Same kernels/args/order either way, so outputs are identical."""
+        if self._swapin_stream is None or not self._swapin_on_green:
+            return self._run_swap_in_kernel(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                layer_id,
+                record_plan=record_plan,
+                num_newest=num_newest,
+            )
+        cur = device_module.current_stream()
+        self._swapin_stream.wait_stream(cur)
+        with device_module.stream(self._swapin_stream):
+            out = self._run_swap_in_kernel(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                layer_id,
+                record_plan=record_plan,
+                num_newest=num_newest,
+            )
+        cur.wait_stream(self._swapin_stream)
+        return out
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -1452,7 +1534,7 @@ class HiSparseCoordinator:
         it always takes the direct path).
         """
         if not self.enable_prefetch or num_newest != 1:
-            return self._run_swap_in_kernel(
+            return self._maybe_green_swap_in(
                 req_pool_indices,
                 compressed_seq_lens,
                 top_k_result,
@@ -1471,7 +1553,7 @@ class HiSparseCoordinator:
         # Anchor: swap in synchronously (recording the plan), then prefetch the
         # skip layers' copies on the side stream.
         group = self._prefetch_groups.get(layer_id)
-        anchor_locs = self._run_swap_in_kernel(
+        anchor_locs = self._maybe_green_swap_in(
             req_pool_indices,
             compressed_seq_lens,
             top_k_result,
