@@ -595,6 +595,12 @@ class Envs:
     # path; CUDA-graph capture works across primary+green streams (verified on
     # GH200, driver 565.57.01 / CUDA 13 userspace).
     SGLANG_HISPARSE_GREEN_CTX_SMS = EnvInt(0)
+    # Additionally run the swap-in gather itself (anchor/verify calls, which
+    # sit on the attention critical path) on the green-context stream with a
+    # fork+join. Off by default: at decode batch sizes the fused swap-in grid
+    # is b x 960 threads (<= 5 SMs), so SM isolation buys nothing there while
+    # the fork/join adds latency; on by default would change step timing.
+    SGLANG_HISPARSE_SWAPIN_GREEN_CTX = EnvBool(False)
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.

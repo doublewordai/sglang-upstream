@@ -240,6 +240,11 @@ class HiSparseCoordinator:
         # path keeps swap-in on the caller's current stream.
         if self.green_ctx is not None:
             self._swapin_stream = self._make_io_stream()
+            self._swapin_on_green = bool(
+                envs.SGLANG_HISPARSE_SWAPIN_GREEN_CTX.get()
+            )
+        else:
+            self._swapin_on_green = False
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -1364,7 +1369,7 @@ class HiSparseCoordinator:
         """Swap-in on the green-context stream when the flag is set (fork+join
         with events; capture-safe inside CUDA graphs), else on the current
         stream. Same kernels/args/order either way, so outputs are identical."""
-        if self._swapin_stream is None:
+        if self._swapin_stream is None or not self._swapin_on_green:
             return self._run_swap_in_kernel(
                 req_pool_indices,
                 compressed_seq_lens,
