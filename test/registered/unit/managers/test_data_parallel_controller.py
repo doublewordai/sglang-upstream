@@ -27,9 +27,13 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.data_parallel_controller import (
+    retained_tokens_per_device_token,
+)
+from sglang.srt.managers.dp_prefix_affinity import PrefixAffinityIndex
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _BASE_LOAD = msgspec.structs.replace(
@@ -260,6 +264,226 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+def _make_prefix_affinity_controller(
+    dp_size: int,
+    *,
+    block_tokens: int = 4,
+    threshold: float = 0.5,
+    max_imbalance: int = 16,
+) -> DataParallelController:
+    ctl = _make_controller(dp_size)
+    ctl.prefix_index = PrefixAffinityIndex(
+        dp_size=dp_size, block_tokens=block_tokens, max_blocks_per_rank=64
+    )
+    ctl.prefix_affinity_threshold = threshold
+    ctl.prefix_affinity_max_imbalance = max_imbalance
+    return ctl
+
+
+def _dispatched_rank(ctl: DataParallelController) -> int:
+    ranks = [i for i, w in enumerate(ctl.workers) if w.send_pyobj.call_count]
+    assert len(ranks) == 1, ranks
+    ctl.workers[ranks[0]].send_pyobj.reset_mock()
+    return ranks[0]
+
+
+class TestPrefixAffinityIndex(CustomTestCase):
+    def test_keys_chain_full_blocks_and_ignore_the_tail(self):
+        idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=8)
+        keys = idx.prefix_keys(list(range(10)))
+        self.assertEqual(len(keys), 2, "10 tokens / block 4 -> 2 full blocks")
+        self.assertEqual(keys, idx.prefix_keys(list(range(8))))
+        self.assertNotEqual(keys[1], idx.prefix_keys([0, 1, 2, 3, 9, 9, 9, 9])[1])
+
+    def test_longest_match_returns_deepest_ranks(self):
+        idx = PrefixAffinityIndex(dp_size=3, block_tokens=4, max_blocks_per_rank=8)
+        self.assertEqual(idx.longest_match(idx.prefix_keys(list(range(8)))), ([], 0))
+        idx.record(rank=0, keys=idx.prefix_keys(list(range(4))))
+        idx.record(rank=2, keys=idx.prefix_keys(list(range(12))))
+        ranks, tokens = idx.longest_match(idx.prefix_keys(list(range(8))))
+        self.assertEqual((ranks, tokens), ([2], 8))
+        ranks, tokens = idx.longest_match(idx.prefix_keys(list(range(4)) + [7] * 4))
+        self.assertEqual((sorted(ranks), tokens), ([0, 2], 4))
+
+    def test_record_evicts_least_recently_used_keys(self):
+        idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=3)
+        idx.record(rank=0, keys=[1, 2, 3])
+        idx.record(rank=0, keys=[3])  # refresh 3, so 2 is the oldest
+        idx.record(rank=0, keys=[4])
+        self.assertEqual(list(idx._keys[0]), [1, 3, 4])
+
+    def test_trimming_drops_a_stale_prompt_tail_before_its_head(self):
+        """A radix cache evicts leaves first; the index must keep matching the
+        surviving head of an old session rather than its orphaned tail."""
+        idx = PrefixAffinityIndex(dp_size=1, block_tokens=4, max_blocks_per_rank=3)
+        old = idx.prefix_keys(list(range(8)))
+        idx.record(rank=0, keys=old)
+        idx.record(rank=0, keys=idx.prefix_keys(list(range(100, 108))))
+        self.assertEqual(idx.longest_match(old), ([0], 4), "head kept, tail gone")
+
+    def test_footprint_follows_the_lru_and_its_capacity(self):
+        idx = PrefixAffinityIndex(dp_size=2, block_tokens=4, max_blocks_per_rank=2)
+        idx.record(rank=0, keys=[1, 2, 3])
+        self.assertEqual(idx.footprint_tokens(0), 8, "capped at 2 blocks of 4")
+        self.assertEqual(idx.footprint_tokens(1), 0)
+        idx.set_max_blocks_per_rank(1)
+        self.assertEqual(list(idx._keys[0]), [1], "resizing keeps the newest head")
+        self.assertEqual(idx.footprint_tokens(0), 4)
+
+
+class TestPrefixAffinityScheduler(CustomTestCase):
+    def test_first_turn_goes_to_least_loaded_worker(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [5, 3, 1, 4]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 2)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 3, 2, 4])
+
+    def test_next_turn_follows_the_prefix(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [0, 0, 0, 3]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        first = _dispatched_rank(ctl)
+        # A new turn appends to the prompt; the retained prefix is 8 of 12 tokens.
+        ctl.dp_budget.total_requests = [3, 3, 3, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(12))))
+        self.assertEqual(_dispatched_rank(ctl), first)
+
+    def test_short_match_falls_back_to_least_loaded(self):
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [0, 1, 1, 1]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(4))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        # Only 4 of 16 tokens match: below the 50% threshold.
+        ctl.dp_budget.total_requests = [2, 1, 1, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(16))))
+        self.assertEqual(_dispatched_rank(ctl), 3)
+
+    def test_overloaded_matching_worker_is_skipped(self):
+        ctl = _make_prefix_affinity_controller(dp_size=2, max_imbalance=2)
+        ctl.dp_budget.total_requests = [0, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        ctl.dp_budget.total_requests = [10, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 1)
+
+    def test_inactive_matching_worker_is_skipped(self):
+        ctl = _make_prefix_affinity_controller(dp_size=3)
+        ctl.dp_budget.total_requests = [0, 1, 1]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        ctl._active_workers = [1, 2]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 1)
+
+    def test_routed_dp_rank_is_recorded_but_not_rerouted(self):
+        """An externally routed request still lands on its rank and leaves
+        its prefix there: the index and speculative load must reflect it, or
+        the next turn of that conversation is sent to a different rank."""
+        ctl = _make_prefix_affinity_controller(dp_size=4)
+        ctl.dp_budget.total_requests = [5, 3, 1, 4]
+        ctl.prefix_affinity_scheduler(_req(routed_dp_rank=3, input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 3)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 3, 1, 5])
+        ctl.dp_budget.total_requests = [0, 0, 0, 5]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(12))))
+        self.assertEqual(_dispatched_rank(ctl), 3)
+
+    def test_rank_activated_beyond_budget_counts_as_idle(self):
+        """Elastic EP activates ranks past the launch dp_size before the budget
+        grows; indexing the load list by such a rank raised IndexError."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.workers.append(MagicMock(name="worker_2"))
+        ctl.status.append(True)
+        ctl._active_workers = [0, 1, 2]
+        ctl.prefix_index = PrefixAffinityIndex(
+            dp_size=3, block_tokens=4, max_blocks_per_rank=64
+        )
+        ctl.dp_budget.total_requests = [1, 1]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 2)
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 1])
+
+    def test_new_session_goes_to_the_smallest_cache_footprint(self):
+        """Long-context sessions are bounded by KV, not request count: a new
+        session goes where it evicts the least, unless that rank is far ahead
+        in requests."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.dp_budget.total_requests = [0, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(8))))
+        self.assertEqual(_dispatched_rank(ctl), 0)  # 2 blocks on rank 0
+        ctl.dp_budget.total_requests = [0, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(100, 112))))
+        self.assertEqual(_dispatched_rank(ctl), 1)  # 3 blocks on rank 1
+        # Rank 1 has fewer requests but the larger footprint.
+        ctl.dp_budget.total_requests = [1, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(200, 204))))
+        self.assertEqual(_dispatched_rank(ctl), 0)
+        # ...until the request imbalance exceeds the cap.
+        ctl.dp_budget.total_requests = [20, 0]
+        ctl.prefix_affinity_scheduler(_req(input_ids=list(range(300, 304))))
+        self.assertEqual(_dispatched_rank(ctl), 1)
+
+    def test_index_capacity_defaults_to_the_kv_pool(self):
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.max_total_num_tokens = 4096
+        ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 1.0
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 1024)
+        ctl.prefix_index_blocks_arg = 64
+        ctl.prefix_index.set_max_blocks_per_rank(64)
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 64, "explicit wins")
+
+    def test_index_capacity_covers_the_host_tier(self):
+        """With a hierarchical cache every device page is written through to a
+        host pool of hicache_ratio x the device size, so that is what a rank
+        retains and what the footprint estimate must be allowed to reach."""
+        ctl = _make_prefix_affinity_controller(dp_size=2)
+        ctl.max_total_num_tokens = 4096
+        ctl.prefix_index_blocks_arg = 0
+        ctl.retained_tokens_per_device_token = 2.5
+        ctl._size_prefix_index_to_kv_capacity()
+        self.assertEqual(ctl.prefix_index.max_blocks_per_rank, 2560)
+
+
+def _retention_args(**overrides) -> SimpleNamespace:
+    args = dict(
+        enable_hisparse=False,
+        hisparse_config=None,
+        enable_hierarchical_cache=False,
+        hicache_size=0,
+        hicache_ratio=2.0,
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+class TestRetainedTokensPerDeviceToken(CustomTestCase):
+    def test_device_pool_only(self):
+        self.assertEqual(retained_tokens_per_device_token(_retention_args()), 1.0)
+
+    def test_hierarchical_cache_host_tier(self):
+        args = _retention_args(enable_hierarchical_cache=True, hicache_ratio=2.5)
+        self.assertEqual(retained_tokens_per_device_token(args), 2.5)
+
+    def test_hisparse_host_pool(self):
+        """A HiSparse rank retains host_to_device_ratio x the device pool: a
+        1M-token session on a 100k-token device pool must still match the
+        rank that holds it, or every warm turn is re-placed as a new session."""
+        args = _retention_args(
+            enable_hisparse=True,
+            hisparse_config='{"top_k": 2048, "host_to_device_ratio": 10}',
+        )
+        self.assertEqual(retained_tokens_per_device_token(args), 10.0)
+
+    def test_hisparse_default_ratio(self):
+        args = _retention_args(enable_hisparse=True)
+        self.assertEqual(retained_tokens_per_device_token(args), 2.0)
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

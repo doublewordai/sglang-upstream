@@ -93,11 +93,12 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
+    if is_draft_worker or memory_config.enable_hierarchical_cache:
+        return False
+    if envs.SGLANG_DSA_ELIDE_SHARED_INDEX_K.get():
+        return True
     return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and get_disagg().disaggregation_mode == "null"
+        not memory_config.enable_hisparse and get_disagg().disaggregation_mode == "null"
     )
 
 

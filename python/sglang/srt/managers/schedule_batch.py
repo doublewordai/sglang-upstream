@@ -1915,7 +1915,11 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> None:
-    if hisparse_coordinator is not None and not req.finished():
+    if (
+        hisparse_coordinator is not None
+        and not req.finished()
+        and not tree_cache.owns_hisparse_release()
+    ):
         hisparse_coordinator.retract_req(req)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be

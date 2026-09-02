@@ -390,6 +390,18 @@ class TransferStatus:
         return True
 
 
+def dense_layer_params(src_ptrs, dst_ptrs, item_lens, num_layers):
+    """(src ptr, dst ptr, item length) for each layer that holds an item.
+
+    A layer whose index-K is elided (shared-index skip-topk layer) has a
+    0-byte item and a null pointer on that side, so it carries nothing."""
+    return [
+        (src_ptrs[i], dst_ptrs[i], item_lens[i])
+        for i in range(num_layers)
+        if item_lens[i] != 0 and src_ptrs[i] != 0 and dst_ptrs[i] != 0
+    ]
+
+
 class NixlKVManager(CommonKVManager):
     def __init__(
         self,
@@ -1000,7 +1012,14 @@ class NixlKVManager(CommonKVManager):
             return
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
-        decode_only_spec_dec = n_dst > n_src
+        # With layer ids on both peers the entries are paired explicitly, so
+        # decode entries prefill does not hold (other PP stages' layers, or a
+        # draft model's) are simply left unpaired. Only the positional pairing
+        # has to treat a longer decode list as decode-only speculative decoding.
+        paired_by_layer_id = bool(self.kv_args.kv_layer_ids) and bool(
+            peer_info.dst_kv_layer_ids
+        )
+        decode_only_spec_dec = n_dst > n_src and not paired_by_layer_id
 
         if peer_info.requires_dcp_relayout:
             dst_indices = resolve_dcp_dst_entry_indices(
@@ -1534,14 +1553,9 @@ class NixlKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
             )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+            layers_params = dense_layer_params(
+                src_kv_ptrs, dst_kv_ptrs, item_lens, layers_current_pp_stage
+            )
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)

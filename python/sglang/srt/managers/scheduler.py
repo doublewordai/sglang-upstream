@@ -1041,6 +1041,10 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # Pool a request's tokens must fit in: the host-backed pool under
+        # hisparse (retained prefixes and prompts live in host rows), else the
+        # device pool.
+        self.max_token_pool_size = self.tp_worker.model_runner.max_token_pool_size
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1134,6 +1138,11 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+        if isinstance(self.tree_cache, HiSparseRadixCache):
+            self.tree_cache.attach_coordinator(self.hisparse_coordinator)
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
@@ -2191,7 +2200,7 @@ class Scheduler(
 
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # smaller than the token pool. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
@@ -2200,7 +2209,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                self.max_token_pool_size * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,

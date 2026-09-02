@@ -588,6 +588,10 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Opt-in: allocate DSA index-K only on the layers that compute top-k
+    # (shared-index models) under HiSparse / PD disaggregation as well. Set it
+    # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
+    SGLANG_DSA_ELIDE_SHARED_INDEX_K = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
@@ -675,6 +679,10 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Back host KV pools with MAP_PRIVATE anonymous pages (huge pages off) instead
+    # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
+    # unmaps pinned shared ones on every failed migration, stalling GPU access.
+    SGLANG_MAP_HOST_POOL_PRIVATE = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport

@@ -75,7 +75,10 @@ def should_use_zmq() -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+# Dispatch methods whose DataParallelController reads the load snapshots on
+# every dispatch (refresh_load_budget), so it must own the zmq PULL socket in
+# multi-node mode; otherwise its view of the per-rank load never refreshes.
+LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "prefix_affinity"})
 
 
 def _tokenizer_load_snapshot_owner_caller() -> str:
@@ -121,10 +124,10 @@ def zmq_reader_owner(caller: str) -> bool:
     if caller == "DataParallelController":
         return (
             get_parallel().dp_size > 1
-            and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+            and get_parallel().load_balance_method.lower() in LOAD_AWARE_METHODS
         )
     if get_parallel().dp_size > 1 and (
-        get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+        get_parallel().load_balance_method.lower() in LOAD_AWARE_METHODS
     ):
         return False
     return caller == _tokenizer_load_snapshot_owner_caller()

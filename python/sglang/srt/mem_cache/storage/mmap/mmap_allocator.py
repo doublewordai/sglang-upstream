@@ -41,6 +41,7 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+_MADV_NOHUGEPAGE = getattr(mmap, "MADV_NOHUGEPAGE", 15)
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -63,6 +64,40 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
     weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
     return array
+
+
+def _alloc_plain(alloc_bytes: int) -> mmap.mmap:
+    """Anonymous page-size mapping, populated before it is returned.
+
+    With SGLANG_MAP_HOST_POOL_PRIVATE the pages are private anonymous ones with
+    huge pages off: once pinned, memory compaction skips them cheaply, whereas
+    pinned MAP_SHARED pages are isolated, unmapped and remapped on every failed
+    migration attempt, which stalls device access through the pinned mapping.
+    """
+    if envs.SGLANG_MAP_HOST_POOL_PRIVATE.get():
+        mm = mmap.mmap(
+            -1,
+            alloc_bytes,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+        mm.madvise(_MADV_NOHUGEPAGE)
+        mm.madvise(_MADV_POPULATE_WRITE)
+        return mm
+    mm = mmap.mmap(
+        -1,
+        alloc_bytes,
+        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    try:
+        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+        # throwing an error on failure (e.g. out of memory).
+        mm.madvise(_MADV_POPULATE_WRITE)
+    except OSError:
+        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+        pass
+    return mm
 
 
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
@@ -120,19 +155,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
-    mm = mmap.mmap(
-        -1,
-        alloc_bytes,
-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
-    try:
-        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-        # throwing an error on failure (e.g. out of memory).
-        mm.madvise(_MADV_POPULATE_WRITE)
-    except OSError:
-        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        pass
+    mm = _alloc_plain(alloc_bytes)
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 

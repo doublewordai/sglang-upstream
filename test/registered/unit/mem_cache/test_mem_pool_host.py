@@ -102,6 +102,33 @@ class TestHostKVCache(CustomTestCase):
         self.assertEqual(len(indices), 4)
         shm_host_pool.free(indices)
 
+    def test_partial_page_free_waits_for_whole_page(self):
+        first = self.host_pool.alloc(4)
+        # One slot of the second page stays allocated: only the first page
+        # may be handed out again, and only as a whole aligned page.
+        self.host_pool.free(first[:3])
+        self.assertEqual(self.host_pool.available_size(), 6 + 2)
+        self.assertTrue(
+            torch.equal(self.host_pool.alloc(4), torch.tensor([4, 5, 6, 7]))
+        )
+        self.assertTrue(torch.equal(self.host_pool.alloc(2), torch.tensor([8, 9])))
+        self.assertTrue(torch.equal(self.host_pool.alloc(2), torch.tensor([0, 1])))
+        self.assertIsNone(self.host_pool.alloc(2))
+        self.host_pool.free(first[3:])
+        self.assertTrue(torch.equal(self.host_pool.alloc(2), torch.tensor([2, 3])))
+
+    def test_fragmented_frees_keep_pages_aligned(self):
+        pages = self.host_pool.alloc(8).view(-1, self.page_size)
+        # Free in a page-crossing order: second half of page 1, page 3, first
+        # half of page 1, page 0. Each alloc must still return aligned pages.
+        self.host_pool.free(pages[1, 1:])
+        self.host_pool.free(pages[3])
+        self.host_pool.free(pages[1, :1])
+        self.host_pool.free(pages[0])
+        got = self.host_pool.alloc(6).view(-1, self.page_size)
+        self.assertTrue(torch.equal(got, torch.tensor([[8, 9], [6, 7], [2, 3]])))
+        self.assertTrue(torch.equal(self.host_pool.alloc(2), torch.tensor([0, 1])))
+
     def test_empty_free_keeps_release_list_empty(self):
         self.assertEqual(self.host_pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(self.host_pool.num_release_slots, 0)

@@ -95,9 +95,22 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    hisparse_retention = (
+        server_args.disaggregation_mode == "decode"
+        and server_args.disaggregation_decode_enable_radix_cache
+        and not server_args.disable_radix_cache
+    )
+    assert server_args.disable_radix_cache or hisparse_retention, (
+        "Hierarchical sparse attention requires --disable-radix-cache, except "
+        "on a PD decode server with --disaggregation-decode-enable-radix-cache "
+        "(host-resident prefix retention via HiSparseRadixCache)."
+    )
+    # Retention adopts host rows through the DSA coordinator's side table; the
+    # DSv4 allocator keeps its own (c4) pools and never registers that hook.
+    assert not (hisparse_retention and is_v4_hisparse), (
+        "Hisparse prefix retention (--disaggregation-decode-enable-radix-cache "
+        "with --enable-hisparse) supports DSA models only, not DeepSeek V4."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

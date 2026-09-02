@@ -574,7 +574,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        if self.scheduler.enable_hisparse and prefix_match.l1_prefix_len > 0:
+            # Retention: only adopt the head whose host rows the tree owns (a
+            # prefix inserted by a still-running request has no rows yet).
+            keep = self.tree_cache.retained_prefix_len(prefix_match.prefix_indices)
+            if keep < prefix_match.l1_prefix_len:
+                prefix_match.prefix_indices = prefix_match.prefix_indices[:keep]
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1262,6 +1269,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            if self.scheduler.enable_hisparse:
+                logger.info(
+                    "hisparse prealloc rid=%s input_len=%d prefix_len=%d "
+                    "total_prefix_len=%d dst_tokens=%d dst_pages=%d page_size=%d",
+                    decode_req.req.rid,
+                    origin_input_len,
+                    prefix_len,
+                    total_prefix_len,
+                    len(kv_indices),
+                    len(page_indices),
+                    kv_transfer_page_size,
+                )
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1418,6 +1437,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
                 available_size = logical_allocator.available_size()
+            # Retained prefixes hold logical indices and are evicted on demand.
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                available_size += self.tree_cache.evictable_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1513,6 +1535,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return swa_allocatable_tokens
 
+    def _prealloc_available_size(self) -> int:
+        """Free tokens in the pool pre-alloc draws from."""
+        if self.scheduler.enable_hisparse:
+            return self.token_to_kv_pool_allocator.logical_available_size()
+        return self.token_to_kv_pool_allocator.available_size()
+
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
@@ -1568,18 +1596,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         # Evict cached entries if the pool doesn't have enough free pages.
+        # HiSparse pre-alloc takes logical indices only, so that pool (not the
+        # smaller device pool) decides whether retained prefixes must go.
         if (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
-            and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
+            and self._prealloc_available_size() < required_alloc_tokens
         ):
-            num_to_evict = (
-                required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
-            )
+            num_to_evict = required_alloc_tokens - self._prealloc_available_size()
             result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
-            if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
+            if self._prealloc_available_size() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
-                    f"available {self.token_to_kv_pool_allocator.available_size()} "
+                    f"available {self._prealloc_available_size()} "
                     f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
                     f"evictable_size={self.tree_cache.evictable_size()}, "
                     f"protected_size={self.tree_cache.protected_size()}, "
@@ -1591,27 +1619,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         if self.scheduler.enable_hisparse:
-            # HiSparse is incompatible with decode-side L1 radix cache. Keep
-            # this path on the upstream full-allocation semantics.
-            assert prefix_len == 0
-
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
+            # With HiSparseRadixCache a matched (retained) prefix keeps its
+            # host rows: adopt them and allocate/transfer only the delta.
             coordinator = self.scheduler.hisparse_coordinator
+            if prefix_len > 0:
+                assert total_prefix_len == prefix_len, (
+                    "hisparse retention does not compose with decode-side "
+                    "HiCache loadback (L2/L3 prefix gap)"
+                )
+                coordinator.adopt_prefix(req, prefix_indices)
+            else:
+                coordinator.req_adopted_len[req.req_pool_idx] = 0
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
                 req=req,
                 fill_len=fill_len,
+                prefix_len=prefix_len,
+                prefix_indices=prefix_indices,
                 uses_swa_tail=self._uses_swa_tail_prealloc(),
                 swa_tail_len=self._swa_tail_len(fill_len),
             )
-            # Allocate host indices for the RDMA transfer target.
+            # Allocate host indices for the RDMA transfer target (delta only).
+            prefix_host = coordinator.host_token_len(prefix_len)
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
+                prefix_host,
+                coordinator.host_token_len(fill_len) - prefix_host,
             )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
@@ -1671,6 +1708,8 @@ def alloc_for_decode_prealloc_hisparse(
     *,
     req: Req,
     fill_len: int,
+    prefix_len: int = 0,
+    prefix_indices: Optional[torch.Tensor] = None,
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
@@ -1679,11 +1718,16 @@ def alloc_for_decode_prealloc_hisparse(
     else:
         req.kv.kv_allocated_len = fill_len
     device = allocator.device
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+    if prefix_len > 0:
+        assert not uses_swa_tail, "retained prefix + SWA tail is unsupported"
+        last = int(prefix_indices[-1])
+    else:
+        last = -1
+    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
     seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
-    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    last_loc = torch.tensor([last], dtype=torch.int64, device=device)
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -1702,7 +1746,7 @@ def alloc_for_decode_prealloc_hisparse(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
-            extend_num_tokens=fill_len,
+            extend_num_tokens=fill_len - prefix_len,
         )
     return kv_loc
 
@@ -2062,7 +2106,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
+                if (
+                    self.scheduler.enable_hisparse
+                    and not self.tree_cache.owns_hisparse_release()
+                ):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
@@ -2086,7 +2133,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                    if self.scheduler.enable_hisparse:
+                    if (
+                        self.scheduler.enable_hisparse
+                        and not self.tree_cache.owns_hisparse_release()
+                    ):
                         self.scheduler.hisparse_coordinator.request_finished(
                             decode_req.req
                         )

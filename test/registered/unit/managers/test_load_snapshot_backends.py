@@ -314,7 +314,12 @@ class TestZmqReaderOwner(CustomTestCase):
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
-        for method in ("total_tokens", "total_requests"):
+        """Every method whose controller refreshes the load budget on dispatch
+        must drain zmq itself: with prefix_affinity left to the tokenizer-side
+        owner (drained only on /v1/loads), the controller's per-rank counts
+        only ever grew by its own speculative +1s, tripped the imbalance guard
+        after 16 dispatches and sent 500k-token sessions to an empty rank."""
+        for method in ("total_tokens", "total_requests", "prefix_affinity"):
             self.assertEqual(
                 self._owners(
                     dp_size=4, tokenizer_worker_num=8, load_balance_method=method
@@ -356,7 +361,12 @@ class TestZmqReaderOwner(CustomTestCase):
     def test_at_most_one_owner_across_configs(self):
         for dp_size in (1, 4):
             for tw in (1, 8):
-                for method in ("round_robin", "total_tokens", "total_requests"):
+                for method in (
+                    "round_robin",
+                    "total_tokens",
+                    "total_requests",
+                    "prefix_affinity",
+                ):
                     for node_rank in (0, 1):
                         owners = self._owners(
                             dp_size=dp_size,

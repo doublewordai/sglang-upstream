@@ -934,6 +934,182 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
+    # ------------------------------------------------------------------
+    # Prefix retention (radix-over-hisparse)
+    #
+    # The radix tree retains finished requests' logical kv indices; their MLA
+    # latent stays in the pinned host pool and their indexer keys stay valid in
+    # the (full-logical-size, device-resident) index buffer because retained
+    # logical indices are never reused. One CPU side table maps each retained
+    # logical index to the host row that mirrors it; adoption of a matched
+    # prefix is a gather from that table into the new request's per-request
+    # host-row table. Device resources (buffer slots, mapping rows) are still
+    # released at finish exactly as before.
+    # ------------------------------------------------------------------
+    def init_retention(self) -> None:
+        assert self.compress_ratio == 1, (
+            "hisparse prefix retention assumes compress_ratio == 1 "
+            "(host rows are keyed positionally by token index)"
+        )
+        n = int(self.token_to_kv_pool_allocator.size_full) + self.page_size + 1
+        self.logical_to_host_row = torch.full((n,), -1, dtype=torch.int64)
+        self.req_adopted_len = torch.zeros(
+            self.req_to_host_pool.shape[0], dtype=torch.int64
+        )
+        self.token_to_kv_pool_allocator.register_retention_cb(self.on_logical_free)
+
+    def reset_retention(self) -> None:
+        """Drop every retained row (tree reset / flush_cache). The allocator's
+        clear() rebuilds its free lists without the retention hook, so the
+        rows must be returned to the host pool here."""
+        rows = self.logical_to_host_row[self.logical_to_host_row >= 0]
+        if rows.numel() > 0:
+            self.mem_pool_host.free(rows)
+        self.logical_to_host_row.fill_(-1)
+        self.req_adopted_len.zero_()
+
+    def on_logical_free(self, free_index: torch.Tensor) -> None:
+        """Allocator hook: a logical index leaving the allocator takes its
+        retained host row (if any) with it."""
+        idx = free_index.to(device="cpu", dtype=torch.int64)
+        rows = self.logical_to_host_row[idx]
+        held = rows >= 0
+        if bool(held.any()):
+            self.mem_pool_host.free(rows[held])
+            self.logical_to_host_row[idx[held]] = -1
+
+    def flush_pending_to_host(self, req: Req, target_len: int) -> int:
+        """Synchronously complete the host mirror up to `target_len` tokens.
+
+        The eager backup lags one compressed token (the newest lives only in
+        the request's reserved device-buffer slot). Returns the number of
+        tokens whose host mirror is verified complete — the retained prefix is
+        truncated to this length, so an unrecoverable tail shortens the cache
+        instead of ever publishing a hole.
+        """
+        idx = req.req_pool_idx
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+
+        have = int(self.req_to_host_pool_allocated_len[idx])
+        want = self.host_token_len(target_len)
+        if want <= have:
+            return min(target_len, have)
+
+        # Recover pending positions from the per-request device buffer. With
+        # the reserved-slot scheme only positions >= device_buffer_size share a
+        # slot, and only the newest of those is still resident.
+        pending = list(range(have, want))
+        recoverable = []
+        for p in pending:
+            slot = min(p, self.device_buffer_size)
+            if slot == self.device_buffer_size and p != want - 1:
+                break  # older long-seq positions were overwritten; stop here
+            if int(self.req_to_device_buffer[idx, slot]) <= 0:
+                break
+            recoverable.append((p, slot))
+        if not recoverable:
+            return have
+
+        positions = [p for p, _ in recoverable]
+        slots = torch.tensor(
+            [s for _, s in recoverable], dtype=torch.int64, device=self.device
+        )
+        device_locs = self.req_to_device_buffer[idx, slots]
+        host_locs = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            idx,
+            positions[0],
+            len(positions),
+        )
+        self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device,
+            host_locs,
+            device_locs,
+            io_backend="kernel",
+        )
+        device_module.current_stream().synchronize()
+        return min(target_len, positions[-1] + 1)
+
+    def host_rows_snapshot(self, req: Req) -> torch.Tensor:
+        """Copy of this request's host rows (positional), before release."""
+        idx = req.req_pool_idx
+        n = int(self.req_to_host_pool_allocated_len[idx])
+        return self.req_to_host_pool[idx, :n].clone()
+
+    def retain_rows(self, logical_values: torch.Tensor, rows: torch.Tensor) -> None:
+        """Move host-row ownership for `logical_values` to the side table."""
+        assert logical_values.numel() == rows.numel()
+        idx = logical_values.to(device="cpu", dtype=torch.int64)
+        assert bool(
+            (self.logical_to_host_row[idx] < 0).all()
+        ), "retain_rows: logical index already holds a retained row"
+        self.logical_to_host_row[idx] = rows.to(device="cpu", dtype=torch.int64)
+
+    def adopt_prefix(self, req: Req, prefix_indices: torch.Tensor) -> None:
+        """Point a new request's host-row table at a retained prefix."""
+        idx = req.req_pool_idx
+        n = prefix_indices.numel()
+        if n == 0:
+            self.req_adopted_len[idx] = 0
+            return
+        rows = self.logical_to_host_row[
+            prefix_indices.to(device="cpu", dtype=torch.int64)
+        ]
+        assert bool((rows >= 0).all()), (
+            "adopt_prefix: matched prefix has un-retained host rows"
+        )
+        self.req_to_host_pool[idx, :n] = rows
+        self.req_to_host_pool_allocated_len[idx] = n
+        self.req_adopted_len[idx] = n
+        logger.info(
+            "HiSparse retention: adopted %d-token host-resident prefix for %s",
+            n,
+            req.rid,
+        )
+
+    def release_for_retention(self, req: Req) -> None:
+        """request_finished minus the host-row free: device buffer slots,
+        mapping rows and per-request tables are released; host bytes survive
+        (ownership passes to the radix tree via retain_rows)."""
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+
+        allocated_len = req.kv.kv_allocated_len
+        current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+        if current_cap > 0:
+            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
+            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
+            if all_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :allocated_len
+        ]
+        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            allocated_locs
+        )
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+
+        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
+        self.req_to_device_buffer[req.req_pool_idx, :] = 0
+        self.req_device_buffer_size[req.req_pool_idx] = 0
+        self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        self.req_adopted_len[req.req_pool_idx] = 0
+        self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req.req_pool_idx] = False
+
+    def free_unretained_rows(self, rows: torch.Tensor) -> None:
+        """Free host rows that were never moved to the side table."""
+        rows = rows[rows >= 0]
+        if rows.numel() > 0:
+            self.mem_pool_host.free(rows)
+
     def _run_swap_in_kernel(
         self,
         req_pool_indices: torch.Tensor,

@@ -15,6 +15,15 @@ from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
 
 
+def _mapping_perms(ptr: int) -> str:
+    for line in open("/proc/self/maps"):
+        span, perms = line.split()[:2]
+        lo, hi = (int(x, 16) for x in span.split("-"))
+        if lo <= ptr < hi:
+            return perms
+    raise AssertionError(f"no mapping contains {ptr:#x}")
+
+
 class TestMmapAllocator(unittest.TestCase):
     def test_alloc_mmap(self):
         dims = (10, 1024)
@@ -24,6 +33,15 @@ class TestMmapAllocator(unittest.TestCase):
         self.assertEqual(tensor.dtype, dtype)
         # Verify it has mapped memory address
         self.assertGreater(tensor.data_ptr(), 0)
+
+    def test_alloc_mmap_private(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_MAP_HOST_POOL_PRIVATE.override(True):
+            tensor = alloc_mmap((4, 1024), torch.float32)
+        tensor[0, 0] = 42.0
+        self.assertEqual(tensor[0, 0].item(), 42.0)
+        self.assertEqual(_mapping_perms(tensor.data_ptr()), "rw-p")
 
     def test_alloc_shm(self):
         dims = (10, 1024)

@@ -306,6 +306,10 @@ class HostKVCache(abc.ABC):
         self.mem_state = torch.zeros(
             (self.logical_size,), dtype=torch.uint8, device=self.device
         )
+        assert self.logical_size % self.logical_page_size == 0, (
+            f"host pool size {self.logical_size} is not a multiple of the page "
+            f"size {self.logical_page_size}"
+        )
         self.free_slots = torch.arange(self.logical_size, dtype=torch.int64)
         # Keep freed chunks aside and consume them lazily from alloc() to avoid
         # concatenating a large free-list on every host-pool free.
@@ -386,6 +390,25 @@ class HostKVCache(abc.ABC):
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
         )
         self.slot_used[indices_cpu] = False
-        self.release_slots.append(indices_cpu)
-        self.num_release_slots += len(indices_cpu)
+        released = self._slots_of_whole_free_pages(indices_cpu)
+        if released.numel() > 0:
+            self.release_slots.append(released)
+            self.num_release_slots += len(released)
         return len(indices)
+
+    def _slots_of_whole_free_pages(self, indices_cpu: torch.Tensor) -> torch.Tensor:
+        """Slots of the pages these indices touch whose slots are now all free.
+
+        alloc() hands out whole aligned pages: the free list holds whole pages
+        only, so a page rejoins it once its last slot is freed and a partially
+        freed page waits. Callers that address host rows by page id (the
+        HiSparse transfer destinations) depend on this.
+        """
+        page_size = self.logical_page_size
+        if page_size == 1:
+            return indices_cpu
+        pages = torch.unique(indices_cpu // page_size)
+        in_use = self.slot_used.view(-1, page_size)[pages].any(dim=1)
+        free_pages = pages[~in_use]
+        offsets = torch.arange(page_size, dtype=torch.int64)
+        return (free_pages[:, None] * page_size + offsets[None, :]).reshape(-1)

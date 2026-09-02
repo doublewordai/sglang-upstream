@@ -715,6 +715,67 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_pd_elides_shared_index_k_when_opted_in(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """Opted in, PD prices index-K on the 3 anchor layers of 6 only."""
+        from sglang.srt.environ import envs
+
+        num_layers = 6
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            disaggregation_mode="prefill",
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with envs.SGLANG_DSA_ELIDE_SHARED_INDEX_K.override(True), mock_cpu_env(
+            kv_size=1
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * 3)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hicache_keeps_every_indexer_layer_when_opted_in(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The host indexer pool mirrors every layer, so HiCache never elides."""
+        from sglang.srt.environ import envs
+
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with envs.SGLANG_DSA_ELIDE_SHARED_INDEX_K.override(True), get_memory().override(
+            enable_hierarchical_cache=True
+        ), mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
 
 class TestFactory(CustomTestCase):
     def test_default_for_non_swa(self):

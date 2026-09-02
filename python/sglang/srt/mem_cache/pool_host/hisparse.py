@@ -13,7 +13,22 @@ class HiSparseHostPoolMixin:
         return (size + self.page_size - 1) // self.page_size * self.page_size
 
     def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
-        return self.alloc(num_pages * self.page_size)
+        host_locs = self.alloc(num_pages * self.page_size)
+        if host_locs is not None:
+            self._assert_whole_pages(host_locs)
+        return host_locs
+
+    def _assert_whole_pages(self, host_locs: torch.Tensor) -> None:
+        """Transfer destinations name host rows by page id (row // page_size),
+        so every page-sized run of an allocation must be one aligned page."""
+        runs = host_locs.view(-1, self.page_size)
+        offsets = torch.arange(self.page_size, dtype=runs.dtype)
+        aligned = bool((runs[:, 0] % self.page_size == 0).all())
+        contiguous = bool((runs == runs[:, :1] + offsets[None, :]).all())
+        assert aligned and contiguous, (
+            f"HiSparse host alloc of {runs.shape[0]} pages returned runs that are "
+            "not whole aligned pages; transfer destinations index host rows by page."
+        )
 
     def alloc_paged_token_slots(
         self,

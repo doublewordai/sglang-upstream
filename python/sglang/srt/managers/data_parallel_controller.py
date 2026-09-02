@@ -42,8 +42,13 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.dp_prefix_affinity import PrefixAffinityIndex
+from sglang.srt.managers.load_snapshot import (
+    LOAD_AWARE_METHODS,
+    create_load_snapshot_reader,
+)
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.sparsity.factory import parse_hisparse_config
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
@@ -83,6 +88,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -160,11 +166,11 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
-        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
-            LoadBalanceMethod.TOTAL_REQUESTS,
-            LoadBalanceMethod.TOTAL_TOKENS,
+        self.refresh_load_budget_on_dispatch = (
+            self.load_balance_method.name.lower() in LOAD_AWARE_METHODS
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -172,6 +178,26 @@ class DataParallelController:
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
+        )
+
+        # 0 = size the index to the KV capacity, known once the workers report
+        # max_total_num_tokens (_size_prefix_index_to_kv_capacity). With the
+        # hierarchical cache the host tier (hicache_ratio x device) is what a
+        # rank retains, as every device page is written through to it.
+        self.prefix_index_blocks_arg = (
+            server_args.dp_prefix_affinity_max_blocks_per_rank
+        )
+        self.retained_tokens_per_device_token = retained_tokens_per_device_token(
+            server_args
+        )
+        self.prefix_index = PrefixAffinityIndex(
+            dp_size=self.max_dp_size,
+            block_tokens=server_args.dp_prefix_affinity_block_tokens,
+            max_blocks_per_rank=self.prefix_index_blocks_arg or (1 << 15),
+        )
+        self.prefix_affinity_threshold = server_args.dp_prefix_affinity_threshold
+        self.prefix_affinity_max_imbalance = (
+            server_args.dp_prefix_affinity_max_imbalance
         )
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
@@ -734,6 +760,16 @@ class DataParallelController:
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
+        self._size_prefix_index_to_kv_capacity()
+
+    def _size_prefix_index_to_kv_capacity(self) -> None:
+        if self.prefix_index_blocks_arg:
+            return
+        retained = int(
+            self.max_total_num_tokens * self.retained_tokens_per_device_token
+        )
+        blocks = max(1, retained // self.prefix_index.block_tokens)
+        self.prefix_index.set_max_blocks_per_rank(blocks)
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -797,6 +833,78 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    def prefix_affinity_scheduler(self, req: Req):
+        """Cache-aware dispatch: send a request to the DP rank that most likely
+        still holds its prompt prefix; otherwise to the least-loaded rank."""
+        if not self._active_workers:
+            raise RuntimeError("No active DP workers are available for routing.")
+        keys = self.prefix_index.prefix_keys(req.input_ids)
+        # An externally routed request still lands (and leaves its prefix) on
+        # its rank, so the index and the speculative load must see it too.
+        if self.maybe_external_dp_rank_routing(req):
+            target = req.routed_dp_rank
+        else:
+            target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
+            if target is None:
+                target = self._new_session_rank()
+            sock_send(self.workers[target], req)
+        if logger.isEnabledFor(logging.INFO):
+            ranks, matched = self.prefix_index.longest_match(keys)
+            logger.info(
+                "prefix_affinity dispatch rid=%s len=%d matched=%d on %s -> dp%d loads=%s",
+                req.rid,
+                len(req.input_ids),
+                matched,
+                ranks,
+                target,
+                [self._rank_load(r) for r in self._active_workers],
+            )
+        # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
+        if target < self.dp_budget.dp_size:
+            self.dp_budget.total_requests[target] += 1
+        self.prefix_index.record(rank=target, keys=keys)
+
+    def _rank_load(self, rank: int) -> int:
+        """Ranks activated beyond the launch dp_size have no budget slot yet
+        (elastic EP); treat them as idle rather than indexing past the list."""
+        loads = self.dp_budget.total_requests
+        return loads[rank] if rank < len(loads) else 0
+
+    def _least_loaded_rank(self, ranks: List[int]) -> int:
+        return min(ranks, key=self._rank_load)
+
+    def _new_session_rank(self) -> int:
+        """Where an unmatched prompt goes: the rank whose cache footprint is
+        smallest (it evicts the least), unless that rank is too far ahead of
+        the least-loaded one in requests; then the least-loaded rank."""
+        least = self._least_loaded_rank(self._active_workers)
+        target = min(
+            self._active_workers,
+            key=lambda r: (self.prefix_index.footprint_tokens(r), self._rank_load(r)),
+        )
+        imbalance = self._rank_load(target) - self._rank_load(least)
+        if imbalance > self.prefix_affinity_max_imbalance:
+            return least
+        return target
+
+    def _prefix_affinity_rank(
+        self, *, keys: List[int], input_len: int
+    ) -> Optional[int]:
+        """The least-loaded rank among those sharing the longest prefix match,
+        or None when the match is too short or that rank is too far ahead of
+        the least-loaded one (the same rule sgl-router's cache-aware policy
+        applies across workers)."""
+        ranks, matched_tokens = self.prefix_index.longest_match(keys)
+        ranks = [r for r in ranks if r in self._active_workers]
+        if not ranks or matched_tokens < self.prefix_affinity_threshold * input_len:
+            return None
+        target = self._least_loaded_rank(ranks)
+        least = self._least_loaded_rank(self._active_workers)
+        imbalance = self._rank_load(target) - self._rank_load(least)
+        if imbalance > self.prefix_affinity_max_imbalance:
+            return None
+        return target
+
     def event_loop(self):
         while True:
             while True:
@@ -806,6 +914,19 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+
+def retained_tokens_per_device_token(server_args: ServerArgs) -> float:
+    """Tokens a DP rank retains per device-pool token. A HiSparse rank keeps
+    its KV in a host pool of host_to_device_ratio x the device pool and its
+    radix cache retains into that pool; a hierarchical cache writes every
+    device page through to a host tier of hicache_ratio x the device pool.
+    Without either, the device pool is all a rank retains."""
+    if server_args.enable_hisparse:
+        return max(1.0, float(parse_hisparse_config(server_args).host_to_device_ratio))
+    if server_args.enable_hierarchical_cache and server_args.hicache_size == 0:
+        return max(1.0, server_args.hicache_ratio or 1.0)
+    return 1.0
 
 
 def run_data_parallel_controller_process(

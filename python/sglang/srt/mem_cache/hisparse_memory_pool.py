@@ -1,7 +1,7 @@
 # mapping on device memory, host memory and memory allocator
 
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -41,6 +41,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        skip_topk_layers: Optional[List[bool]] = None,
     ):
         super().__init__(
             size=size,
@@ -56,6 +57,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            skip_topk_layers=skip_topk_layers,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

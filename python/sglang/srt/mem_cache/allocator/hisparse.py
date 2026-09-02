@@ -26,6 +26,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
         self._size_hisparse = size
+        # Prefix retention (radix-over-hisparse): set via register_retention_cb.
+        self._retention_cb = None
         self.compress_ratio = 1
         self.dtype = dtype
         self.device = device
@@ -81,6 +83,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
         )
+
+    def logical_available_size(self) -> int:
+        """Free logical indices. Retained prefixes hold logical indices (backed
+        by host rows) while owning no device tokens, so pool accounting that
+        subtracts the radix cache's evictable size must use this pool."""
+        return self.logical_attn_allocator.available_size()
 
     def get_kvcache(self):
         return self._kvcache
@@ -255,10 +263,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         return
 
+    def register_retention_cb(self, cb) -> None:
+        """Prefix retention (radix-over-hisparse): called with every logical
+        index batch leaving the allocator, so retained host rows are freed
+        exactly when their logical index is."""
+        self._retention_cb = cb
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
+            if self._retention_cb is not None:
+                self._retention_cb(free_index)
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
         else:
@@ -376,6 +392,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
+
+    def logical_available_size(self) -> int:
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
