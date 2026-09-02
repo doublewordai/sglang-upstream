@@ -134,6 +134,10 @@ class HiSparseCoordinator:
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
+        # pd/mtp-hisparse: the MTP draft model's device-resident KV pool
+        # (logical-indexed). Set by the scheduler after both exist; see
+        # remap_draft_kv_from_host_rows.
+        self.draft_pool = None
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -399,6 +403,7 @@ class HiSparseCoordinator:
           but here the buffer is empty.
         """
         self.alloc_device_buffer(req)
+        self.remap_draft_kv_from_host_rows(req)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
@@ -417,6 +422,48 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
+
+    def remap_draft_kv_from_host_rows(self, req: Req) -> None:
+        """pd/mtp-hisparse: move the transferred draft-layer KV to its logical locs.
+
+        Under hisparse the PD transfer writes EVERY layer (target latent and
+        draft) at the decode arm's *host-row* indices -- the main KV's
+        destination is the pinned host pool, and the draft pool's VRAM buffer
+        is appended to the same index list. The draft model, however, reads
+        its device-resident pool at *logical* locs (req_to_token). Move the
+        just-transferred delta rows host_rows -> logical, via a staging
+        buffer (the two index spaces alias the same pool rows).
+        """
+        if self.draft_pool is None:
+            return
+        idx = req.req_pool_idx
+        adopted = getattr(self, "req_adopted_len", None)
+        start = int(adopted[idx]) if adopted is not None else 0
+        # The transfer wrote exactly [start, host_token_len(kv_allocated_len))
+        # rows (token-granular, matching the prealloc host alloc); the page
+        # tail beyond it was never written.
+        end = min(
+            int(self.req_to_host_pool_allocated_len[idx]),
+            self.host_token_len(req.kv.kv_allocated_len),
+        )
+        if end <= start:
+            return
+        host_rows = self.req_to_host_pool[idx, start:end].to(torch.int64)
+        logical = self.req_to_token_pool.req_to_token[idx, start:end].to(torch.int64)
+        for layer_id in range(self.draft_pool.layer_num):
+            buf = self.draft_pool.get_key_buffer(layer_id)
+            staged = buf.index_select(0, host_rows)
+            buf.index_copy_(0, logical, staged)
+        if envs.SGLANG_MTP_DEBUG.get():
+            logger.info(
+                "HiSparse: remapped draft KV rows [%d, %d) host %s -> logical %s "
+                "for %s",
+                start,
+                end,
+                host_rows[:4].tolist(),
+                logical[:4].tolist(),
+                req.rid,
+            )
 
     def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
@@ -494,7 +541,13 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
-        short_reqs_cpu = seq_lens_cpu <= self.device_buffer_size
+        # pd/mtp-hisparse: grow up to the padded buffer. An MTP verify window
+        # can cross device_buffer_size in one step (positions at/after dbs
+        # take reserved-page slots within [dbs, dbs+page)), so a request stays
+        # "growable" until it holds the full padded buffer; plain decode is
+        # unchanged (it crosses at seq_len == dbs, where new_cap already
+        # becomes padded_buffer_size).
+        short_reqs_cpu = seq_lens_cpu < self.padded_buffer_size
         needs_grow_cpu = short_reqs_cpu & (seq_lens_cpu > current_caps)
 
         if torch.any(needs_grow_cpu):

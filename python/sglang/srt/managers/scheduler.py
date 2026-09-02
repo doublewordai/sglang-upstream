@@ -1324,6 +1324,14 @@ class Scheduler(
             if self.draft_worker is not None
             else None
         )
+        if (
+            self.hisparse_coordinator is not None
+            and draft_token_to_kv_pool is not None
+        ):
+            # pd/mtp-hisparse: the draft pool is appended to the PD transfer's
+            # layer list but receives at host-row indices; the coordinator
+            # remaps it to logical locs at admission (admit_request_direct).
+            self.hisparse_coordinator.draft_pool = draft_token_to_kv_pool
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
