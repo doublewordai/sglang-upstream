@@ -31,6 +31,8 @@ try:
     ]
     _libc.munmap.restype = ctypes.c_int
     _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _libc.madvise.restype = ctypes.c_int
+    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 except OSError:
     _libc = None
 
@@ -210,9 +212,18 @@ def _alloc_thp(n_bytes: int, alloc_bytes: int, strict: bool) -> ctypes.Array:
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
             ptr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-    # enable + fault in THPs
-    _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_HUGEPAGE)
-    _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_POPULATE_WRITE)
+    # enable + fault in THPs (madvise argtypes are declared above; without them
+    # a >2 GiB length silently wraps to a C int and the advice never applies)
+    rc = _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_HUGEPAGE)
+    if rc != 0:
+        e = ctypes.get_errno()
+        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
+        raise OSError(e, f"madvise(MADV_HUGEPAGE) {os.strerror(e)}")
+    rc = _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_POPULATE_WRITE)
+    if rc != 0:
+        e = ctypes.get_errno()
+        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
+        raise OSError(e, f"madvise(MADV_POPULATE_WRITE) {os.strerror(e)}")
     try:
         _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_COLLAPSE)
     except OSError as e:  # <6.1 kernels: coverage check below still applies
