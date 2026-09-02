@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import dataclasses
 import json
@@ -2168,12 +2169,44 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         per-rank footprints used for new-session placement. Gated on a
         DataParallelController owning the scheduler input socket; a bare
         scheduler (dp_size == 1, no EP scale-join) has no handler for the
-        message and no index to clear."""
+        message and no index to clear.
+
+        Thread-safe: the server warmup calls this from its own thread, and
+        the send socket is a zmq.asyncio socket whose (uvloop) send Futures
+        need a current event loop — a direct sock_send from a foreign thread
+        raises RuntimeError("There is no current event loop in thread ...").
+        When a foreign thread calls and the tokenizer manager's loop is
+        running, the send runs on that loop instead (the same pattern as
+        gRPC bridge's _submit_on_tm_loop); we wait for it (bounded) so the
+        clear is ordered before "ready to roll" in the boot log."""
         if not (
             get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
         ):
             return
-        self._dispatch_to_scheduler(ClearPrefixAffinityIndexReq())
+        req = ClearPrefixAffinityIndexReq()
+        loop = self.event_loop
+        on_loop_thread = False
+        try:
+            on_loop_thread = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            pass
+        if loop is not None and loop.is_running() and not on_loop_thread:
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_dispatch_to_scheduler(req), loop
+            )
+            try:
+                future.result(timeout=10.0)
+            except concurrent.futures.TimeoutError:
+                logger.error(
+                    "clear_prefix_affinity_index: timed out sending "
+                    "ClearPrefixAffinityIndexReq on the tokenizer manager loop"
+                )
+            except Exception:
+                logger.exception("clear_prefix_affinity_index: send failed")
+        else:
+            # We are on the tokenizer manager's own loop thread (or no loop
+            # is running); the direct send works there.
+            self._dispatch_to_scheduler(req)
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.

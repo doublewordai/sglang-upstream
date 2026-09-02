@@ -913,8 +913,13 @@ class DataParallelController:
         boot-time warmup traffic cannot pin the per-rank footprints used for
         new-session placement. Requests can also opt out individually with
         is_warmup=True (GenerateReqInput)."""
-        self.prefix_index.clear()
-        logger.info("prefix_affinity index cleared after warmup")
+        dropped = self.prefix_index.clear()
+        logger.info(
+            "prefix_affinity index cleared after warmup (dropped %d entries; "
+            "footprints now %s)",
+            dropped,
+            [self.prefix_index.footprint_tokens(r) for r in self._active_workers],
+        )
 
     def _rank_load(self, rank: int) -> int:
         """Ranks activated beyond the launch dp_size have no budget slot yet
