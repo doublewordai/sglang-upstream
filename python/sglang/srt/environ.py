@@ -599,6 +599,7 @@ class Envs:
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
     SGLANG_DSA_ELIDE_SHARED_INDEX_K = EnvBool(False)
+    SGLANG_DSA_ELIDE_PREFILL_HICACHE = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
