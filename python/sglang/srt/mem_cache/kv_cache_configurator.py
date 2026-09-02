@@ -296,6 +296,12 @@ class KVCacheConfigurator:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        try:
+            from sglang.srt.utils.memory_snapshot import memsnap_phase
+
+            memsnap_phase("after_pools")
+        except Exception:
+            pass
 
         return KVCacheConfigResult(
             max_total_num_tokens=sizes.max_total_num_tokens,

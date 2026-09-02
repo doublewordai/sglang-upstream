@@ -1164,6 +1164,17 @@ class ModelRunner:
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
 
+        try:
+            from sglang.srt.utils.memory_snapshot import (
+                install_memsnap_hooks,
+                memsnap_phase,
+            )
+
+            install_memsnap_hooks(self, self.model)
+            memsnap_phase("after_weights")
+        except Exception:
+            pass
+
         report_online_quantization(model=self.model, server_args=self.server_args)
 
         maybe_register_debug_tensor_dump_hook(
@@ -1509,6 +1520,13 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+
+        try:
+            from sglang.srt.utils.memory_snapshot import memsnap_forward_begin
+
+            memsnap_forward_begin(forward_batch)
+        except Exception:
+            pass
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:

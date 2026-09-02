@@ -395,6 +395,12 @@ def capture_prefill_graph(
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
     )
+    try:
+        from sglang.srt.utils.memory_snapshot import memsnap_phase
+
+        memsnap_phase("after_graphs_prefill")
+    except Exception:
+        pass
     return result(prefill_runner, mem_usage, capture_time)
 
 
@@ -482,6 +488,12 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )
+    try:
+        from sglang.srt.utils.memory_snapshot import memsnap_phase
+
+        memsnap_phase("after_graphs")
+    except Exception:
+        pass
     return GraphCapture(
         runner=runner,
         memory_phase=memory_phase,
