@@ -76,14 +76,18 @@ class PrefixAffinityIndex:
         for lru in self._keys:
             self._trim(lru)
 
-    def clear(self) -> None:
-        """Drop every rank's keys. Used when the server warmup completes: a
-        warmup request's KV is evicted from the radix cache within minutes of
-        boot, but an index entry never ages while its rank is idle, so warmup
-        traffic would otherwise permanently inflate that rank's
-        footprint_tokens and starve it of new sessions."""
+    def clear(self) -> int:
+        """Drop every rank's keys and return how many entries were dropped.
+        Used when the server warmup completes: a warmup request's KV is
+        evicted from the radix cache within minutes of boot, but an index
+        entry never ages while its rank is idle, so warmup traffic would
+        otherwise permanently inflate that rank's footprint_tokens and
+        starve it of new sessions. Idempotent: clearing an empty index
+        returns 0."""
+        dropped = sum(len(lru) for lru in self._keys)
         for lru in self._keys:
             lru.clear()
+        return dropped
 
     def _trim(self, lru: "OrderedDict[int, None]") -> None:
         while len(lru) > self.max_blocks_per_rank:
