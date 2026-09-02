@@ -20,12 +20,38 @@ import ctypes
 import mmap
 import re
 import sys
+from contextlib import contextmanager
 
-import pytest
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+
+try:
+    import pytest
+except ImportError:  # frozen prod venvs have no pytest: run standalone
+    class _Skip(Exception):
+        pass
+
+    class _PytestShim:
+        @staticmethod
+        def skip(msg):
+            raise _Skip(msg)
+
+        @staticmethod
+        @contextmanager
+        def raises(exc):
+            @contextmanager
+            def _cm():
+                try:
+                    yield
+                except exc:
+                    return
+                raise AssertionError(f"expected {exc.__name__}")
+            with _cm():
+                yield
+
+    pytest = _PytestShim()
 
 GIB = 2**30
 MIB = 2**20
@@ -150,4 +176,21 @@ def test_non_strict_unknown_size_falls_back():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    import traceback
+
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    fails = skips = 0
+    for t in tests:
+        try:
+            t()
+            print(f"PASS {t.__name__}", flush=True)
+        except Exception as e:
+            if type(e).__name__ == "Skipped" or "_Skip" in type(e).__name__:
+                skips += 1
+                print(f"SKIP {t.__name__}: {e}", flush=True)
+            else:
+                fails += 1
+                print(f"FAIL {t.__name__}", flush=True)
+                traceback.print_exc()
+    print(f"{len(tests) - fails - skips} pass, {skips} skip, {fails} fail", flush=True)
+    sys.exit(1 if fails else 0)
