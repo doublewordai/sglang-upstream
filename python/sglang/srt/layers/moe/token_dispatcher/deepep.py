@@ -78,6 +78,20 @@ def _is_mnnvl_fabric_supported() -> bool:
     return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
+# lane prefill-graphs: worst-case (CPU-sync-free) normal-mode dispatch.
+# SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS > 0 enables deep_ep's num_worst_tokens
+# intranode dispatch: recv buffers are sized to the bound, intranode_prepare
+# does not host-sync, and the per-expert recv list comes back empty (the
+# masked grouped-GEMM layout is derived on device downstream).
+_deepep_worst_case_recv_tokens = int(
+    __import__("os").environ.get("SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS", "0") or 0
+)
+
+
+def deepep_worst_case_enabled() -> bool:
+    return _deepep_worst_case_recv_tokens > 0
+
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -590,6 +604,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            num_worst_tokens=(
+                _deepep_worst_case_recv_tokens
+                if self.deepep_mode.is_normal()
+                and _deepep_worst_case_recv_tokens > 0
+                and self.group.size() > 1
+                else 0
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(

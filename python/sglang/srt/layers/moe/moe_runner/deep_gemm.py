@@ -1101,6 +1101,53 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation in ("silu", "situ")
 
+    if not num_recv_tokens_per_expert:
+        # lane prefill-graphs: worst-case (num_worst_tokens) dispatch returned no
+        # host per-expert list. Derive the masked grouped-GEMM layout on device
+        # from recv_topk_ids: fixed shapes per chunk size, no CPU sync, and
+        # capturable under CUDA graphs. Padding rows in topk_ids must carry -1
+        # (no selection), which the dispatch-index/fill/reorder kernels skip.
+        from sglang.kernels.ops.moe.ep_moe_kernels import moe_ep_deepgemm_preprocess
+
+        output_dtype = (
+            torch.bfloat16
+            if quant_info.w13_weight.dtype == torch.bfloat16
+            else torch.float8_e4m3fn
+        )
+        masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
+            moe_ep_deepgemm_preprocess(
+                topk_ids,
+                runner_config.num_local_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+                output_dtype=output_dtype,
+                use_mxfp8=quant_info.use_mxfp8,
+            )
+        )
+        if runner_config.inplace:
+            dispose_tensor(hidden_states)
+            if hidden_states_scale is not None:
+                dispose_tensor(hidden_states_scale)
+        running_state["masked_mode"] = True
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states.shape
+        running_state["hidden_states_dtype"] = hidden_states.dtype
+        running_state["hidden_states_device"] = hidden_states.device
+        running_state["src2dst"] = src2dst
+        running_state["mxfp8_act_gran_k"] = (
+            quant_info.block_shape[1] if quant_info.block_shape else 128
+        )
+        return DeepGemmRunnerInput(
+            hidden_states=gateup_input,
+            hidden_states_scale=gateup_input_scale,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
+
+    running_state["masked_mode"] = False
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
 
@@ -1198,6 +1245,34 @@ def post_permute_deep_gemm_to_deepep_normal(
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
+
+    if running_state.get("masked_mode"):
+        # lane prefill-graphs: worst-case path — gather per recv token from the
+        # masked grouped-GEMM output via src2dst (same weighting as ep_gather;
+        # routed scaling stays with the model-level multiply, so pass 1.0).
+        from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
+
+        shape = running_state["hidden_states_shape"]
+        gather_out = torch.empty(
+            shape, device=running_state["hidden_states_device"], dtype=torch.bfloat16
+        )
+        post_reorder_deepgemm(
+            hidden_states,
+            gather_out,
+            running_state["src2dst"],
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            shape[0],
+            shape[1],
+            1.0,
+        )
+        return DeepEPNormalCombineInput(
+            hidden_states=gather_out,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
     output_index = running_state["output_index"]
 
     gather_out = torch.empty(
