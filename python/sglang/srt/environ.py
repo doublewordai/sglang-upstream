@@ -1392,6 +1392,10 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Lane mqa-tune: block configuration for the prefill indexer logits
+    # kernel sm90_fp8_mqa_logits ('off' | 'best' | 'BQ,BKV,QS,KVS,MT').
+    # Same DeepGEMM kernel template, bit-exact; see lanes/mqa-tune.
+    SGLANG_DSA_MQA_LOGITS_VARIANT = EnvStr("off")
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
