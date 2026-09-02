@@ -80,6 +80,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
+    maybe_commit_verify_tokens,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -1199,6 +1200,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            # pd/mtp-hisparse: commit after the draft-extend launch (see
+            # maybe_commit_verify_tokens) so the accept_lens D2H overlaps it.
+            maybe_commit_verify_tokens(batch, batch_output, self.target_worker)
 
             return batch_output
 
