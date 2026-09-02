@@ -439,7 +439,7 @@ class MetadataBuffers:
         prefill stages other than the last skip exactly this range when
         sending aux data (KVArgs.aux_send_spec_bufs)."""
         bufs = self._aux_bufs()
-        start = bufs.index(self.output_topk_p)
+        start = next(i for i, b in enumerate(bufs) if b is self.output_topk_p)
         return start, len(bufs) - 1
 
     def get_buf_infos(self):
