@@ -450,6 +450,7 @@ class NixlPlane:
         # peer_name -> {pool: prep_handle}
         self.preps: Dict[str, Dict[str, Any]] = {}
         self._peers: set = set()
+        self._peer_canonical: Dict[str, str] = {}
         self._lock = threading.RLock()
 
     def ensure(self) -> None:
@@ -497,13 +498,16 @@ class NixlPlane:
         self.ensure()
         return self.agent.get_agent_metadata()
 
-    def add_peer(self, peer_name: str, peer_meta_b64: str) -> None:
+    def add_peer(self, peer_name: str, peer_meta_b64: str) -> str:
+        """Register a remote agent; returns its canonical NIXL name."""
         self.ensure()
         with self._lock:
             if peer_name in self._peers:
-                return
-            self.agent.add_remote_agent(base64.b64decode(peer_meta_b64))
+                return self._peer_canonical.get(peer_name, peer_name)
+            canonical = self.agent.add_remote_agent(base64.b64decode(peer_meta_b64))
+            self._peer_canonical[peer_name] = canonical
             self._peers.add(peer_name)
+            return canonical
 
     def drain_notifs(self, seconds: float = 1.0) -> int:
         """Drain transfer-completion notifs (a WRITE's remote completion)."""
@@ -524,12 +528,26 @@ class NixlPlane:
             if peer_name in self.preps:
                 return self.preps[peer_name]
             self.ensure()
-            preps = {}
-            for pool, geom in self.geoms.items():
-                preps[pool] = self.agent.prep_xfer_dlist(
-                    peer_name, geom.descs, "DRAM"
-                )
-                assert preps[pool] is not None, f"prep_xfer_dlist None for {pool}"
+            canonical = self._peer_canonical.get(peer_name, peer_name)
+            preps = None
+            # loadRemoteMD is asynchronous: the remote agent's registrations
+            # become visible to the backend only after its handshake completes
+            # (observed as NIXL_ERR_NOT_FOUND from prepXferDlist). Retry a few
+            # seconds; this cost is paid once per peer pair.
+            last_err = None
+            for attempt in range(40):
+                try:
+                    preps = {}
+                    for pool, geom in self.geoms.items():
+                        h = self.agent.prep_xfer_dlist(canonical, geom.descs, "DRAM")
+                        assert h is not None, f"prep_xfer_dlist None for {pool}"
+                        preps[pool] = h
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    time.sleep(0.25)
+            if preps is None:
+                raise RuntimeError(f"prep_xfer_dlist failed for {peer_name!r}: {last_err}")
             self.preps[peer_name] = preps
             return preps
 
