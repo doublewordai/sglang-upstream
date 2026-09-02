@@ -296,6 +296,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -3076,6 +3077,16 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=last_tokens)
         self.future_map.stash(batch.req_pool_indices, payload)
         batch.input_ids = None
+
+        if self.spec_algorithm.is_eagle():
+            # Unified hisparse flow: the batch needs a spec_info for the spec
+            # worker; future-indices mode resolves the (zero-padded) state from
+            # the relay. On the PD decode arm transferred requests bypass this
+            # builder (admit_request_direct), so this is unified-rig only.
+            batch.spec_info = EagleDraftInput(
+                bonus_tokens=last_tokens,
+                future_indices=batch.req_pool_indices,
+            )
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
