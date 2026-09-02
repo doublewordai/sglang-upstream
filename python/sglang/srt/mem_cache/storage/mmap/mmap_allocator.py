@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.util
+import errno
 import logging
 import math
 import mmap
@@ -135,7 +136,31 @@ def _alloc_plain(alloc_bytes: int) -> mmap.mmap:
     return mm
 
 
-def _alloc_thp(n_bytes: int, alloc_bytes: int, strict: bool) -> mmap.mmap:
+def _thp_pmd_size() -> int:
+    """PMD (transparent huge page) size in bytes; 2 MiB fallback."""
+    try:
+        return int(open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size").read())
+    except (OSError, ValueError):
+        return 2 * 1024 * 1024
+
+
+def _mmap_libc(size: int, hint: int, flags: int) -> int:
+    """Raw libc mmap; returns the address (raises OSError on failure)."""
+    ptr = _libc.mmap(
+        ctypes.c_void_p(hint) if hint else None,
+        size,
+        mmap.PROT_READ | mmap.PROT_WRITE,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | flags,
+        -1,
+        0,
+    )
+    if ptr is None or ptr == _MAP_FAILED:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    return ptr
+
+
+def _alloc_thp(n_bytes: int, alloc_bytes: int, strict: bool) -> ctypes.Array:
     """Private anonymous mapping backed by PMD transparent huge pages.
 
     THP is the fallback when the hugetlb pool cannot be reserved (no root):
@@ -144,23 +169,58 @@ def _alloc_thp(n_bytes: int, alloc_bytes: int, strict: bool) -> mmap.mmap:
     512 MiB pages directly and MADV_COLLAPSE picks up any stragglers. Like
     hugetlbfs pages, THP pages are not LRU-compactable, so the kcompactd
     pinned-page storm fixed by SGLANG_MAP_HOST_POOL_PRIVATE cannot recur.
+
+    The mapping is forced to start on a PMD boundary (MAP_FIXED_NOREPLACE
+    probe ladder, else kernel-chosen address trimmed head+tail): a
+    page-aligned start can lose up to one whole PMD (25% of a 2 GiB pool) to
+    the alignment gap, which otherwise silently caps THP coverage.
     """
-    mm = mmap.mmap(
-        -1,
-        alloc_bytes,
-        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
-    mm.madvise(_MADV_HUGEPAGE)
-    mm.madvise(_MADV_POPULATE_WRITE)
+    pmd = _thp_pmd_size()
+    ptr = None
+    if _libc is not None:
+        noreplace = getattr(mmap, "MAP_FIXED_NOREPLACE", 0x100000)
+        for base in (0x10000000000, 0x400000000000, 0x800000000000):
+            hint = base
+            for _ in range(64):
+                try:
+                    ptr = _mmap_libc(alloc_bytes, hint, noreplace)
+                    break
+                except OSError as e:
+                    if e.errno != errno.EEXIST:
+                        ptr = None
+                        break
+                    hint += pmd
+            if ptr is not None:
+                break
+    if ptr is None:
+        if _libc is not None:
+            over = alloc_bytes + pmd
+            raw = _mmap_libc(over, 0, 0)
+            aligned = (raw + pmd - 1) & ~(pmd - 1)
+            if aligned != raw:
+                _libc.munmap(ctypes.c_void_p(raw), aligned - raw)
+            tail = raw + over - (aligned + alloc_bytes)
+            if tail > 0:
+                _libc.munmap(ctypes.c_void_p(aligned + alloc_bytes), tail)
+            ptr = aligned
+        else:
+            mm = mmap.mmap(
+                -1, alloc_bytes,
+                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+    # enable + fault in THPs
+    _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_HUGEPAGE)
+    _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_POPULATE_WRITE)
     try:
-        mm.madvise(_MADV_COLLAPSE)
+        _libc.madvise(ctypes.c_void_p(ptr), alloc_bytes, _MADV_COLLAPSE)
     except OSError as e:  # <6.1 kernels: coverage check below still applies
         logger.warning("MADV_COLLAPSE unavailable (%s); THP coverage may be partial", e)
-    huge_kb = _thp_anon_huge_kb(_mm_ptr(mm))
+    huge_kb = _thp_anon_huge_kb(ptr)
     coverage = huge_kb * 1024 / alloc_bytes
     if strict and coverage < 0.98:
-        mm.close()
+        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
         raise RuntimeError(
             f"SGLANG_HUGEPAGE_SIZE=THP with SGLANG_HUGEPAGE_STRICT=1 but only "
             f"{coverage:.1%} of {alloc_bytes >> 20} MiB is THP-backed "
@@ -169,18 +229,16 @@ def _alloc_thp(n_bytes: int, alloc_bytes: int, strict: bool) -> mmap.mmap:
     if coverage < 0.5:
         logger.warning(
             "THP host pool only %.1f%% hugepage-backed (AnonHugePages=%d kB of %d MiB)",
-            coverage * 100,
-            huge_kb,
-            alloc_bytes >> 20,
+            coverage * 100, huge_kb, alloc_bytes >> 20,
         )
     else:
         logger.info(
             "THP host pool %.1f%% hugepage-backed (AnonHugePages=%d kB of %d MiB)",
-            coverage * 100,
-            huge_kb,
-            alloc_bytes >> 20,
+            coverage * 100, huge_kb, alloc_bytes >> 20,
         )
-    return mm
+    array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
+    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
+    return array
 
 
 def _mm_ptr(mm: mmap.mmap) -> int:
@@ -215,9 +273,10 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
 
     if hugepage_size == "THP":
-        alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
-        mm = _alloc_thp(n_bytes, alloc_bytes, strict)
-        return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+        page_size = _thp_pmd_size()  # PMD multiple so coverage is not tail-capped
+        alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+        array = _alloc_thp(n_bytes, alloc_bytes, strict)
+        return torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
     if hugepage_size == "":
         page_size, extra_flags = mmap.PAGESIZE, 0
