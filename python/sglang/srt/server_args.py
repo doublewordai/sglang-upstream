@@ -806,7 +806,7 @@ class ServerArgs:
     ] = None
     chunked_prefill_size_small: A[
         Optional[int],
-        "When set (with chunked prefill enabled), while a short or warm request is waiting in the local queue, chunked prefills advance in chunks of this size instead of --chunked-prefill-size, so the waiting request can join the next prefill step instead of waiting for a full-size chunk to retire. Short = at most 16384 new (uncached) tokens; warm = prefix cache hit of at least 90%. Like --chunked-prefill-size this is a global size that is divided by dp_size under DP attention. Default None (off: always use --chunked-prefill-size).",
+        "When set (with chunked prefill enabled), while a short or warm request is waiting in the local queue, chunked prefills advance in chunks of this size instead of --chunked-prefill-size, so the waiting request can join the next prefill step instead of waiting for a full-size chunk to retire. Short = at most 16384 new (uncached) tokens; warm = prefix cache hit of at least 90 percent. Like --chunked-prefill-size this is a global size that is divided by dp_size under DP attention. Default None (off: always use --chunked-prefill-size).",
         NS("schedule"),
     ] = None
     enable_dynamic_chunking: A[
