@@ -471,18 +471,27 @@ class HiCacheBlob(HiCacheStorage):
         g0 = start // self.blob_pages
         hit_abs = start
         g = g0
+        trace = []
         while g * self.blob_pages < n_abs:
             p0 = g * self.blob_pages
             if p0 > hit_abs:
+                trace.append(f"gap@{p0}")
                 break  # gap before this group
-            np_ = self._coverage_of_group(self._group_id(full_chain[p0], self._poolset))
+            gid = self._group_id(full_chain[p0], self._poolset)
+            np_ = self._coverage_of_group(gid)
+            trace.append(f"g{g}:{gid[:8]}:np{np_}")
             if np_ == 0:
                 break
             hit_abs = min(p0 + np_, n_abs)
             if np_ < self.blob_pages:
                 break  # partial group: prefix ends here
             g += 1
-        return max(0, min(hit_abs, n_abs) - start)
+        hit = max(0, min(hit_abs, n_abs) - start)
+        logger.info(
+            "[blob] hit_pages start=%d n_abs=%d nkeys=%d hit=%d trace=%s",
+            start, n_abs, n_abs - start, hit, ",".join(trace),
+        )
+        return hit
 
     def batch_exists_v2(
         self,

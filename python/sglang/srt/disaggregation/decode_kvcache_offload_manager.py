@@ -57,6 +57,22 @@ class DecodeKVCacheOffloadManager:
             self.offload_stride = max(
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
+        # Blob-style backends group pages by absolute chain position; offload
+        # chunks must end on group boundaries so every group is written whole
+        # by a single op (a group split across ops loses all pages after its
+        # first, by the head-group rule). Group-aligned chunking below.
+        self.offload_group_tokens = 0
+        if server_args.hicache_storage_backend == "blob":
+            try:
+                cfg = json.loads(
+                    server_args.hicache_storage_backend_extra_config or "{}"
+                )
+                blob_pages = int(cfg.get("blob_pages", 16))
+            except Exception:
+                blob_pages = 16
+            self.offload_group_tokens = max(
+                self.page_size, blob_pages * self.page_size
+            )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
             raise ValueError("Unsupported KV cache type for decode offload")
@@ -209,6 +225,9 @@ class DecodeKVCacheOffloadManager:
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
         )
+        incremental_aligned_len = self._group_align_incremental(
+            state, incremental_aligned_len, req
+        )
 
         if incremental_aligned_len == 0:
             return False
@@ -271,6 +290,38 @@ class DecodeKVCacheOffloadManager:
         )
         state.inc_len += incremental_aligned_len
         return True
+
+    def _group_align_incremental(self, state, page_aligned_len, req) -> int:
+        """Cap an offload chunk so storage groups are written whole.
+
+        Blob backends write only groups whose FIRST page lies inside the op's
+        page range; an op must therefore end on a group boundary (any start is
+        fine). While decoding we wait for a chunk that spans at least one full
+        group past the next boundary; at request finish we flush the remaining
+        page-aligned tail (its final group is written partial-from-head).
+        The sliver between a turn boundary and the next group boundary is not
+        offloadable by design (bounded < group per turn, like the prefill
+        side's node-boundary rule).
+        """
+        G = self.offload_group_tokens
+        if G <= self.page_size or page_aligned_len == 0:
+            return page_aligned_len
+        start_abs = state.prefill_len + state.inc_len
+        if start_abs % G == 0:
+            whole = (page_aligned_len // G) * G
+            if req.finished():
+                return page_aligned_len  # flush tail (partial final group ok)
+            return whole
+        to_boundary = G - (start_abs % G)
+        if page_aligned_len < to_boundary:
+            return 0 if not req.finished() else page_aligned_len
+        rest = page_aligned_len - to_boundary
+        if req.finished():
+            return page_aligned_len
+        whole_groups = (rest // G) * G
+        if whole_groups == 0:
+            return 0  # wait for a full group past the boundary
+        return to_boundary + whole_groups
 
     def check_offload_progress(self):
         """Check the progress of offload from device to host and backup from host to storage."""

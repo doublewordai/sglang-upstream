@@ -2763,7 +2763,12 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
+                    # FULL chain incl. the matched node's own pages: the core
+                    # get_prefix_hash_values returns ancestors only, and
+                    # position-aware storage backends (blob) address groups
+                    # by absolute chain position.
                     tree_cache.get_prefix_hash_values(req.last_host_node)
+                    + tree_cache.get_hash_values(req.last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )

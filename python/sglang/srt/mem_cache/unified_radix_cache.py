@@ -1461,6 +1461,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        return self.tree_core.get_hash_values(node_id)
+
     def prefetch_from_storage(
         self,
         req_id: str,
