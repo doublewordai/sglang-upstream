@@ -1056,9 +1056,9 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
         mark("weights_apply_end")
         mark("post_load_weights_begin")
+        for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -1068,6 +1068,7 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+        mark("post_load_weights_end")
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -2613,7 +2614,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     with device_loading_context(module, target_device):
-        mark("post_load_weights_end")
                         quant_method.process_weights_after_loading(module)
 
             rank, _ = self._world_rank_and_size()
