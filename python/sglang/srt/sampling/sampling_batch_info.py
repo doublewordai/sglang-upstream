@@ -280,13 +280,15 @@ class SamplingBatchInfo:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
-        if self.acc_additive_penalties is not None:
+    def apply_logits_bias(self, logits: torch.Tensor, skip_penalties: bool = False):
+        # skip_penalties: the fused-sampling kernel applies the acc_* penalty
+        # tensors itself (lane fused-sampling); model_runner stashes them on
+        # _fused_pending_penalties for the Sampler.
+        if self.acc_additive_penalties is not None and not skip_penalties:
             # Used in the overlap mode
             logits.add_(self.acc_additive_penalties)
 
-        if self.acc_scaling_penalties is not None:
-            # Used in the overlap mode
+        if self.acc_scaling_penalties is not None and not skip_penalties:
             apply_scaling_penalties(logits, self.acc_scaling_penalties)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:

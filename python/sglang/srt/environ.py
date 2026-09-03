@@ -450,6 +450,8 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    SGLANG_DSA_IN_GRAPH_METADATA = EnvBool(False)
+    SGLANG_HISPARSE_FAST_BACKUP = EnvBool(False)
     # mtp-debug lane: log the first target-verify step's hisparse page table
     # and the draft pool's transferred rows (diagnosis of spec x hisparse).
     SGLANG_MTP_DEBUG = EnvBool(False)
@@ -573,6 +575,13 @@ class Envs:
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
     SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
+    # Fuse the post-logits decode pipeline (temperature -> softmax -> token
+    # selection) into one Triton kernel, bit-exact vs the eager reference
+    # (greedy: torch.argmax tie-break; sampled: torch.multinomial's gumbel-max
+    # composite with identical philox RNG consumption). Falls back to the
+    # reference path for top-k/top-p/min-p, seeded/deterministic sampling,
+    # logprob requests, and non-CUDA devices.
+    SGLANG_FUSED_SAMPLING = EnvBool(False)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
@@ -597,6 +606,9 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Diagnostic: log HiSparse verify-step miss counts (per draft position,
+    # last anchor group's plans) every N verify steps; 0 = off.
+    SGLANG_HISPARSE_MISS_LOG = EnvInt(0)
     # Plan-then-IO swap-in split: the fused kernel plans only and a
     # full-GPU-grid kernel copies the recorded miss plan (warp per row).
     # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
@@ -720,6 +732,9 @@ class Envs:
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
     SGLANG_MAP_HOST_POOL_PRIVATE = EnvBool(False)
+    # Raise (instead of warn) at boot when a host KV pool has <99% of its
+    # populated pages on the GPU-local NUMA node (mmap_allocator check).
+    SGLANG_NUMA_LOCALITY_STRICT = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
@@ -1185,7 +1200,24 @@ class Envs:
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # EAGLE adaptive verify (lane/adaptive-spec): per-request verify lengths from
+    # draft confidence + an SPS cost table. Requires SGLANG_RAGGED_VERIFY_MODE=compact.
+    SGLANG_EAGLE_ADAPTIVE_VERIFY = EnvBool(False)
+    # Lane M3: force every request's verify_len (grid timing measurement).
+    SGLANG_EAGLE_FORCE_VERIFY_LEN = EnvInt(0)
+    # Lane M3: append per-step verify timing rows to this jsonl path.
+    SGLANG_EAGLE_VERIFY_TIMING = EnvStr("")
+    # Lane A/B: cap swap-in positions per layer in the ragged verify page
+    # table build (measurement only; unsafe for mixed-vl graph replays).
+    SGLANG_EAGLE_SWAPIN_MAXPOS = EnvInt(0)
+    # Path to an SPS cost table JSON (SpsCostTable or SpsAdditiveCostTable format,
+    # see dspark_sps.py) for the EAGLE adaptive verify budget scheduler. Without
+    # it the schedule degenerates to verify-all (full width through the ragged
+    # graphs) and a warning is logged.
+    SGLANG_EAGLE_SPS_TABLE = EnvStr("")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Lane debug: log ragged verify page-table shapes/values (one line per call).
+    SGLANG_RAGGED_DEBUG = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
@@ -1423,6 +1455,12 @@ class Envs:
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
     SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    # Warm-start the full-grid decode top-k: carry the previous decode step's
+    # k-th logit minus a delta-sigma margin per (request, layer) as the
+    # threshold seed; 1 streaming pass + exact refine on a hit, full 2-pass
+    # fallback on a miss (requires SGLANG_DSA_TOPK_DECODE_FG).
+    SGLANG_DSA_TOPK_WARMSTART = EnvBool(False)
+    SGLANG_DSA_TOPK_WARMSTART_DELTA = EnvFloat(0.3)
 
     # Decode-shaped Triton paged-MQA logits kernel
     # (kernels/ops/attention/dsa/decode_mqa_logits.py) replacing the DeepGEMM
