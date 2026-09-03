@@ -1372,6 +1372,12 @@ class Envs:
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
     SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    # Warm-start the full-grid decode top-k: carry the previous decode step's
+    # k-th logit minus a delta-sigma margin per (request, layer) as the
+    # threshold seed; 1 streaming pass + exact refine on a hit, full 2-pass
+    # fallback on a miss (requires SGLANG_DSA_TOPK_DECODE_FG).
+    SGLANG_DSA_TOPK_WARMSTART = EnvBool(False)
+    SGLANG_DSA_TOPK_WARMSTART_DELTA = EnvFloat(0.3)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

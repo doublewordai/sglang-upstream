@@ -68,6 +68,7 @@ class DSATopKBackend(Enum):
         lengths: torch.Tensor,
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
+        warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
             if self._should_use_decode_fg(score, lengths, topk, row_starts):
@@ -75,7 +76,14 @@ class DSATopKBackend(Enum):
                     topk_decode_fg,
                 )
 
-                return topk_decode_fg(score, lengths, topk)
+                return topk_decode_fg(
+                    score,
+                    lengths,
+                    topk,
+                    warmstart=envs.SGLANG_DSA_TOPK_WARMSTART.get(),
+                    delta=envs.SGLANG_DSA_TOPK_WARMSTART_DELTA.get(),
+                    warm_key=warm_key or 0,
+                )
 
             from sgl_kernel import fast_topk_v2
 
@@ -119,9 +127,12 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            return self.topk_func(
+                logits, lengths, topk, row_starts=row_starts, warm_key=warm_key
+            )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
