@@ -808,13 +808,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+            elif forward_batch.forward_mode.is_idle():
+                # DP-attention idle rank: build_eagle_verify_input discards the
+                # draft outputs for idle batches, and the draft runs
+                # attn-TP-local under draft_tp_context, so skip the 0-row
+                # nextn forward entirely (it cannot make collective progress
+                # anyway and crashes on empty metadata/JIT shapes).
+                empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+                parent_list, top_scores_index, draft_tokens, draft_probs = (
+                    empty,
+                    empty,
+                    empty.view(0, 0),
+                    None,
+                )
             else:
                 if self.speculative_num_steps > 1:
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
-                    # Idle DP batches still run the draft forward (collective
-                    # lockstep) and deepseek_nextn's indexer reads
-                    # forward_metadata, so init runs for them too.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
