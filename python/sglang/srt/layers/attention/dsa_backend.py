@@ -2040,6 +2040,17 @@ class DeepseekSparseAttnBackend(
                 topk_pos = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 bs = topk_pos.shape[0] // n
                 tk = topk_pos.view(bs, n, -1)
+                if (
+                    getattr(self.hisparse_coordinator, "dpf_prefetch_enabled", False)
+                    and layer.layer_id == 0
+                ):
+                    # Fork the draft-seed prefetch before the first real
+                    # swap-in of the step (no-op after the first position).
+                    self.hisparse_coordinator.begin_draft_prefetch(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        bs,
+                    )
                 out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
                 outv = out.view(bs, n, -1)
                 probe = getattr(self.hisparse_coordinator, "dpf_probe", None)

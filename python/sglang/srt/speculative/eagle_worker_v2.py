@@ -1172,10 +1172,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 _dpf_coord = getattr(
                     self.target_worker.model_runner, "hisparse_coordinator", None
                 )
-                if _dpf_coord is not None and _dpf_coord.dpf_probe is not None:
-                    _dpf_coord.dpf_probe.on_draft_seed(
-                        getattr(batch.spec_info, "dsa_topk_indices", None)
-                    )
+                if _dpf_coord is not None:
+                    if _dpf_coord.dpf_probe is not None:
+                        _dpf_coord.dpf_probe.on_draft_seed(
+                            getattr(batch.spec_info, "dsa_topk_indices", None)
+                        )
+                    if _dpf_coord.dpf_prefetch_enabled:
+                        _dpf_coord.dpf_on_seed(
+                            getattr(batch.spec_info, "dsa_topk_indices", None),
+                            int(batch.seq_lens.shape[0]),
+                        )
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group

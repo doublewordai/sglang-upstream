@@ -266,6 +266,19 @@ class HiSparseCoordinator:
             max_num_req_slots=max_num_req_slots,
         )
 
+        # draft-seed prefetch (lane/draft-prefetch, SGLANG_DPF_PREFETCH)
+        self.dpf_prefetch_enabled = bool(envs.SGLANG_DPF_PREFETCH.get()) and (
+            not self.is_dsv4_hisparse
+        )
+        self.dpf_prefetch_stream = None
+        self._dprefetch_events = None
+        self.dpf_seed_buf = None
+        self.dprefetch_nreqs = None
+        self._dprefetch_out = None
+        self._dprefetch_forked = False
+        if self.dpf_prefetch_enabled:
+            self._init_draft_prefetch(max_num_req_slots)
+
         # draft-prefetch probe (lane/draft-prefetch, SGLANG_DPF_PROBE)
         self.dpf_probe = None
         if envs.SGLANG_DPF_PROBE.get():
@@ -282,6 +295,101 @@ class HiSparseCoordinator:
                 self.dpf_probe.probe_reqs,
                 self.dpf_probe.out_path,
             )
+
+    def _init_draft_prefetch(self, max_num_req_slots: int) -> None:
+        """Persistent state for the draft-seed prefetch (see patch header).
+        The prefetch launches are issued inside the verify CUDA graph (join
+        pattern); every per-step input is a device buffer updated by the host
+        before replay: dpf_seed_buf (the draft seed positions, -1 rows for
+        padded requests are never read because the kernel early-returns on
+        bid >= num_real_reqs[0]) and dprefetch_nreqs (0 disables the prefetch
+        work while keeping the per-layer events recorded -> no stalls)."""
+        dev = self.device
+        self.dpf_prefetch_stream = device_module.Stream()
+        self.dpf_seed_buf = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=dev
+        )
+        # num_real_reqs-style gate for the prefetch kernels (device scalar).
+        self.dprefetch_nreqs = torch.zeros(1, dtype=torch.int32, device=dev)
+        # scratch output table for the prefetch swap-ins (never consumed; the
+        # real swap-in re-plans against the updated resident tables).
+        self._dprefetch_out = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=dev
+        )
+        layer_num = self.mem_pool_device.layer_num
+        self._dprefetch_events = [device_module.Event() for _ in range(layer_num)]
+        logger.info(
+            "HiSparse: draft-seed prefetch enabled (%d layers, top_k=%d).",
+            layer_num,
+            self.top_k,
+        )
+
+    def dpf_on_seed(self, seed: Optional[torch.Tensor], bs: int) -> None:
+        """Host hook before the draft step: refresh the persistent seed
+        buffer and the per-step prefetch gate. Called from
+        EAGLEWorkerV2.forward_batch_generation (same place the probe hooks)."""
+        if not self.dpf_prefetch_enabled:
+            return
+        self._dprefetch_forked = False
+        if seed is None or bs <= 0:
+            self.dprefetch_nreqs.fill_(0)
+            return
+        assert seed.shape[-1] == self.top_k and seed.dtype in (
+            torch.int32,
+            torch.int64,
+        ), f"dpf seed: bad shape {tuple(seed.shape)} / dtype {seed.dtype}"
+        n = min(bs, self.dpf_seed_buf.shape[0])
+        self.dpf_seed_buf[:n].copy_(seed[:n].to(torch.int32))
+        self.dprefetch_nreqs.fill_(n)
+
+    def begin_draft_prefetch(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bs: int,
+    ) -> None:
+        """Fork the per-layer seed prefetch on the side stream. Called at the
+        first verify swap-in call of the step (layer 0, position 0) from
+        dsa_backend; inside CUDA-graph capture this joins the graph (same
+        pattern as the shared-index prefetch fork). req_pool_indices/seq_lens
+        must be the same tensors the real swap-ins use so replays see current
+        values."""
+        if not self.dpf_prefetch_enabled or self._dprefetch_forked:
+            return
+        self._dprefetch_forked = True
+        # Match the real swap-in's position-0 window: seq_lens + 1 with
+        # num_newest=1 binds the window [S, S+1) to the reserved page; the
+        # seed's selections are all <= S-1 (host-backed).
+        seq_lens = seq_lens + 1
+        swap_in_fn = (
+            load_cache_to_device_buffer_dsv4_mla
+            if self.is_dsv4_hisparse
+            else load_cache_to_device_buffer_mla
+        )
+        # Fork: the prefetch stream observes everything the compute stream has
+        # done so far (this layer's KV write) before its kernels run.
+        self.dpf_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self.dpf_prefetch_stream):
+            for layer_id in range(self.mem_pool_device.layer_num):
+                swap_in_fn(
+                    top_k_tokens=self.dpf_seed_buf,
+                    device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                    host_cache_locs=self.req_to_host_pool,
+                    device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    top_k_device_locs=self._dprefetch_out,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    lru_slots=self.lru_slots[layer_id],
+                    item_size_bytes=self.item_size_bytes,
+                    num_top_k=self.top_k,
+                    hot_buffer_size=self.device_buffer_size,
+                    page_size=1,
+                    block_size=self.swap_in_block_size,
+                    num_real_reqs=self.dprefetch_nreqs,
+                )
+                self._dprefetch_events[layer_id].record(self.dpf_prefetch_stream)
 
     def _init_shared_index_prefetch(
         self,
@@ -1415,6 +1523,12 @@ class HiSparseCoordinator:
             )
 
         num_reqs = req_pool_indices.size(0)
+        if self.dpf_prefetch_enabled:
+            # Order the real swap-in after this layer's seed prefetch. The
+            # events are always recorded (no-op prefetch kernels still run
+            # and record), so this never stalls when the prefetch is gated
+            # off for a step.
+            self._dprefetch_events[layer_id].wait(device_module.current_stream())
         if self._is_shared_index_layer[layer_id]:
             # Skip layer: wait for its prefetched copy; the anchor's slot table
             # applies (shared index + lockstep buffers).
