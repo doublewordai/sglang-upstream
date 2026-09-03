@@ -2098,6 +2098,15 @@ class DeepseekSparseAttnBackend(
                         forward_batch.seq_lens[:4].tolist(),
                         forward_batch.out_cache_loc[:8].tolist(),
                     )
+                if (
+                    getattr(self.hisparse_coordinator, "dpf_prefetch_enabled", False)
+                    and self.hisparse_coordinator._dprefetch_forked
+                ):
+                    # Stagger: issue the next layer's seed prefetch while this
+                    # layer's attention + MoE run.
+                    self.hisparse_coordinator.issue_next_layer_prefetch(
+                        layer.layer_id
+                    )
                 page_table_1 = out
             else:
                 # flash_mla_sparse_fwd / tilelang require int32 page indices.

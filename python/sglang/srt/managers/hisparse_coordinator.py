@@ -357,39 +357,66 @@ class HiSparseCoordinator:
         if not self.dpf_prefetch_enabled or self._dprefetch_forked:
             return
         self._dprefetch_forked = True
+        self._dprefetch_next_layer = 0
         # Match the real swap-in's position-0 window: seq_lens + 1 with
         # num_newest=1 binds the window [S, S+1) to the reserved page; the
         # seed's selections are all <= S-1 (host-backed).
-        seq_lens = seq_lens + 1
+        self._dprefetch_req_pool_indices = req_pool_indices
+        self._dprefetch_seq_lens = seq_lens + 1
+        # Fork: the prefetch stream observes everything the compute stream has
+        # done so far (this layer's KV write) before its kernels run. Only
+        # layer 0 is issued here; each later layer is issued while the
+        # previous layer computes (issue_next_layer_prefetch), so the single
+        # side stream never serializes ahead of the compute stream.
+        self.dpf_prefetch_stream.wait_stream(device_module.current_stream())
+        self._issue_layer_prefetch(0)
+
+    def _issue_layer_prefetch(self, layer_id: int) -> None:
+        """Launch layer_id's seed prefetch on the side stream and record its
+        event. Called for layer 0 at the fork and for l+1 after layer l's
+        verify swap-ins (dsa_backend), giving one-prefetch-deep overlap."""
+        assert self._dprefetch_forked
+        if layer_id >= self.mem_pool_device.layer_num:
+            return
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
-        # Fork: the prefetch stream observes everything the compute stream has
-        # done so far (this layer's KV write) before its kernels run.
-        self.dpf_prefetch_stream.wait_stream(device_module.current_stream())
         with device_module.stream(self.dpf_prefetch_stream):
-            for layer_id in range(self.mem_pool_device.layer_num):
-                swap_in_fn(
-                    top_k_tokens=self.dpf_seed_buf,
-                    device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-                    host_cache_locs=self.req_to_host_pool,
-                    device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
-                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-                    top_k_device_locs=self._dprefetch_out,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
-                    lru_slots=self.lru_slots[layer_id],
-                    item_size_bytes=self.item_size_bytes,
-                    num_top_k=self.top_k,
-                    hot_buffer_size=self.device_buffer_size,
-                    page_size=1,
-                    block_size=self.swap_in_block_size,
-                    num_real_reqs=self.dprefetch_nreqs,
-                )
-                self._dprefetch_events[layer_id].record(self.dpf_prefetch_stream)
+            swap_in_fn(
+                top_k_tokens=self.dpf_seed_buf,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=self._dprefetch_out,
+                req_pool_indices=self._dprefetch_req_pool_indices,
+                seq_lens=self._dprefetch_seq_lens,
+                lru_slots=self.lru_slots[layer_id],
+                item_size_bytes=self.item_size_bytes,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=self.swap_in_block_size,
+                num_real_reqs=self.dprefetch_nreqs,
+            )
+            self._dprefetch_events[layer_id].record(self.dpf_prefetch_stream)
+
+    def issue_next_layer_prefetch(self, just_finished_layer: int) -> None:
+        """dsa_backend calls this after just_finished_layer's verify swap-in
+        loop: stagger the next layer's prefetch behind this point on the
+        compute stream (it overlaps the current layer's attention+MoE)."""
+        if not self.dpf_prefetch_enabled or not self._dprefetch_forked:
+            return
+        nxt = just_finished_layer + 1
+        if nxt >= self.mem_pool_device.layer_num:
+            return
+        # The side stream waits for the compute stream's progress up to here
+        # (one-prefetch-deep), then launches the next layer's copy.
+        self.dpf_prefetch_stream.wait_stream(device_module.current_stream())
+        self._issue_layer_prefetch(nxt)
 
     def _init_shared_index_prefetch(
         self,
