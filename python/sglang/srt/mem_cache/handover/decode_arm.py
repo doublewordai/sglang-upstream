@@ -466,3 +466,69 @@ class _PtrView:
         # torch view over the ctypes buffer
         t = torch.frombuffer(self._buf, dtype=torch.uint8)
         return t.view(-1, item)
+
+
+# ---------------------------------------------------------------------------
+# Serialization (mirror of the prefill-arm manifest format)
+# ---------------------------------------------------------------------------
+
+
+def decode_export_to_bytes(export: DecodeExport, page_size: int) -> bytes:
+    import json as _json
+
+    header = {
+        "n_chains": len(export.chains),
+        "host_item_len": export.host_item_len,
+        "index_item_len": export.index_item_len,
+        "layer_num": export.layer_num,
+        "page_size": page_size,
+    }
+    hb = _json.dumps(header).encode()
+    parts = [np.uint32(len(hb)).tobytes(), hb]
+    for c in export.chains:
+        tokens = np.frombuffer(c.tokens, dtype=np.int64)
+        parts.append(np.uint64(len(tokens)).tobytes())
+        parts.append(tokens.tobytes())
+        parts.append(np.uint64(c.n_seg_pages).tobytes())
+        parts.append(c.old_logical_pages.astype(np.int64).tobytes())
+        parts.append(c.host_row_pages.astype(np.int64).tobytes())
+    return b"".join(parts)
+
+
+def bytes_to_decode_export(b: bytes) -> Tuple[DecodeExport, int]:
+    import json as _json
+    from array import array as _array
+
+    off = 0
+
+    def take(n):
+        nonlocal off
+        assert off + n <= len(b), "decode manifest truncated"
+        out = b[off : off + n]
+        off += n
+        return out
+
+    hlen = int(np.frombuffer(take(4), dtype=np.uint32)[0])
+    header = _json.loads(take(hlen).decode())
+    export = DecodeExport(
+        host_item_len=int(header["host_item_len"]),
+        index_item_len=int(header["index_item_len"]),
+        layer_num=int(header["layer_num"]),
+    )
+    for _ in range(header["n_chains"]):
+        ntok = int(np.frombuffer(take(8), dtype=np.uint64)[0])
+        tokens = _array("q")
+        tokens.frombytes(take(ntok * 8))
+        n_seg = int(np.frombuffer(take(8), dtype=np.uint64)[0])
+        old_logical = np.frombuffer(take(n_seg * 8), dtype=np.int64).copy()
+        host_rows = np.frombuffer(take(n_seg * 8), dtype=np.int64).copy()
+        export.chains.append(
+            DecodeChain(
+                tokens=tokens,
+                n_seg_pages=n_seg,
+                old_logical_pages=old_logical,
+                host_row_pages=host_rows,
+            )
+        )
+    assert off == len(b)
+    return export, int(header["page_size"])
