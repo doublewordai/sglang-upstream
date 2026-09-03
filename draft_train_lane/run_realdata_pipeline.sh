@@ -58,6 +58,17 @@ if [ "${SKIP_CAPTURE:-0}" != 1 ]; then
   kill $SRV $LB $BOOT 2>/dev/null; sleep 60
   ~/sglang-venv/bin/python $LANE/draft_capture_reader.py stats "$CAP" | tee $LOGS/pipe-capstats.txt
   # decode-validate needs --sent + decode records; capture is extend-only by design
+
+  # ---------- 3.5 pre-training baseline eval (decisive semantic check) ----------
+  phase "baseline eval (semantic check)"
+  srun --overlap --jobid="$HOLDER" -N1 -n1 -w "$DECODE_MASTER" --gres=gpu:4 \
+    --cpus-per-task=16 --input=none bash -c "
+      export T_WITH_EP=1; source $S/runs/glm-isambard/U-uccl-send-abort/scripts/env-U.sh >/dev/null 2>&1
+      export PYTHONDONTWRITEBYTECODE=1; cd $LANE
+      CUDA_VISIBLE_DEVICES=0 ~/sglang-venv/bin/python $LANE/eval_draft.py \
+        --data '$CAP' --weights $LANE/draft_weights --max-windows 64 --window 2048 --chain
+    " > $LOGS/pipe-baseeval.out 2>&1 || echo "BASEEVAL-FAILED (see pipe-baseeval.out)"
+  tail -20 $LOGS/pipe-baseeval.out
 fi
 
 # ---------- 4. train on real data (GPU step: needs the holder) ----------
