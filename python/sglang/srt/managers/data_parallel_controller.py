@@ -108,10 +108,14 @@ class DPBudget:
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
         # HiSparse host-pool admission state per rank (host-pool
-        # backpressure). Free host tokens are what a decode rank can still
-        # pin; 0/0 means "not reported" (non-hisparse ranks).
+        # backpressure). Free/pinned host tokens are what a decode rank can
+        # still pin / has pinned (active + retained rows); 0/0 means "not
+        # reported" (non-hisparse ranks). Pinned is the early signal a
+        # controller can act on before the pool limit.
         self.host_pool_free_tokens = [0] * dp_size
         self.host_pool_total_tokens = [0] * dp_size
+        self.host_pool_pinned_tokens = [0] * dp_size
+        self.host_pool_evictable_tokens = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -128,6 +132,12 @@ class DPBudget:
             )
             self.host_pool_total_tokens[load.dp_rank] = getattr(
                 load, "host_pool_total_tokens", 0
+            )
+            self.host_pool_pinned_tokens[load.dp_rank] = getattr(
+                load, "host_pool_pinned_tokens", 0
+            )
+            self.host_pool_evictable_tokens[load.dp_rank] = getattr(
+                load, "host_pool_evictable_tokens", 0
             )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
@@ -244,6 +254,13 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+        # When this controller owns the zmq PULL socket (load-aware methods),
+        # it is the only process draining load snapshots into node-0 SHM.
+        # Dispatches drain it, but at idle nothing would: SHM (and therefore
+        # /v1/loads and the /metrics load-snapshot collector) would go stale
+        # forever. Drain on a ~100 ms cadence from the event loop instead.
+        self._snapshot_drain = getattr(self.load_snapshot_reader, "poll", None)
+        self._last_snapshot_drain_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -1087,6 +1104,11 @@ class DataParallelController:
         while True:
             while True:
                 self.soft_watchdog.feed()
+                if self._snapshot_drain is not None:
+                    now = time.perf_counter()
+                    if now - self._last_snapshot_drain_time >= 0.1:
+                        self._last_snapshot_drain_time = now
+                        self._snapshot_drain()
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:

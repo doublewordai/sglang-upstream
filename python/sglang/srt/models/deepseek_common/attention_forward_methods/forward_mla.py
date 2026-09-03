@@ -119,6 +119,9 @@ def should_defer_dsa_cp_kv_gather(
 
 
 class DeepseekMLAForwardMixin:
+    # lane/decode-glue-fusion: lazy eligibility for the q_a norm+quant fusion
+    _dgf_qa_fuse: bool | None = None
+
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_exec().kernel.flashinfer_mla_disable_ragged
@@ -166,6 +169,37 @@ class DeepseekMLAForwardMixin:
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             return False
         return True
+
+    def _dgf_fuse_qa_norm_quant(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch, q: torch.Tensor
+    ) -> bool:
+        """SGLANG_DECODE_GLUE_FUSE_NORM_QUANT: eligible when the q_a norm+quant
+        fusion can serve q_b AND the DSA indexer wq_b from one quantized tensor
+        (small decode/verify batches, CUDA, block-fp8 q_b, K a multiple of 2048)."""
+        if self._dgf_qa_fuse is None:
+            from sglang.srt.environ import envs
+
+            self._dgf_qa_fuse = bool(
+                envs.SGLANG_DECODE_GLUE_FUSE_NORM_QUANT.get()
+                and _is_cuda
+                and self.q_lora_rank is not None
+                and self.q_lora_rank % 2048 == 0
+                and getattr(self.q_b_proj, "weight_scale_inv", None) is not None
+                and not getattr(self.q_b_proj, "set_lora", False)
+                and not is_kv_b_lora_active(self)
+                and not get_parallel().dcp_enabled
+            )
+        if not self._dgf_qa_fuse:
+            return False
+        return (
+            isinstance(q, torch.Tensor)
+            and q.dtype == torch.bfloat16
+            and 1 <= q.shape[0] <= 16
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        )
 
     def _split_q_nope_pe(
         self: DeepseekV2AttentionMLA,
@@ -324,7 +358,28 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if self._dgf_fuse_qa_norm_quant(forward_batch, q):
+                # lane/decode-glue-fusion: one kernel replaces q_a_layernorm +
+                # the q_b/wq_b input quant; the (fp8, scale) tuple feeds both
+                # GEMMs (quant-once) via the fp8-linear prequant path.
+                from sglang.kernels.ops.quantization.dgf_norm_quant import (
+                    dgf_rmsnorm_quant,
+                )
+
+                _, _, q8, qs = dgf_rmsnorm_quant(
+                    q, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon,
+                    skip_h=True,
+                )
+                q = (q8, qs)
+                if self.alt_stream is not None and get_is_capture_mode():
+                    current_stream = torch.cuda.current_stream()
+                    self.alt_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(self.alt_stream):
+                        k_nope = self.kv_a_layernorm(k_nope)
+                    current_stream.wait_stream(self.alt_stream)
+                else:
+                    k_nope = self.kv_a_layernorm(k_nope)
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
