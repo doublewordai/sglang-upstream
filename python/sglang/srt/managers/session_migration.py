@@ -516,7 +516,7 @@ def export_session_decode(
     page_size = tree_cache.page_size
     coord = tree_cache.coordinator
     key = RadixKey(
-        token_ids=token_ids, extra_key=extra_key, cache_salt=cache_salt
+        token_ids=array("q", token_ids), extra_key=extra_key, cache_salt=cache_salt
     ).page_aligned(page_size)
     if len(key) == 0:
         return None
@@ -573,7 +573,7 @@ def import_session_decode(
     page_size = tree_cache.page_size
     coord = tree_cache.coordinator
     key = RadixKey(
-        token_ids=tokens, extra_key=extra_key, cache_salt=cache_salt
+        token_ids=array("q", tokens), extra_key=extra_key, cache_salt=cache_salt
     ).page_aligned(page_size)
     n = len(key)
     assert len(dst_logical) == n and len(dst_rows) == n
