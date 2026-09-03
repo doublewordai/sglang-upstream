@@ -592,6 +592,13 @@ def run_eagle_verify(
             ScatterCompactToStrided,
         )
 
+        # Restore the full strided out_cache_loc for the draft-extend (the
+        # verify forward used only the compact subset; pad rows write beyond
+        # the committed seq_len, exactly like the uniform path).
+        strided_locs = getattr(verify_input, "strided_out_cache_loc", None)
+        if strided_locs is not None:
+            batch.out_cache_loc = strided_locs.reshape(-1)
+
         logits_output.next_token_logits = ScatterCompactToStrided.execute(
             compact=logits_output.next_token_logits,
             layout=ragged_layout,

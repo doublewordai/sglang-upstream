@@ -661,22 +661,33 @@ def _eagle_prepare_ragged_verify(
     )
     verify_input.positions = positions
 
-    real_locs = assign_extend_cache_locs_func(
+    # Allocate the FULL strided window (bs * ndt slots, like the uniform
+    # path): slot booking and req_to_token bookkeeping stay uniform; the
+    # ragged win is verify attention/swap-in compute scaling with sum(vl).
+    # The verify forward itself uses only the compact subset (gathered
+    # below); the draft-extend consumes the full strided set, restored by
+    # run_eagle_verify after the target forward.
+    strided_locs = assign_extend_cache_locs_func(
         req_pool_indices=batch.req_pool_indices,
         req_to_token=req_to_token_pool.req_to_token,
         start_offset=batch.seq_lens,
-        end_offset=batch.seq_lens + verify_lens.to(batch.seq_lens.dtype),
+        end_offset=batch.seq_lens + ndt,
         batch_size=bs,
         draft_token_num=ndt,
         device=device,
-    )
+    ).view(bs, ndt)
+    verify_input.strided_out_cache_loc = strided_locs
     coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
     if coord is not None:
         ghost_loc = coord.ragged_ghost_cache_loc(num_draft_tokens=ndt)
     else:
         ghost_loc = 0
+    # Compact verify locs: row r (req i, within w) -> strided slot (i, w).
+    compact_locs = strided_locs[
+        safe_req, within.clamp(max=ndt - 1)
+    ].to(torch.int64)
     locs = torch.nn.functional.pad(
-        real_locs, (0, ragged_layout.graph_num_tokens - real_locs.shape[0])
+        compact_locs, (0, ragged_layout.graph_num_tokens - compact_locs.shape[0])
     )
     batch.out_cache_loc = torch.where(
         valid, locs, torch.full_like(locs, ghost_loc)
