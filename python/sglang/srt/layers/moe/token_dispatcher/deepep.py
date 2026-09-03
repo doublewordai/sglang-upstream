@@ -617,7 +617,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             if sa is not None:
                 dp = max(get_attention_dp_size(), 1)
                 chunk = sa.chunked_prefill_size or (sa.max_prefill_tokens or 8192)
-                per_rank = max(chunk // dp, 1024)
+                # The runtime chunked_prefill_size is already dp-adjusted
+                # (8192 global -> 2048/rank); dividing again under-sizes the
+                # bound and overflows the recv buffers under load. Take the
+                # max of both interpretations: oversizing costs memory,
+                # undersizing crashes.
+                per_rank = max(chunk, chunk // dp, 1024)
         except Exception:
             pass
         bound = per_rank * self.group.size()
