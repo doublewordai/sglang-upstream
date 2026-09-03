@@ -2823,6 +2823,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
+        # True retraction (PD rebootstrap): the KV is freed outright and the
+        # request re-enters through a prefill recompute, so skip the CPU/host
+        # KV backup that release_req would otherwise take.
+        offload_kv = not (
+            server_args.disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_retraction_backup == "rebootstrap"
+        )
+
         retracted_reqs = []
         first_iter = True
         while first_iter or (
@@ -2837,7 +2845,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx, len(sorted_indices), server_args, offload_kv=offload_kv
+            )
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(

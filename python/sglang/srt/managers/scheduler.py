@@ -3716,8 +3716,29 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
-            for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and get_disagg().disaggregation_decode_retraction_backup
+                == "rebootstrap"
+            ):
+                # True retraction: the retracted KV was freed outright (no
+                # backup), so the request re-enters through the PD
+                # rebootstrap -- the original prefill worker recomputes the
+                # prefix KV and transfers it back over a fresh bootstrap, and
+                # the already-emitted boundary token is replayed on the decode
+                # side. Mirrors the retract-mode weight-update path
+                # (pause_generation), minus the pause/hold: the engine keeps
+                # serving the surviving requests while this one waits in the
+                # preallocation queue.
+                for req in retracted_reqs:
+                    if req.output_ids:
+                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    req.pd_rebootstrap_in_progress = True
+                    req.time_stats.set_retract_time()
+                    self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+            else:
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
 
