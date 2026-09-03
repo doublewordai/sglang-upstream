@@ -2318,6 +2318,11 @@ class SchedulerDisaggregationDecodeMixin:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                # The PD-prebuilt running batch carries multimodal_inputs as a
+                # per-req list; _build_hisparse_decode_batch leaves it None and
+                # merge_batch concatenates the two. Align the shapes.
+                if new_batch.multimodal_inputs is None:
+                    new_batch.multimodal_inputs = [None] * len(ready_reqs)
                 if running_batch.is_empty():
                     running_batch = new_batch
                 else:
