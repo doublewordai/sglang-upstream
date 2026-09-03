@@ -218,3 +218,74 @@
   fine-tune regime; <6 GPU-h per arm; recipe adjustment for real data = LOW lr (1e-5/5e-5
   arms + cosine decay + early stop) since the head starts at ~0.8 top-1, not from scratch.
   VAT (verification-aware training) implemented + arm in flight at the chain-helpful config.
+
+---
+
+## INTERIM DONE (2026-09-03 ~07:20Z) — parked awaiting real-weights window + decode-side spec-cost fix
+
+**Why parked (supervisor context, mtp-speed lane):** speculation at real load gives only
+1.21x TPOT p50 below 32k context, ~1.0x from 32k-131k (p90 regresses), and the spec arm
+OOMs at 64 sessions. The decode-side spec cost bounds the payoff of any better draft head:
+even a perfect draft cannot deliver while the machinery itself is ~1.0x at production
+contexts. Relaunch when (a) a real-weights capture window exists and (b) decode-side spec
+cost is fixed.
+
+### What stands (validated, committed at `2aad0a449b` on lane/draft-train)
+
+1. **Harness — complete and audit-clean.**
+   - Capture: engine-side hook (`draft_capture.py`, deepseek_v2 final-layer pre-logits)
+     → flat .bin shards + stats; reader/RealData loader verified end-to-end on the 8-node
+     dry-run (75 records / 199,687 tokens / 0 drops).
+   - **Alignment audit (supervisor challenge resolved)**: `eagle_worker_v2.draft_extend`
+     pairs `input_ids[1:]` with `target_hidden_states` — token x_t gets h_{t-1} —
+     exactly `draft_data.get`'s pairing. Layer-78 NextN extraction matches
+     `GlmMoeDsaForCausalLMNextN._map_mtp_ckpt_name`. Tokenizer: engine-side input_ids,
+     no chat-template path. Dtype: fp16 storage (higher fidelity than runtime bf16;
+     max|h| check on first real capture). The 0.019 baseline was real-GLM-draft vs
+     DUMMY-target hiddens — correct near-zero, not a harness bug.
+   - Training: teacher-forced parallel CE+feature loss; chain/BPTT, residual (logit-delta),
+     and VAT (reach-weighted) objectives implemented; 27-config dummy sweep done
+     (objective choice is config-sensitive; don't stack blind).
+   - Export/load: conditional kv_b fp8 passthrough (kv_b is TRAINABLE — 5.5% drift at
+     high lr), expert bit-identity 1536/1536, requant ≤3.1%; PILOT-VERIFY-OK;
+     engine loads and serves the exported head (SERVER-READY, EAGLE chain runs).
+
+2. **Go/no-go arithmetic (unchanged in form, gated in time).**
+   - Baseline: shipped NextN head ≈ 0.75-0.8 top-1 implied from accept 2.9/4 at depth 4.
+   - Ceiling: accept 4/4 → ~1.38x decode speedup vs 2.9/4's ~1.19x, at fixed spec cost.
+   - Distribution fine-tune needs 10-100M tokens: 1-2 days of 8-node capture
+     (~5.9M tok/replay, ~57M tok/day) or few replay passes; <6 GPU-h per training arm.
+   - **BUT all of this only converts to TPOT if the decode-side spec overhead is fixed
+     first** — per mtp-speed's measurement the machinery caps the gain at ~1.0x for
+     32k-131k contexts today. Gate A (two-drafter, ΔE_structured≥+0.40 on 37.4% share)
+     and Gate B (AngelSpec routing, ATLAS adaptive) recorded in variants.md for that world.
+
+3. **Exact capture recipe for real hidden states (relaunch runbook).**
+   - Primary: one 8-node holder `J` (whichever exists at relaunch; H was 6261373 until
+     21:10Z 2026-09-03; J never landed this session). Claim in GPU-CLAIMS.md first.
+   - Full sequence in one command:
+     `HOLDER=<J> nohup bash run_realdata_pipeline.sh > logs/pipeline.out 2>&1 &`
+     (capture → baseline eval → train arms → export → M4 A/B; env/port/launcher notes
+     in the script header).
+   - Capture only: `HOLDER=<J> CAP=<tag> nohup bash run_capture.sh ...` — boots the
+     8-node PD rig (ports 57000-57999, T_WITH_EP=1, source env-U.sh), waits for
+     SYSTEM-READY, replays the full timeline corpus, tears down by pid, prints stats.
+     Split-holder fallback: `NODES_OVERRIDE="nidA nidB ..."` (prefill nodes first).
+   - **PHASE 3.5 HARD GATE (supervisor, before ANY training):** original draft weights
+     on the real capture must score ≥0.7 top-1:
+     `eval_draft.py --data capture/<tag> --window 1024 --max-windows 64 --chain
+     --per-segment --weights draft_weights`. If <0.7 there is a real harness bug —
+     do not proceed to training.
+   - Training arms (real-data recipe): low lr 1e-5 / 5e-5, cosine decay, early stop on
+     held-out sessions; pure-parallel vs chain vs +VAT; ≤6 GPU-h/arm on F-class GPUs.
+   - Export: `export_draft.py --ft <pt> --orig-ckpt /projects/s6p/hf/hub/models--zai-org--GLM-5.3/snapshots/e0b07fd2751b42d5efa199cc02c2b271deadc516`;
+     verify with `verify_pilot.py` (PILOT-VERIFY-OK required).
+   - M4 A/B: `run_m4_ab.sh` — old draft vs fine-tuned, depths 3-6; swap gate ΔA≥+0.15
+     at prod depth with no depth regression.
+   - Single-node real-weights boot is INFEASIBLE (GLM-5.3 ~660GB fp8; tp2/tp4 OOM at
+     load, ~92GB/rank loader footprint) — do not retry; the gate runs on the rig.
+   - Open lead for that world: DFLASH is in-tree as a `--speculative-algorithm` choice
+     (draft KV materialized from target hiddens = exactly our training distribution);
+     dummy-rig DFLASH validation was not run before park — cheap first experiment.
+
+**Status: stopped per supervisor. No GPU work left running; all claims released.**

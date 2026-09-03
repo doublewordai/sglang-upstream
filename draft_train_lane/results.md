@@ -238,3 +238,11 @@ verifier-hidden conditioning (zero retraining — maps exactly onto our
 teacher-forced training distribution), P-EAGLE, AngelSpec routing (Gate B),
 ATLAS adaptive drafter (Gate B #2), EAGLE-3.1 depth pathologies (our norm
 discipline already covers the post-norm fix).
+
+## Interim DONE (parked 2026-09-03 ~07:20Z)
+
+Awaiting: real-weights capture window + decode-side spec-cost fix (mtp-speed measured
+spec at ~1.0x TPOT p50 for 32k-131k contexts, p90 regression, OOM at 64 sessions — a
+better draft head is off the near-term path). Harness audit-clean and fully staged;
+relaunch runbook in worklog.md (holder J / NODES_OVERRIDE fallback, phase-3.5 ≥0.7
+hard gate, low-lr real-data arms, export+verify gates, M4 A/B, DFLASH lead).
