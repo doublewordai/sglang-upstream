@@ -1069,8 +1069,8 @@ class ModelRunner:
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        mark("load_model_begin")
         )
+        mark("load_model_begin")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
