@@ -2,11 +2,16 @@
 # draft-train M4: accept-length A/B, old vs new draft x depth 3..6, corpus replay.
 # Runs ON the persistent node (nohup). One boot + 15-min replay per arm.
 #
-#   HOLDER=<jobid> [ARMS="old:3 old:4 old:5 old:6 new:3 new:4 new:5 new:6"] \
-#   [DURATION=900] nohup bash run_m4_ab.sh > logs/m4-ab.out 2>&1 &
+#   HOLDER=<jobid> [ARMS="old:4 new:4 w8:4 ws:4 wsink:4"] [DURATION=900] \
+#       nohup bash run_m4_ab.sh > logs/m4-ab.out 2>&1 &
 #
-# old  = checkpoint NextN (no --speculative-draft-model-path)
-# new  = $LANE/export_trained (the fine-tuned draft)
+# old   = checkpoint NextN (no --speculative-draft-model-path)
+# new   = $LANE/export_trained (control fine-tune, absolute-window)
+# w8    = $LANE/export_w8  (OWL-analog arm)   + --speculative-draft-window-size 8
+# ws    = $LANE/export_ws  (Windowed-MTP arm) + --speculative-draft-window-size 2048
+# wsink = $LANE/export_ws  (sink variant)     + window 2048 + --speculative-draft-attn-sink 64
+# (draft dirs may be overridden per arm: new:<depth>:<path> ... window flags via the
+#  4th field: new:4:/path:2048:64)
 set -uo pipefail
 S=/scratch/s6p/fergus.s6p
 LANE=$S/grace-1m/lanes/draft-train
@@ -25,11 +30,23 @@ DECODE_MASTER=$(scontrol show hostnames "$(squeue -j "$HOLDER" -h -o %N)" | sed 
 echo "nodes=$NODES decode_master=$DECODE_MASTER arms=$ARMS duration=$DURATION"
 
 run_arm() {
-  local draft=$1 depth=$2
+  local draft=$1 depth=$2 dpath=${3:-} wflag=${4:-0} sinkflag=${5:-0}
   local tag="$draft-$depth"
   local flags="--speculative-algorithm EAGLE --speculative-num-steps $depth --speculative-eagle-topk 1 --speculative-num-draft-tokens $((depth+1))"
-  if [ "$draft" = "new" ]; then
-    flags="$flags --speculative-draft-model-path $LANE/export_trained"
+  case "$draft" in
+    new)  dpath=${dpath:-$LANE/export_trained} ;;
+    w8)   dpath=${dpath:-$LANE/export_w8};  wflag=${4:-8} ;;
+    ws)   dpath=${dpath:-$LANE/export_ws};  wflag=${4:-2048} ;;
+    wsink) dpath=${dpath:-$LANE/export_ws}; wflag=${4:-2048}; sinkflag=${5:-64} ;;
+  esac
+  if [ -n "$dpath" ] && [ "$draft" != "old" ]; then
+    flags="$flags --speculative-draft-model-path $dpath"
+  fi
+  if [ "$wflag" != "0" ] && [ "$draft" != "old" ]; then
+    flags="$flags --speculative-draft-window-size $wflag"
+  fi
+  if [ "$sinkflag" != "0" ] && [ "$draft" != "old" ]; then
+    flags="$flags --speculative-draft-attn-sink $sinkflag"
   fi
   echo "=== ARM $tag: flags=$flags ==="
   local bootlog=$OUT/boot-$tag.out
@@ -110,7 +127,7 @@ PYEOF
 }
 
 for arm in $ARMS; do
-  draft=${arm%%:*}; depth=${arm##*:}
-  run_arm "$draft" "$depth"
+  IFS=: read -r draft depth dpath wflag sinkflag <<< "$arm"
+  run_arm "$draft" "$depth" "${dpath:-}" "${wflag:-0}" "${sinkflag:-0}"
 done
 echo "M4-AB-ALL-DONE"
