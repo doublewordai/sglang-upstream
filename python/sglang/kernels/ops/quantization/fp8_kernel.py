@@ -1446,11 +1446,13 @@ def _use_fp8_blockwise_smallm(M, N, K, A, As, Bs, block_size) -> bool:
     if N % 128 != 0 or K % 128 != 0:
         return False
     # As must be the production per-token-group quant buffer: [M, K//128]
-    # fp32 column-major over a pad4(M)-row TMA-aligned allocation.
+    # fp32 column-major over a pad4(M)-row TMA-aligned allocation (the
+    # kernel reads the buffer's row pitch from the stride, so unpadded M is
+    # fine and no pad-row copy is needed).
     pad = (M + 3) // 4 * 4
     if As.ndim != 2 or tuple(As.shape) != (M, K // 128):
         return False
-    if As.stride() not in ((1, M), (1, pad)):
+    if As.stride() != (1, M if M % 4 == 0 else pad):
         return False
     return True
 
@@ -1460,27 +1462,9 @@ def _fp8_blockwise_smallm(A, B, As, Bs, M, N, K):
         fp8_blockwise_scaled_mm_sm90,
     )
 
-    Mp = (M + 3) // 4 * 4
-    if Mp == M:
-        A_use, As_use = A, As
-    else:
-        # Unpadded token rows (the local-quant path): pad to 4 so the
-        # problem extent matches the quant buffer's padded row stride --
-        # identical to the pre-quantized path, which arrives already padded.
-        A_use = A.new_empty((Mp, K))
-        A_use[:M].copy_(A)
-        if As.stride() == (1, Mp):
-            As_use = As.as_strided((Mp, As.shape[1]), (1, Mp))
-        else:  # non-TMA-aligned scales: copy into a padded col-major buffer
-            As_use = torch.empty_strided(
-                (Mp, As.shape[1]), (1, Mp), device=As.device, dtype=As.dtype
-            )
-            As_use[:M].copy_(As)
-            As_use[M:].zero_()
-    sfb = _fp8_blockwise_smallm_sfb(Bs)
-    out = fp8_blockwise_scaled_mm_sm90(A_use, B, As_use, sfb, variant=5)
-    if Mp != M:
-        out = out[:M]
+    # A and As pass through untouched: the kernel consumes the true token
+    # count M and reads the scale buffer's pad4 row pitch from As's stride.
+    out = fp8_blockwise_scaled_mm_sm90(A, B, As, _fp8_blockwise_smallm_sfb(Bs), variant=5)
     return out.view(*A.shape[:-1], N)
 
 

@@ -223,8 +223,13 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   int k = static_cast<int>(a.size(1));
   int n = static_cast<int>(b.size(0));
 
-  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
-  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+  // Per-token scale buffer pitch (column-major [M, K/128] over a pad4(M)-row
+  // allocation): the SFA K-group stride and TMA extent use the pitch, not the
+  // true token count, so M can be unpadded.
+  int m_sfa = static_cast<int>(scales_a.stride(1));
+
+  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m_sfa, n, k, 1));
+  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m_sfa, n, k, 1));
 
   using Runner = GemmRunner<
       OutType,
@@ -270,9 +275,15 @@ void launch_sm90_fp8_blockwise_scaled_mm_swapab(
   int k = static_cast<int>(a.size(1));
   int n = static_cast<int>(b.size(0));  // weight rows -> swapped M'
 
+  // Token-scale buffer pitch: the per-token scale tensor is column-major
+  // [tokens, K/128] over a pad4(tokens)-row allocation, so the K-group stride
+  // (and TMA extent) of SFB' is the row pitch, not the true token count.
+  // This lets the problem N' stay at the true (unpadded) token count.
+  int m_sfb = static_cast<int>(scales_a.stride(1));
+
   // Swapped problem shape (M', N', K) = (n, m, k).
   LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1));
-  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m, k, 1));
+  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m_sfb, k, 1));
 
   using Runner = GemmRunner<
       OutType,
@@ -319,8 +330,11 @@ struct Fp8BlockwiseSm90Kernel {
     const int nb = (n + 127) / 128;
 
     RuntimeCheck(k % 128 == 0, "K must be a multiple of 128");
-    RuntimeCheck(m % 4 == 0, "M must be a multiple of 4 (row-padded scales)");
-    RuntimeCheck(m >= 4, "M must be at least 4");
+    // M may be any size >= 1: the per-token scale buffer is column-major with
+    // a 4-aligned row pitch (the production pad4 TMA-aligned quant buffer),
+    // and the swap launcher builds the token-scale layout from that pitch, so
+    // the problem M can be the true (unpadded) token count.
+    RuntimeCheck(m >= 1, "M must be at least 1");
     RuntimeCheck(m <= 32, "this kernel targets decode shapes (M <= 32)");
 
     RuntimeCheck(scales_a.dim() == 2, "scales_a must be 2D [M, K/128]");
@@ -329,6 +343,8 @@ struct Fp8BlockwiseSm90Kernel {
     RuntimeCheck(scales_a.stride(0) == 1, "scales_a must be column-major (stride (1, M))");
     RuntimeCheck(static_cast<int>(scales_a.stride(1)) % 4 == 0,
                  "scales_a row pitch must be 4-aligned");
+    RuntimeCheck(static_cast<int>(scales_a.stride(1)) >= m,
+                 "scales_a row pitch must cover M rows");
     RuntimeCheck(host::is_type<float>(scales_a.dtype()), "scales_a must be Float32");
 
     RuntimeCheck(scales_b.dim() == 2, "scales_b must be 2D [K/128, N/128]");

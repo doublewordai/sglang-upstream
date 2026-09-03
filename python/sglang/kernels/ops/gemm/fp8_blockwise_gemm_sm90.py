@@ -56,9 +56,10 @@ def fp8_blockwise_scaled_mm_sm90(
     """SM90 fp8 blockwise GEMM.
 
     Args:
-        mat_a: [M, K] fp8 e4m3 row-major activation, M a multiple of 4.
-        scales_a: [M, K // 128] fp32, column-major (stride (1, M)) — the
-            production per-token-group quant output buffer.
+        mat_a: [M, K] fp8 e4m3 row-major activation, M >= 1.
+        scales_a: [M, K // 128] fp32, column-major (stride (1, pitch)) where
+            pitch >= M is 4-aligned — the production per-token-group quant
+            output buffer as-is (pitch = pad4(M)).
         mat_b: [N, K] fp8 e4m3 row-major weight (as stored).
         scales_b: [K // 128, ceil(N // 128)] fp32 row-major —
             weight_scale_inv.t().contiguous().
