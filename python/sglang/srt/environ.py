@@ -722,6 +722,9 @@ class Envs:
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
     SGLANG_MAP_HOST_POOL_PRIVATE = EnvBool(False)
+    # Raise (instead of warn) at boot when a host KV pool has <99% of its
+    # populated pages on the GPU-local NUMA node (mmap_allocator check).
+    SGLANG_NUMA_LOCALITY_STRICT = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport

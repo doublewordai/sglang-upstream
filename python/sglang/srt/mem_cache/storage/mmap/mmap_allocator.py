@@ -5,6 +5,7 @@ import logging
 import math
 import mmap
 import os
+import re
 import uuid
 import weakref
 
@@ -286,7 +287,194 @@ def _mm_ptr(mm: mmap.mmap) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(mm))
 
 
-def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+# --- Boot-time host-pool NUMA locality check -------------------------------
+# lpddr-budget measured a 2.0x decode-gather slowdown (99.5 -> 50.0 GB/s
+# wide-copy, 90.6 -> 47.7 GB/s composed) when a host pool lands on a remote
+# Grace NUMA node. Placement is decided at first touch: alloc_mmap faults
+# every page at mmap time, so locality follows the calling thread's memory
+# policy (sglang binds each rank with numactl --cpunodebind=N --membind=N in
+# utils/numa_utils.configure_subprocess). This check prints pct_local per
+# pool right after population so a placement regression (e.g. binding
+# dropped, local node exhausted) cannot pass silently at boot.
+_NUMA_LOCALITY_MIN_BYTES = 128 * 1024 * 1024  # only log pool-sized mappings
+_NUMA_LOCALITY_WARN_PCT = 99.0
+
+
+def _parse_cpulist(text: str) -> set:
+    """Parse a /sys cpulist ("0-3,7") into a set of ints."""
+    out = set()
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-")
+            out.update(range(int(lo), int(hi) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def _numa_local_node() -> "tuple[int | None, bool]":
+    """(local_node, affinity_contained) from the calling thread's CPU affinity.
+
+    Returns the NUMA node that contains the smallest allowed CPU, and whether
+    the whole affinity mask lies inside that node (it does for a properly
+    numactl-bound rank). (None, False) on non-NUMA systems or when the
+    affinity spans nodes.
+    """
+    try:
+        allowed = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        return None, False
+    if not allowed:
+        return None, False
+    first = min(allowed)
+    try:
+        entries = sorted(os.listdir("/sys/devices/system/node"))
+    except OSError:
+        return None, False
+    node, contained = None, False
+    for d in entries:
+        if not re.fullmatch(r"node\d+", d):
+            continue
+        try:
+            with open(f"/sys/devices/system/node/{d}/cpulist") as f:
+                cpus = _parse_cpulist(f.read())
+        except (OSError, ValueError):
+            continue
+        if cpus and first in cpus:
+            node = int(d[4:])
+            contained = allowed <= cpus
+            break
+    return node, contained
+
+
+def _numa_pages_by_node(ptr: int, n_bytes: int):
+    """(bytes_by_node, vma_policies) for populated pages overlapping
+    [ptr, ptr+n_bytes), from /proc/self/numa_maps. (None, None) if the
+    file is unavailable."""
+    byt = {}
+    policies = []
+    try:
+        with open("/proc/self/numa_maps") as f:
+            lines = f.readlines()
+    except OSError:
+        return None, None
+    starts = [int(line.split()[0], 16) for line in lines]
+    for i, line in enumerate(lines):
+        start = starts[i]
+        end = starts[i + 1] if i + 1 < len(lines) else start + 1
+        if end <= ptr or start >= ptr + n_bytes:
+            continue
+        toks = line.split()
+        pol = toks[1] if len(toks) > 1 else "?"
+        if len(toks) > 2 and toks[2].startswith("("):
+            pol += " " + toks[2]  # "prefer (many):0-3"
+        policies.append(pol)
+        ps_kb = None
+        for t in toks:
+            if t.startswith("kernelpagesize_kB="):
+                ps_kb = int(t.split("=", 1)[1])
+        if ps_kb is None:
+            continue
+        for t in toks:
+            m = re.fullmatch(r"N(\d+)=(\d+)", t)
+            if m:
+                byt[int(m.group(1))] = (
+                    byt.get(int(m.group(1)), 0) + int(m.group(2)) * ps_kb * 1024
+                )
+    return byt, policies
+
+
+_NUMA_UNSET = object()
+_gpu_numa_node_cache = _NUMA_UNSET
+
+
+def _gpu_numa_node():
+    """NUMA node of the current CUDA device via NVML (best-effort, cached).
+
+    None when CUDA is not initialized, pynvml is unavailable, or the query
+    fails (CPU-only hosts, unit tests); callers fall back to the
+    affinity-derived node.
+    """
+    global _gpu_numa_node_cache
+    if _gpu_numa_node_cache is not _NUMA_UNSET:
+        return _gpu_numa_node_cache
+    node = None
+    try:
+        import torch
+
+        if torch.cuda.is_initialized():
+            from sglang.srt.utils.numa_utils import _query_numa_node_for_gpu
+
+            nodes = _query_numa_node_for_gpu(torch.cuda.current_device())
+            if nodes:
+                node = nodes[0]
+    except Exception:
+        node = None
+    _gpu_numa_node_cache = node
+    return node
+
+
+def log_host_pool_numa_locality(ptr: int, n_bytes: int, name: str = "") -> None:
+    """Print pct_local (share of a host pool's populated pages on the
+    GPU-local NUMA node) once at allocation; warn below 99%.
+
+    Raise instead of warn when SGLANG_NUMA_LOCALITY_STRICT=1. Silently no-ops
+    for mappings below _NUMA_LOCALITY_MIN_BYTES, on non-NUMA hosts, or when
+    /proc/self/numa_maps cannot be read.
+    """
+    if n_bytes < _NUMA_LOCALITY_MIN_BYTES:
+        return
+    byt, policies = _numa_pages_by_node(ptr, n_bytes)
+    if not byt:
+        return
+    total = sum(byt.values())
+    if total == 0:
+        return
+    by_str = " ".join(f"N{n}={b / 2**30:.1f}GiB" for n, b in sorted(byt.items()))
+    pol_str = ",".join(policies) or "?"
+    prefix = f"[host-pool numa] {name}: " if name else "[host-pool numa] "
+    local, contained = _numa_local_node()
+    gpu_node = _gpu_numa_node()
+    if gpu_node is not None:
+        # the true locality target is the GPU's own node (NVML); the
+        # affinity node is only a proxy for it
+        target, tgt = gpu_node, f"gpu_node=N{gpu_node}"
+    elif local is not None:
+        target, tgt = local, f"local_node=N{local}"
+    else:
+        logger.info(
+            "%s%.1f GiB at %#x: no local node determined (affinity spans "
+            "nodes and GPU node unavailable); by_node: %s (policy=%s)",
+            prefix, total / 2**30, ptr, by_str, pol_str,
+        )
+        return
+    notes = []
+    if local is not None and gpu_node is not None and local != gpu_node:
+        notes.append(f"rank bound to N{local} but its GPU is on N{gpu_node}")
+    if not contained:
+        notes.append("affinity spans nodes")
+    notes_s = ("; " + "; ".join("WARNING " + n for n in notes)) if notes else ""
+    pct = 100.0 * byt.get(target, 0) / total
+    line = (
+        f"{prefix}{total / 2**30:.1f} GiB at {ptr:#x}: {tgt} "
+        f"pct_local={pct:.2f}% by_node: {by_str} (policy={pol_str}{notes_s})"
+    )
+    if pct >= _NUMA_LOCALITY_WARN_PCT:
+        logger.info(line)
+        return
+    logger.warning(
+        "%s -- host pool is NOT NUMA-local; decode gather/swap-in from this "
+        "pool runs at up to 2x reduced bandwidth (lpddr-budget: 99.5->50.0 "
+        "GB/s wide-copy on a remote node). Check the rank's numactl binding "
+        "(SGLANG_NUMA_BIND_V2 / SGLANG_AUTO_NUMA_BIND).", line,
+    )
+    if envs.SGLANG_NUMA_LOCALITY_STRICT.get():
+        raise RuntimeError(line)
+
+
+def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap.
 
     SGLANG_HUGEPAGE_SIZE selects the page backing:
@@ -316,7 +504,9 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         page_size = _thp_pmd_size()  # PMD multiple so coverage is not tail-capped
         alloc_bytes = math.ceil(n_bytes / page_size) * page_size
         array = _alloc_thp(n_bytes, alloc_bytes, strict)
-        return torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
+        tensor = torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
+        log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
+        return tensor
 
     if hugepage_size == "":
         page_size, extra_flags = mmap.PAGESIZE, 0
@@ -348,9 +538,11 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         else:
             try:
                 array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
-                return torch.frombuffer(
+                tensor = torch.frombuffer(
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
+                log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
+                return tensor
             except OSError as e:
                 msg = (
                     f"Hugepage mmap via libc failed ({e}); "
@@ -365,10 +557,14 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
     mm = _alloc_plain(alloc_bytes)
-    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
+    return tensor
 
 
-def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
+def alloc_shm(
+    dims: tuple, dtype: torch.dtype, name: str = ""
+) -> tuple[torch.Tensor, int, mmap.mmap]:
     """Allocate a host tensor via shared memory (/dev/shm).
 
     Returns a tuple of (tensor, fd, mm).
@@ -430,4 +626,5 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
         raise e
 
     tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
     return tensor, fd, mm
