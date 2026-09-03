@@ -173,7 +173,8 @@ def _add_req(cat: _Cat, req: "Req", now: float, age_attr: str) -> None:
         return
     cat.n += 1
     cat.tokens += toks
-    age = _age(getattr(req.time_stats, age_attr, 0.0), now)
+    ts = getattr(req, "time_stats", None)
+    age = _age(getattr(ts, age_attr, 0.0) if ts is not None else 0.0, now)
     if age > cat.oldest_age_s:
         cat.oldest_age_s = age
     cat.owners.append(
@@ -313,6 +314,12 @@ def _get_pool_lock_breakdown_str(source: Any) -> str:
 
 _last_log_ts: Dict[int, float] = {}
 
+# prefill-oom-1328 hotfix: fallback registry for caches that forbid ad-hoc
+# attributes (setattr on the live tree cache raised silently on green g11
+# and swallowed every [pool-locks] line for the whole arm).
+_HOOKS: Dict[int, Any] = {}
+_warned = False
+
 
 def maybe_log_pool_locks(scheduler: "Scheduler") -> None:
     """Cadence-gated [pool-locks] log + lazy wiring of the failure-attribution
@@ -328,9 +335,15 @@ def maybe_log_pool_locks(scheduler: "Scheduler") -> None:
         if tc is not None and getattr(tc, "pool_lock_breakdown_str", None) is None:
             # Wire the attribution hook: allocation.py's OOM raise sites call
             # available_and_evictable_str(tree_cache), which appends this.
-            tc.pool_lock_breakdown_str = (
-                lambda s=scheduler: _get_pool_lock_breakdown_str(s)
-            )
+            # hotfix: the wiring itself must never be able to kill the
+            # cadence log. Fall back to the module-level registry when the
+            # cache class forbids ad-hoc attributes.
+            try:
+                tc.pool_lock_breakdown_str = (
+                    lambda s=scheduler: _get_pool_lock_breakdown_str(s)
+                )
+            except Exception:
+                _HOOKS[id(tc)] = lambda s=scheduler: _get_pool_lock_breakdown_str(s)
         rank = id(scheduler)
         now = time.monotonic()
         if now - _last_log_ts.get(rank, 0.0) < interval:
@@ -338,4 +351,10 @@ def maybe_log_pool_locks(scheduler: "Scheduler") -> None:
         _last_log_ts[rank] = now
         logger.info("%s", _get_pool_lock_breakdown_str(scheduler))
     except Exception:
-        logger.debug("maybe_log_pool_locks failed", exc_info=True)
+        # hotfix: a silent except is how the g11 failure hid for a whole
+        # arm. Warn once with the traceback so the next boot self-
+        # diagnoses; keep retrying silently afterwards.
+        global _warned
+        if not _warned:
+            _warned = True
+            logger.warning("maybe_log_pool_locks failed; will keep retrying", exc_info=True)

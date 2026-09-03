@@ -2761,12 +2761,12 @@ class AllRanksLoadSnapshotCollector:
             for name, doc, field in _ALL_RANKS_DEVICE_POOL_FAMILIES:
                 family = GaugeMetricFamily(name, doc, labels=labelnames)
                 for s_ in snapshots:
-                    family.add_metric(self._label_values(s), int(getattr(s_, field)))
+                    family.add_metric(self._label_values(s_), int(getattr(s_, field)))
                 yield family
             for name, doc, field in _ALL_RANKS_DEVICE_POOL_AGES:
                 family = GaugeMetricFamily(name, doc, labels=labelnames)
                 for s_ in snapshots:
-                    family.add_metric(self._label_values(s), float(getattr(s_, field)))
+                    family.add_metric(self._label_values(s_), float(getattr(s_, field)))
                 yield family
 
         if take_queue:
