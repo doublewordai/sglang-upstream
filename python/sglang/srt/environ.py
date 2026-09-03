@@ -1535,6 +1535,12 @@ class Envs:
     # replacing both fast_topk_v2 and the fg chain on decode/verify shapes
     # (same gate domain as SGLANG_DSA_TOPK_DECODE_FG; precedence: floor > fg).
     # Same selection semantics as the fg kernel.
+    # Warp-ballot one-read decode top-k (lane ka-topk-issue): same gate domain
+    # as SGLANG_DSA_TOPK_DECODE_FG; precedence ballot > floor > fg.
+    SGLANG_DSA_TOPK_DECODE_BALLOT = EnvBool(False)
+    # Warp-ballot prefill select + page-table transform, same slot as
+    # SGLANG_DSA_TOPK_PREFILL_1PASS; precedence ballot > 1pass.
+    SGLANG_DSA_TOPK_PREFILL_BALLOT = EnvBool(False)
     SGLANG_DSA_TOPK_DECODE_FLOOR = EnvBool(False)
     # Warm-start the full-grid decode top-k: carry the previous decode step's
     # k-th logit minus a delta-sigma margin per (request, layer) as the
