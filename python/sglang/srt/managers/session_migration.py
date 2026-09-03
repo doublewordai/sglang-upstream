@@ -985,8 +985,9 @@ class SessionMigrationAgent:
             if alloc is None:
                 return {"ok": False, "reason": "pool full"}
             logical, rows = alloc
-            lv = logical.reshape(-1, page_size)
-            hv = rows.reshape(-1, page_size)
+            # allocators return device tensors; page math needs CPU copies
+            lv = logical.to(device="cpu", dtype=torch.int64).reshape(-1, page_size)
+            hv = rows.to(device="cpu", dtype=torch.int64).reshape(-1, page_size)
             assert bool(((lv[:, 0] % page_size) == 0).all()) and bool(
                 (lv[:, 1:] - lv[:, :-1] == 1).all()
             ), "allocated logical pages not aligned runs"
