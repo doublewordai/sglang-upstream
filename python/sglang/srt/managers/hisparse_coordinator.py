@@ -319,6 +319,9 @@ class HiSparseCoordinator:
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+        # lane/adaptive-spec: cached sacrificial ghost-row loc (see
+        # ragged_ghost_cache_loc); None until first use / after clear().
+        self._ragged_ghost_loc: Optional[int] = None
 
         # Miss-plan buffers for the plan-then-IO swap-in split: the planning
         # kernel (every layer when the wide gather is on; each group's anchor
@@ -907,6 +910,112 @@ class HiSparseCoordinator:
             locs.reshape(-1)
         )
 
+    def map_verify_locs_to_buffer_ragged(
+        self,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        ragged_layout,
+        num_draft_tokens: int,
+    ) -> None:
+        """Ragged variant of map_verify_locs_to_buffer (lane/adaptive-spec):
+        each request's window is verify_lens[i] tokens (front-packed rows).
+
+        ``out_cache_loc`` is the compact tier-padded tensor; only the first
+        total_verify_tokens rows are real. Ghost rows' locs are pre-steered to
+        the sacrificial row by ragged_ghost_cache_loc and are not mapped here.
+        """
+        assert not self.is_dsv4_hisparse, "MTP verify under hisparse: DSA only"
+        n = int(num_draft_tokens)
+        page_size = self.mem_pool_device.page_size
+        assert n <= page_size, (
+            f"MTP verify needs num_draft_tokens ({n}) <= hisparse page size ({page_size})"
+        )
+        assert self.device_buffer_size >= n * self.top_k, (
+            f"MTP verify needs device_buffer_size ({self.device_buffer_size}) >= "
+            f"num_draft_tokens * top_k ({n} * {self.top_k})"
+        )
+        verify_lens_cpu_list = (
+            ragged_layout.verify_lens_cpu
+            if ragged_layout.verify_lens_cpu is not None
+            else ragged_layout.verify_lens.detach().to("cpu").tolist()
+        )
+        total = int(sum(verify_lens_cpu_list))
+        if total <= 0:
+            return
+        verify_lens = ragged_layout.verify_lens.to(
+            device=seq_lens.device, dtype=torch.int64
+        )
+        verify_lens_cpu = torch.tensor(
+            verify_lens_cpu_list, dtype=torch.int64
+        )
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.cpu()
+        self.wait_for_pending_backup()
+        # Grow 1:1 buffers to cover each request's last new position.
+        self._grow_device_buffers(
+            seq_lens + verify_lens,
+            req_pool_indices,
+            seq_lens_cpu + verify_lens_cpu,
+            req_pool_indices_cpu,
+        )
+        # Per-(request, within) window slots for the real rows only.
+        starts = torch.cumsum(verify_lens, dim=0) - verify_lens
+        rows = torch.arange(total, device=seq_lens.device, dtype=torch.int64)
+        req_id = torch.searchsorted(
+            torch.cumsum(verify_lens, dim=0), rows, right=True
+        )
+        safe_req = req_id.clamp(max=verify_lens.shape[0] - 1)
+        within = rows - starts[safe_req]
+        positions = seq_lens[safe_req] + within
+        reserved_base = torch.clamp(seq_lens[safe_req], min=self.device_buffer_size)
+        slot_idx = torch.where(
+            positions < self.device_buffer_size,
+            positions,
+            self.device_buffer_size + (positions - reserved_base),
+        )
+        locs = self.req_to_device_buffer[req_pool_indices[safe_req], slot_idx]
+        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+            out_cache_loc[:total]
+        )
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
+            locs.to(torch.int64)
+        )
+
+    def ragged_ghost_cache_loc(self, num_draft_tokens: int) -> int:
+        """Full-pool loc for ghost (tier-padding) rows, steered once to the
+        first spare reserved-page row (device_buffer_size + n), which no
+        position ever maps to (the verify window is at most n tokens and the
+        reserved page holds page_size >= n slots). Uses the mapping's slack
+        tail (size_full + page_size - 1): never allocated, only reset by
+        clear(), after which the lazy flag re-steers.
+
+        Returns 0 (plain loc-0 ghost convention, as DSpark) when the reserved
+        page has no spare row.
+        """
+        n = int(num_draft_tokens)
+        if self._ragged_ghost_loc is not None:
+            return self._ragged_ghost_loc
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        page_size = self.mem_pool_device.page_size
+        if page_size <= n:
+            logger.warning(
+                "ragged ghost steering unavailable (page_size %d <= n %d); "
+                "ghost rows write through mapping[0] (loc-0 convention).",
+                page_size,
+                n,
+            )
+            self._ragged_ghost_loc = 0
+            return 0
+        ghost_loc = int(mapping.shape[0]) - 2
+        mapping[ghost_loc] = self.device_buffer_size + n
+        self._ragged_ghost_loc = ghost_loc
+        return ghost_loc
+
     def commit_verify_tokens(
         self,
         seq_lens: torch.Tensor,
@@ -978,6 +1087,63 @@ class HiSparseCoordinator:
             device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
 
+    def _fast_backup_eligible(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> bool:
+        """Steady-state conditions for the GPU-side backup fast path.
+
+        True when no first-step skip is pending (each request's first decode step
+        after staging must take the generic path once) and every request's host
+        pool already covers this step's position (no page growth needed). Both
+        checks read CPU state only -- no device sync.
+        """
+        page_size = self.mem_pool_host.page_size
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            if self._skip_first_backup[req_idx]:
+                return False
+            page_end = (
+                (int(seq_lens_cpu[i]) - 1 + page_size - 1) // page_size * page_size
+            )
+            if page_end > int(self.req_to_host_pool_allocated_len[req_idx]):
+                return False
+        return True
+
+    def _fast_backup_previous_token(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """GPU-side steady-state backup of the previous token (compress_ratio == 1).
+
+        backup_indices == the whole batch, so backup_req_indices/prev positions
+        are plain arithmetic and both loc vectors are single gathers. The launch
+        block mirrors the generic path exactly (same stream waits and events).
+        """
+        prev_pos = seq_lens - 1 - 1  # (seq_len - 1) // 1 - 1
+        buffer_slot = prev_pos.clamp(max=self.device_buffer_size)
+        host_locs = self.req_to_host_pool[req_pool_indices, prev_pos]
+        device_locs = self.req_to_device_buffer[req_pool_indices, buffer_slot]
+
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            self._backup_done_event.record()
+            host_locs.record_stream(self.decode_backup_stream)
+            device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
     def _eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,
@@ -997,6 +1163,20 @@ class HiSparseCoordinator:
         - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
           token was produced this step.
         """
+        # [lane attn-streams] Steady-state fast path (SGLANG_HISPARSE_FAST_BACKUP,
+        # compress_ratio == 1): every request backs up its previous token, so the
+        # index list is the whole batch and both loc vectors are two gathers --
+        # no python-list -> pageable-H2D round-trip (measured ~2.2 ms host/step on
+        # GH200) and no per-request python loop. Falls back to the generic path on
+        # first-step skips or host-page growth.
+        if (
+            envs.SGLANG_HISPARSE_FAST_BACKUP.get()
+            and self.compress_ratio == 1
+            and self._fast_backup_eligible(seq_lens_cpu, req_pool_indices_cpu)
+        ):
+            self._fast_backup_previous_token(seq_lens, req_pool_indices)
+            return
+
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.

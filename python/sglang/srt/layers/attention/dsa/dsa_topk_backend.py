@@ -68,6 +68,7 @@ class DSATopKBackend(Enum):
         lengths: torch.Tensor,
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
+        warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
             if self._should_use_decode_fg(score, lengths, topk, row_starts):
@@ -75,7 +76,22 @@ class DSATopKBackend(Enum):
                     topk_decode_fg,
                 )
 
-                return topk_decode_fg(score, lengths, topk)
+                # The warm start trades one full-row read for verify/refine
+                # machinery (~10 us of fixed kernel overhead); measured it only
+                # pays off from ~batch*stride >= 16M elements (1.06-1.34x vs
+                # the plain FG path beyond that, 0.71-0.76x below it).
+                warm = (
+                    envs.SGLANG_DSA_TOPK_WARMSTART.get()
+                    and score.shape[0] * score.shape[1] >= 16_000_000
+                )
+                return topk_decode_fg(
+                    score,
+                    lengths,
+                    topk,
+                    warmstart=warm,
+                    delta=envs.SGLANG_DSA_TOPK_WARMSTART_DELTA.get(),
+                    warm_key=warm_key or 0,
+                )
 
             from sgl_kernel import fast_topk_v2
 
@@ -119,9 +135,12 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            return self.topk_func(
+                logits, lengths, topk, row_starts=row_starts, warm_key=warm_key
+            )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes

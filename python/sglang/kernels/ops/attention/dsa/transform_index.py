@@ -163,6 +163,7 @@ def transform_index_page_table_prefill_fast(
     output_num_tokens: Optional[int] = None,
     page_table_is_expanded: bool = False,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    max_extend_len_override: Optional[int] = None,
 ) -> torch.Tensor:
     assert page_size == 1
     assert topk_indices.shape[1] == 2048
@@ -171,7 +172,11 @@ def transform_index_page_table_prefill_fast(
     if real_num_tokens == 0:
         return result
 
-    max_extend_len = max(extend_lens_cpu)
+    max_extend_len = (
+        int(max_extend_len_override)
+        if max_extend_len_override is not None
+        else max(extend_lens_cpu)
+    )
     block_q = 1 if max_extend_len == 1 else 2 if max_extend_len == 2 else 4
     block_topk = 256
     if cu_seqlens_q is None:
