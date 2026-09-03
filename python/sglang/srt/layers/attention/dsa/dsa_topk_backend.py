@@ -171,12 +171,6 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
-            page_table_size_1 = (
-                attn_metadata.page_table_1[batch_idx_list]
-                if batch_idx_list is not None
-                else attn_metadata.page_table_1
-            )
-
             # Single-pass prefill top-k (lane/topk-1pass): replaces the 2-pass
             # topk_transform_prefill_kernel for exactly the launches that
             # would take it -- PAGED and not decode-shaped (row_starts present,
@@ -200,6 +194,40 @@ class DSATopKBackend(Enum):
                     fast_topk_transform_prefill_1pass,
                 )
 
+                # lane/pagetable-gather (SGLANG_DSA_PAGETABLE_HOIST): the
+                # chunked-mqa PAGED path (batch_idx_list is not None) used to
+                # materialize page_table_1[batch_idx_list] as a [rows, L]
+                # int32 copy per row-chunk PER TOPK LAYER -- at L~950k that is
+                # ~31 GB of HBM writes per layer, ~5x redundant across the
+                # step's topk layers (the gathered table depends only on
+                # per-step metadata: page_table_1 + token_to_batch_idx).
+                # Instead pass the per-step table whole plus
+                # row_to_page = batch_idx_list; the kernel resolves
+                # src_row = page_table_1[batch_idx_list[i]] directly -- the
+                # identical values the materialized copy held (identity), so
+                # outputs are bit-exact. No new cache: the table's lifetime
+                # stays one forward step (rebuilt in init_forward_metadata,
+                # read live at kernel time exactly as the per-layer gather
+                # re-read it).
+                if (
+                    batch_idx_list is not None
+                    and envs.SGLANG_DSA_PAGETABLE_HOIST.get()
+                ):
+                    return fast_topk_transform_prefill_1pass(
+                        score=logits,
+                        lengths=lengths,
+                        page_table_size_1=attn_metadata.page_table_1,
+                        cu_seqlens_q=None,
+                        topk=topk,
+                        row_starts=row_starts,
+                        row_to_page=batch_idx_list,
+                    )
+
+                page_table_size_1 = (
+                    attn_metadata.page_table_1[batch_idx_list]
+                    if batch_idx_list is not None
+                    else attn_metadata.page_table_1
+                )
                 return fast_topk_transform_prefill_1pass(
                     score=logits,
                     lengths=lengths,
@@ -208,6 +236,12 @@ class DSATopKBackend(Enum):
                     topk=topk,
                     row_starts=row_starts,
                 )
+
+            page_table_size_1 = (
+                attn_metadata.page_table_1[batch_idx_list]
+                if batch_idx_list is not None
+                else attn_metadata.page_table_1
+            )
 
             from sgl_kernel import (
                 fast_topk_transform_fused,
