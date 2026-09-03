@@ -169,7 +169,7 @@ class PoolGeom:
       page_first:  one chunk spanning all layers, base[0] + page * item
     """
 
-    def __init__(self, name: str, bases, item: int, rows_per_layer: int, span: int, cksum_mats, n_descs: int):
+    def __init__(self, name: str, bases, item: int, rows_per_layer: int, span: int, cksum_mats, n_descs: int, mem: str = "DRAM", dev: int = 0):
         self.name = name
         self.bases = [int(b) for b in bases]   # region base ptrs (len == span for layer_first)
         self.item = int(item)                  # bytes per page-row chunk
@@ -177,6 +177,8 @@ class PoolGeom:
         self.span = int(span)                  # chunks per page row
         self.cksum_mats = cksum_mats           # [(tensor (n_rows, row_bytes) uint8)]
         self.n_descs = int(n_descs)
+        self.mem = mem                         # "DRAM" or "VRAM"
+        self.dev = int(dev)                    # nixl device id (cuda device for VRAM)
 
     def page_descs(self, pages: np.ndarray) -> np.ndarray:
         """(span*len(pages), 3) uint64 [addr, len, 0] descs for these pages."""
@@ -189,6 +191,8 @@ class PoolGeom:
             "rows_per_layer": self.rows_per_layer,
             "span": self.span,
             "n_descs": self.n_descs,
+            "mem": self.mem,
+            "dev": self.dev,
         }
 
     def checksum(self, pages: np.ndarray) -> int:
@@ -213,19 +217,20 @@ class PoolGeom:
 
 
 def _spec_page_descs(spec: dict, pages: np.ndarray) -> np.ndarray:
-    """Build (span*len(pages), 3) DRAM descs from a geometry spec + page ids."""
+    """Build (span*len(pages), 3) descs from a geometry spec + page ids."""
     p = np.asarray(pages, dtype=np.uint64)
     item = np.uint64(spec["item"])
+    dev = np.uint64(spec.get("dev", 0))
     if spec["span"] == 1:
         addrs = p * item + np.uint64(spec["bases"][0])
         lens = np.full(len(p), spec["item"], dtype=np.uint64)
-        return np.column_stack([addrs, lens, np.zeros(len(p), dtype=np.uint64)])
+        return np.column_stack([addrs, lens, np.full(len(p), dev, dtype=np.uint64)])
     chunks = []
     for base in spec["bases"]:
         addrs = p * item + np.uint64(base)
         chunks.append(
             np.column_stack(
-                [addrs, np.full(len(p), spec["item"], dtype=np.uint64), np.zeros(len(p), dtype=np.uint64)]
+                [addrs, np.full(len(p), spec["item"], dtype=np.uint64), np.full(len(p), dev, dtype=np.uint64)]
             )
         )
     return np.vstack(chunks)
@@ -459,6 +464,154 @@ def slots_to_rows(slots: torch.Tensor, page_size: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# Decode arm (HiSparse retention)
+# --------------------------------------------------------------------------
+
+
+def _is_decode_cache(tree_cache: Any) -> bool:
+    from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+    return isinstance(tree_cache, HiSparseRadixCache)
+
+
+def _decode_pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
+    coord = tree_cache.coordinator
+    assert coord is not None, "hisparse coordinator not attached"
+    host = coord.mem_pool_host
+    if host.layout != "layer_first":
+        raise RuntimeError(
+            f"decode migration needs layer_first host pool, got {host.layout}"
+        )
+    item = int(host.token_stride_size)
+    bases = [int(t.data_ptr()) for t in host.data_refs]
+    cksum_mats = [t.reshape(-1, t.shape[-1]) for t in host.data_refs]
+    geoms: Dict[str, PoolGeom] = {}
+    geoms["latent"] = PoolGeom(
+        "latent", bases, item, host.size, len(bases), cksum_mats,
+        len(bases) * host.size, mem="DRAM", dev=0,
+    )
+    # Indexer keys: device-resident, page-major, indexed by logical page.
+    pool = coord.mem_pool_device
+    ic = pool.index_key_cache
+    bufs = [t for t in ic.buffer if t.numel() > 0]
+    if bufs:
+        item_i = int(bufs[0].shape[1] * bufs[0].element_size())
+        pages_i = int(bufs[0].shape[0])
+        dev = int(pool.device.index if hasattr(pool.device, "index") else 0)
+        geoms["indexer"] = PoolGeom(
+            "indexer", [int(t.data_ptr()) for t in bufs], item_i, pages_i,
+            len(bufs), [t.reshape(t.shape[0], -1) for t in bufs],
+            len(bufs) * pages_i, mem="VRAM", dev=dev,
+        )
+    return geoms
+
+
+def export_session_decode(
+    tree_cache: Any,
+    token_ids: List[int],
+    extra_key: Optional[str] = None,
+    cache_salt: Optional[str] = None,
+) -> Optional[dict]:
+    """Collect the session's retained decode prefix (logical + host rows)."""
+    page_size = tree_cache.page_size
+    coord = tree_cache.coordinator
+    key = RadixKey(
+        token_ids=token_ids, extra_key=extra_key, cache_salt=cache_salt
+    ).page_aligned(page_size)
+    if len(key) == 0:
+        return None
+    mr = tree_cache.match_prefix(MatchPrefixParams(key=key))
+    vals = mr.device_indices
+    if vals is None or len(vals) == 0:
+        return None
+    vals = vals.to(device="cpu", dtype=torch.int64)
+    rows = coord.logical_to_host_row[vals]
+    missing = (rows < 0).nonzero()
+    keep = int(missing[0]) if missing.numel() > 0 else len(vals)
+    keep -= keep % page_size
+    if keep == 0:
+        return None
+    vals = vals[:keep]
+    rows = rows[:keep]
+    # page-run invariants (logical pages and host rows are aligned runs)
+    lv = vals.reshape(-1, page_size)
+    assert bool(((lv[:, 0] % page_size) == 0).all()), "logical pages not aligned"
+    assert bool((lv[:, 1:] - lv[:, :-1] == 1).all()), "logical pages not consecutive"
+    hv = rows.reshape(-1, page_size)
+    assert bool(((hv[:, 0] % page_size) == 0).all()), "host pages not aligned"
+    assert bool((hv[:, 1:] - hv[:, :-1] == 1).all()), "host pages not consecutive"
+    tree_cache.inc_lock_ref(mr.last_device_node)
+    return {
+        "tokens": list(key.token_ids[:keep]),
+        "src_logical_pages": (lv[:, 0] // page_size).numpy().astype(np.int64),
+        "src_host_pages": (hv[:, 0] // page_size).numpy().astype(np.int64),
+        "n_pages": len(lv),
+        "lock_node": mr.last_device_node,
+        "extra_key": extra_key,
+        "cache_salt": cache_salt,
+    }
+
+
+def release_export_decode(tree_cache: Any, manifest: dict) -> None:
+    tree_cache.dec_lock_ref(manifest["lock_node"])
+
+
+def import_session_decode(
+    tree_cache: Any,
+    tokens: List[int],
+    dst_logical: torch.Tensor,
+    dst_rows: torch.Tensor,
+    extra_key: Optional[str] = None,
+    cache_salt: Optional[str] = None,
+) -> Tuple[int, int]:
+    """Insert tree nodes (values = dst logical) + retain host rows.
+
+    Returns (matched, imported): matched tokens keep existing logical/rows.
+    """
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+
+    page_size = tree_cache.page_size
+    coord = tree_cache.coordinator
+    key = RadixKey(
+        token_ids=tokens, extra_key=extra_key, cache_salt=cache_salt
+    ).page_aligned(page_size)
+    n = len(key)
+    assert len(dst_logical) == n and len(dst_rows) == n
+    result = tree_cache.insert(
+        InsertParams(key=key, value=dst_logical[:n].clone(), priority=0)
+    )
+    matched = result.prefix_len
+    if n > matched:
+        coord.retain_rows(dst_logical[matched:n], dst_rows[matched:n])
+    return matched, n - matched
+
+
+def alloc_decode_pages(
+    tree_cache: Any, n_pages: int, page_size: int
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Allocate logical + host page runs. Returns (logical, rows) or None."""
+    coord = tree_cache.coordinator
+    need = n_pages * page_size
+    logical = coord.token_to_kv_pool_allocator.logical_attn_allocator.alloc(need)
+    if logical is None:
+        return None
+    rows = coord.mem_pool_host.alloc_page(n_pages)
+    if rows is None:
+        coord.token_to_kv_pool_allocator.logical_attn_allocator.free(logical)
+        return None
+    return logical, rows
+
+
+def free_decode_pages(tree_cache: Any, logical=None, rows=None) -> None:
+    coord = tree_cache.coordinator
+    if rows is not None and len(rows) > 0:
+        coord.mem_pool_host.free(rows)
+    if logical is not None and len(logical) > 0:
+        # Free via the top allocator so the retention hook + mapping stay sane.
+        coord.token_to_kv_pool_allocator.logical_attn_allocator.free(logical)
+
+
+# --------------------------------------------------------------------------
 # NIXL plane: lazy agent + pool registration + prepped dlists
 # --------------------------------------------------------------------------
 
@@ -499,16 +652,22 @@ class NixlPlane:
                     f"NIXL backend {backend} unavailable; plugins="
                     f"{self.agent.get_plugin_list()}"
                 )
-            self.geoms = _pool_geoms(self.tree_cache)
+            self.geoms = (
+                _decode_pool_geoms(self.tree_cache)
+                if _is_decode_cache(self.tree_cache)
+                else _pool_geoms(self.tree_cache)
+            )
             for geom in self.geoms.values():
                 if geom.span == 1:
                     self.agent.register_memory(
-                        [(geom.bases[0], geom.item * geom.n_descs, 0, "")], "DRAM"
+                        [(geom.bases[0], geom.item * geom.n_descs, geom.dev, "")],
+                        geom.mem,
                     )
                 else:
                     for b in geom.bases:
                         self.agent.register_memory(
-                            [(b, geom.item * geom.rows_per_layer, 0, "")], "DRAM"
+                            [(b, geom.item * geom.rows_per_layer, geom.dev, "")],
+                            geom.mem,
                         )
             logger.info(
                 "[session-migration] NIXL agent up (%s), pools=%s",
@@ -571,7 +730,8 @@ class NixlPlane:
             geom = self.geoms[pool]
             spec = dst_specs[pool]
             if (spec["span"] != geom.span or spec["item"] != geom.item
-                    or spec["n_descs"] != geom.n_descs):
+                    or spec["n_descs"] != geom.n_descs
+                    or spec.get("mem") != geom.mem):
                 raise RuntimeError(
                     f"pool {pool} geometry mismatch: local {geom.fingerprint()} "
                     f"vs remote {spec}"
@@ -579,8 +739,8 @@ class NixlPlane:
             for off in range(0, len(src_pages), max_pages):
                 s = src_pages[off : off + max_pages]
                 d = dst_pages[off : off + max_pages]
-                sd = self.agent.get_xfer_descs(geom.page_descs(s), "DRAM")
-                dd = self.agent.get_xfer_descs(_spec_page_descs(spec, d), "DRAM")
+                sd = self.agent.get_xfer_descs(geom.page_descs(s), geom.mem)
+                dd = self.agent.get_xfer_descs(_spec_page_descs(spec, d), spec.get("mem", "DRAM"))
                 notif = f"mig_{pool}_{off}".encode()
                 h = self.agent.initialize_xfer("WRITE", sd, dd, canonical, notif)
                 if not h:
@@ -628,6 +788,7 @@ class SessionMigrationAgent:
         self.stats_file = stats_file
         self.exec = SchedulerExecutor()
         self.plane = NixlPlane(tree_cache, cxi_device_index)
+        self.decode = _is_decode_cache(tree_cache)
         self._srv: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._fp: Optional[dict] = None
@@ -696,10 +857,257 @@ class SessionMigrationAgent:
 
     def _fingerprint(self) -> dict:
         if self._fp is None:
-            self._fp = _fingerprint(
-                _pool_geoms(self.tree_cache), self.tree_cache.page_size
+            geoms = (
+                _decode_pool_geoms(self.tree_cache)
+                if self.decode
+                else _pool_geoms(self.tree_cache)
             )
+            self._fp = _fingerprint(geoms, self.tree_cache.page_size)
         return self._fp
+
+    # -- decode (HiSparse) ops --------------------------------------------
+
+    def _op_export_meta_decode(self, msg: dict) -> dict:
+        man = self.exec.run(
+            lambda: export_session_decode(
+                self.tree_cache,
+                msg["tokens"],
+                msg.get("extra_key"),
+                msg.get("cache_salt"),
+            ),
+            timeout=30.0,
+        )
+        if man is None:
+            return {"ok": False, "reason": "no retained prefix"}
+        self.exec.run(
+            lambda: release_export_decode(self.tree_cache, man), timeout=30.0
+        )
+        return {
+            "ok": True,
+            "n_pages": man["n_pages"],
+            "n_tokens": len(man["tokens"]),
+            "fingerprint": self._fingerprint(),
+            "nixl_name": self.plane.name,
+            "nixl_meta": base64.b64encode(self.plane.metadata()).decode(),
+        }
+
+    def _op_push_decode(self, msg: dict) -> dict:
+        t0 = time.perf_counter()
+        man = self.exec.run(
+            lambda: export_session_decode(
+                self.tree_cache,
+                msg["tokens"],
+                msg.get("extra_key"),
+                msg.get("cache_salt"),
+            ),
+            timeout=60.0,
+        )
+        if man is None:
+            return {"ok": False, "reason": "no retained prefix"}
+        try:
+            t_export = time.perf_counter() - t0
+            if msg.get("fingerprint") != self._fingerprint():
+                return {"ok": False, "error": "pool fingerprint mismatch"}
+            n = man["n_pages"]
+            dst = msg["dst_pages"]
+            per_pool = {}
+            for pool in self.plane.geoms:
+                if pool == "latent":
+                    src_pages, d = man["src_host_pages"], dst["latent"]
+                elif pool == "indexer":
+                    src_pages, d = man["src_logical_pages"], dst["indexer"]
+                else:
+                    continue
+                if len(d) < n:
+                    return {"ok": False, "error": f"dst_pages too short for {pool}"}
+                per_pool[pool] = (src_pages, d[:n])
+            xfer_s = self.plane.write_pages(
+                msg["peer_name"], msg["peer_meta"], per_pool, msg["dst_spec"]
+            )
+            t_ck0 = time.perf_counter()
+            checksums = {
+                pool: self.plane.checksum(pool, v[0]) for pool, v in per_pool.items()
+            }
+            t_ck = time.perf_counter() - t_ck0
+            nbytes = sum(
+                len(per_pool[p][0]) * self.plane.geoms[p].page_bytes()
+                for p in per_pool
+            )
+            return {
+                "ok": True,
+                "meta": base64.b64encode(self.plane.metadata()).decode(),
+                "name": self.plane.name,
+                "tokens": man["tokens"],
+                "src_pages": {p: v[0] for p, v in per_pool.items()},
+                "checksums": checksums,
+                "nbytes": nbytes,
+                "t_export_s": round(t_export, 6),
+                "t_xfer_s": round(xfer_s, 6),
+                "t_checksum_s": round(t_ck, 6),
+            }
+        finally:
+            self.exec.run(
+                lambda: release_export_decode(self.tree_cache, man), timeout=60.0
+            )
+
+    def _op_adopt_decode(self, msg: dict) -> dict:
+        t0 = time.perf_counter()
+        holder = tuple(msg["holder"])
+        timeout = float(msg.get("timeout", _DEFAULT_TIMEOUT_S))
+        tokens = msg["tokens"]
+        page_size = self.tree_cache.page_size
+        alloc = None
+        ok = False
+        try:
+            meta_resp = tcp_rpc(
+                holder,
+                {
+                    "op": "export_meta",
+                    "tokens": tokens,
+                    "extra_key": msg.get("extra_key"),
+                    "cache_salt": msg.get("cache_salt"),
+                },
+                timeout,
+            )
+            if not meta_resp.get("ok"):
+                return {"ok": False, "reason": meta_resp.get("reason", "export_meta failed")}
+            n_pages = meta_resp["n_pages"]
+            if n_pages == 0:
+                return {"ok": False, "reason": "holder holds nothing"}
+            if meta_resp.get("fingerprint") != self._fingerprint():
+                return {"ok": False, "error": "pool fingerprint mismatch"}
+            self.plane.add_peer(meta_resp["nixl_name"], meta_resp["nixl_meta"])
+
+            alloc = self.exec.run(
+                lambda: alloc_decode_pages(self.tree_cache, n_pages, page_size),
+                timeout=60.0,
+            )
+            if alloc is None:
+                return {"ok": False, "reason": "pool full"}
+            logical, rows = alloc
+            lv = logical.reshape(-1, page_size)
+            hv = rows.reshape(-1, page_size)
+            assert bool(((lv[:, 0] % page_size) == 0).all()) and bool(
+                (lv[:, 1:] - lv[:, :-1] == 1).all()
+            ), "allocated logical pages not aligned runs"
+            dst_logical_pages = (lv[:, 0] // page_size).numpy().astype(np.int64)
+            dst_host_pages = (hv[:, 0] // page_size).numpy().astype(np.int64)
+            dst_pages = {"latent": dst_host_pages, "indexer": dst_logical_pages}
+            dst_specs = {p: g.spec() for p, g in self.plane.geoms.items()}
+
+            push_resp = tcp_rpc(
+                holder,
+                {
+                    "op": "push",
+                    "tokens": tokens,
+                    "extra_key": msg.get("extra_key"),
+                    "cache_salt": msg.get("cache_salt"),
+                    "peer_name": self.plane.name,
+                    "peer_meta": base64.b64encode(self.plane.metadata()).decode(),
+                    "dst_pages": dst_pages,
+                    "dst_spec": dst_specs,
+                    "fingerprint": self._fingerprint(),
+                },
+                timeout,
+            )
+            if not push_resp.get("ok"):
+                return {"ok": False, "error": push_resp.get("error", "push failed")}
+            self.plane.add_peer(push_resp["name"], push_resp["meta"])
+            self.plane.drain_notifs(seconds=5.0)
+
+            t_ck0 = time.perf_counter()
+            verified = True
+            mismatch = None
+            for pool, src_pages in push_resp["src_pages"].items():
+                dst_side = dst_pages[pool][: len(src_pages)]
+                ours = self.plane.checksum(pool, dst_side)
+                if ours != push_resp["checksums"][pool]:
+                    verified = False
+                    mismatch = pool
+                    break
+            t_verify = time.perf_counter() - t_ck0
+            if not verified:
+                return {"ok": False, "error": f"checksum mismatch on {mismatch}"}
+
+            man_tokens = push_resp["tokens"]
+            t_ins0 = time.perf_counter()
+            matched, imported = self.exec.run(
+                lambda: import_session_decode(
+                    self.tree_cache,
+                    man_tokens,
+                    logical[: len(man_tokens)],
+                    rows[: len(man_tokens)],
+                    msg.get("extra_key"),
+                    msg.get("cache_salt"),
+                ),
+                timeout=timeout,
+            )
+            t_insert = time.perf_counter() - t_ins0
+            # Free what the target already had (insert matched that head) and
+            # any un-imported tail.
+            used = matched + imported
+            if matched > 0 or used < len(logical):
+                self.exec.run(
+                    lambda: free_decode_pages(
+                        self.tree_cache,
+                        logical[:matched].clone(),
+                        rows[:matched].clone(),
+                    ),
+                    timeout=30.0,
+                )
+                if used < len(logical):
+                    self.exec.run(
+                        lambda: free_decode_pages(
+                            self.tree_cache,
+                            logical[used:].clone(),
+                            rows[used:].clone(),
+                        ),
+                        timeout=30.0,
+                    )
+            ok = True
+            total = time.perf_counter() - t0
+            xfer_s = push_resp.get("t_xfer_s")
+            nbytes = push_resp.get("nbytes", 0)
+            rec = {
+                "event": "session_migration",
+                "mode": "decode",
+                "req_id": msg.get("req_id"),
+                "dp_rank": self.dp_rank,
+                "tokens_requested": len(tokens),
+                "tokens_imported": imported,
+                "tokens_matched_existing": matched,
+                "pages": n_pages,
+                "bytes": nbytes,
+                "t_total_s": round(total, 6),
+                "t_xfer_s": xfer_s,
+                "t_export_s": push_resp.get("t_export_s"),
+                "t_verify_s": round(t_verify, 6),
+                "t_insert_s": round(t_insert, 6),
+                "t_holder_checksum_s": push_resp.get("t_checksum_s"),
+                "gbps": round((nbytes / 1e9) / xfer_s, 3) if xfer_s else None,
+                "verified": verified,
+            }
+            self._log_stats(rec)
+            return {
+                "ok": True,
+                "tokens_imported": imported,
+                "tokens_matched_existing": matched,
+                "t_total_s": round(total, 6),
+                "t_xfer_s": xfer_s,
+                "gbps": rec["gbps"],
+                "verified": verified,
+            }
+        finally:
+            if not ok and alloc is not None:
+                try:
+                    self.exec.run(
+                        lambda: free_decode_pages(
+                            self.tree_cache, alloc[0], alloc[1]
+                        ),
+                        timeout=30.0,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("[session-migration] decode free failed", exc_info=True)
 
     def _log_stats(self, rec: dict) -> None:
         logger.info("[session-migration] %s", json.dumps(rec))
@@ -713,6 +1121,8 @@ class SessionMigrationAgent:
     # -- ops ---------------------------------------------------------------
 
     def _op_export_meta(self, msg: dict) -> dict:
+        if self.decode:
+            return self._op_export_meta_decode(msg)
         man = self.exec.run(
             lambda: export_session(
                 self.tree_cache,
@@ -738,6 +1148,8 @@ class SessionMigrationAgent:
 
     def _op_push(self, msg: dict) -> dict:
         """Holder side: export + WRITE pages to the requesting target."""
+        if self.decode:
+            return self._op_push_decode(msg)
         t0 = time.perf_counter()
         man = self.exec.run(
             lambda: export_session(
@@ -797,6 +1209,8 @@ class SessionMigrationAgent:
 
         msg: {tokens, extra_key, cache_salt, holder: (host, port), req_id}
         """
+        if self.decode:
+            return self._op_adopt_decode(msg)
         t0 = time.perf_counter()
         holder = tuple(msg["holder"])
         timeout = float(msg.get("timeout", _DEFAULT_TIMEOUT_S))
