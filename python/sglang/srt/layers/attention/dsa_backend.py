@@ -1083,6 +1083,29 @@ class DeepseekSparseAttnBackend(
         else:
             draft_token_num = 0
 
+        if forward_batch.seq_lens.numel() == 0:
+            # Idle DP-attention batch: no rows to attend; the draft worker
+            # still forwards an idle batch in collective lockstep, so provide
+            # a minimal (empty) metadata instead of reducing an empty seq_lens.
+            z = torch.zeros((0,), dtype=torch.int32, device=device)
+            self.forward_metadata = DSAMetadata(
+                page_size=1,
+                cache_seqlens_int32=z,
+                max_seq_len_q=0,
+                max_seq_len_k=0,
+                cu_seqlens_q=torch.arange(0, 1, dtype=torch.int32, device=device),
+                cu_seqlens_k=torch.tensor([0], dtype=torch.int32, device=device),
+                page_table_1=None,
+                real_page_table=z.view(0, 1),
+                dsa_cache_seqlens_int32=z,
+                dsa_cu_seqlens_q=torch.arange(0, 1, dtype=torch.int32, device=device),
+                dsa_cu_seqlens_k=torch.tensor([0], dtype=torch.int32, device=device),
+                dsa_extend_seq_lens_list=[],
+                dsa_seqlens_expanded=z,
+                paged_mqa_schedule_metadata=None,
+                paged_mqa_ctx_lens_2d=None,
+            )
+            return
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         if forward_batch.seq_lens_cpu is not None:

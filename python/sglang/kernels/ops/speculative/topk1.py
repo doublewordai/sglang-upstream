@@ -97,6 +97,25 @@ def _draft_topk1_finalize_kernel(
     tl.store(positions + row, position + 1)
 
 
+
+def _pp4sf_shape_probe(next_token_logits, positions):
+    import os as O
+    if O.environ.get("SGLANG_PP4SF_DEBUG", "0") != "1":
+        return
+    try:
+        import logging
+        from sglang.srt.runtime_context import get_parallel
+        p = get_parallel()
+        logging.getLogger(__name__).warning(
+            "PP4SF dpshape positions=%s logits=%s dp_attn=%s dp_size=%s attn_dp_rank=%s attn_tp_size=%s",
+            tuple(positions.shape), tuple(next_token_logits.shape),
+            getattr(p, "enable_dp_attention", None), getattr(p, "dp_size", None),
+            getattr(p, "attn_dp_rank", None), getattr(p, "attn_tp_size", None),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("PP4SF dpshape-failed %s", repr(e))
+
+
 def draft_topk1_postprocess(
     next_token_logits: torch.Tensor,
     positions: torch.Tensor,
@@ -125,6 +144,7 @@ def draft_topk1_postprocess(
     assert next_token_logits.stride(1) == 1
     assert positions.ndim == 1
     assert positions.is_contiguous()
+    _pp4sf_shape_probe(next_token_logits, positions)
     assert positions.shape[0] == next_token_logits.shape[0]
     assert positions.device == next_token_logits.device
     write_draft_token = draft_tokens is not None
