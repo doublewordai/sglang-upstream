@@ -631,6 +631,17 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+
+    # MTP verify path's multi-position shared-index prefetch (union swap-in
+    # per skip layer). Default True (merge policy 2026-09-03: exact and
+    # measured-positive lands as the default path): the per-position fork
+    # measures 2.6-3.2x vs the synchronous per-position swap-in and is
+    # bit-identical. Set 0 to restore the synchronous fallback (speculation
+    # itself is default-off in prod, so this only affects spec runs).
+    SGLANG_HISPARSE_SPEC_PREFETCH = EnvBool(True)
+    # Debug: verify each step swap-in selection contains distinct token
+    # positions (kernel miss-compaction invariant; see hisparse_coordinator).
+    SGLANG_DEBUG_HISPARSE_CHECK_TOPK = EnvBool(False)
     # draft-prefetch lane probe: per verify step, stash the draft seed top-k,
     # the target's per-layer/per-position top-k, the per-layer resident tables,
     # per-(layer,position) swap-in CUDA-event timings and miss counts, then
