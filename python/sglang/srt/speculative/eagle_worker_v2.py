@@ -135,6 +135,22 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# lane ngram-draft: session-local n-gram store merged into the EAGLE/NextN
+# chain (one verify; lossless -- the target still verifies every proposal).
+# Env-gated; see lane ngram-draft results.md for the design.
+# ---------------------------------------------------------------------------
+import os as _ng_os
+
+NGRAM_ENABLED = _ng_os.environ.get("SGLANG_NGRAM_DRAFT", "0") == "1"
+NGRAM_MIN_MATCH = int(_ng_os.environ.get("SGLANG_NGRAM_MIN_MATCH", "2"))
+NGRAM_KMAX = int(_ng_os.environ.get("SGLANG_NGRAM_KMAX", "8"))
+NGRAM_PUT_PROMPT = _ng_os.environ.get("SGLANG_NGRAM_PUT_PROMPT", "1") == "1"
+NGRAM_DEBUG = _ng_os.environ.get("SGLANG_NGRAM_DEBUG", "0") == "1"
+NGRAM_MAX_TRACKED_REQS = int(_ng_os.environ.get("SGLANG_NGRAM_MAX_TRACKED_REQS", "4096"))
+
+
+
 
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
@@ -204,6 +220,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self._ngram_init(server_args)
 
     def alloc_memory_pool(
         self,
@@ -599,6 +616,139 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    def _ngram_init(self, server_args: ServerArgs):
+        """lane ngram-draft: per-request n-gram store over the verified stream."""
+        self.ngram_enabled = (
+            NGRAM_ENABLED
+            and self.topk == 1
+            and server_args.speculative_num_steps >= 1
+        )
+        if self.ngram_enabled:
+            from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+
+            self._ngram_overlap = not getattr(
+                server_args, "disable_overlap_schedule", False
+            )
+
+            # breadth=1 => the trie match returns a single best continuation
+            # chain, which we splice onto the EAGLE topk-1 chain (one verify).
+            self.ngram_corpus = NgramCorpus(
+                max_trie_depth=NGRAM_KMAX,
+                min_bfs_breadth=1,
+                max_bfs_breadth=1,
+                draft_token_num=server_args.speculative_num_steps,
+            )
+            self._ngram_put_len = {}  # rid -> total stream length inserted
+            self._ngram_hits = 0
+            self._ngram_queries = 0
+            self._ngram_time_s = 0.0
+            self._ngram_max_s = 0.0
+
+    def _ngram_merge(
+        self,
+        batch: ScheduleBatch,
+        draft_tokens: torch.Tensor,
+        top_scores_index: torch.Tensor,
+        draft_probs,
+    ):
+        """Update the per-request n-gram store from the verified stream, then
+        splice long n-gram continuations over the drafted chain. Structure
+        (parents/topk-1 chain) is unchanged, so this stays ONE verify call."""
+        import time as _ng_time
+
+        _t0 = _ng_time.perf_counter()
+        reqs = batch.reqs
+        steps = draft_tokens.shape[1]
+        k = self.ngram_corpus.draft_token_num
+        put_batch, tails, total_lens, rids = [], [], [], []
+        for req in reqs:
+            rid = req.rid
+            out_ids = list(req.output_ids)
+            origin = list(req.origin_input_ids)
+            total = len(origin) + len(out_ids)
+            prev = self._ngram_put_len.get(rid, -1)
+            if prev < 0:
+                # first sight of this request: optionally seed with the prompt
+                if NGRAM_PUT_PROMPT and origin:
+                    put_batch.append(origin)
+                prev = len(origin)
+                self._ngram_put_len[rid] = prev
+            if total > prev:
+                tail = (origin[-k:] + out_ids[-k:])[-k:]
+                put_batch.append(tail)
+                self._ngram_put_len[rid] = total
+            tails.append((origin[-k:] + out_ids[-k:])[-k:])
+            total_lens.append(total)
+            rids.append(rid)
+        if len(self._ngram_put_len) > NGRAM_MAX_TRACKED_REQS:
+            # crude bound: reset (production integration should erase per-req
+            # state on filter instead; see lane notes)
+            self.ngram_corpus.reset()
+            self._ngram_put_len.clear()
+        if put_batch:
+            self.ngram_corpus.batch_put(put_batch)
+        self.ngram_corpus.synchronize()
+
+        # In overlap mode req.output_ids can lag the just-accepted tokens; a
+        # stale tail gives useless (still lossless) proposals. Only query
+        # requests whose last known token equals the bonus token.
+        fresh = list(range(len(reqs)))
+        if self._ngram_overlap:
+            bonus = getattr(batch.spec_info, "bonus_tokens", None)
+            if bonus is not None and bonus.numel() == len(reqs):
+                bl = bonus.tolist()
+                fresh = [
+                    b for b in fresh
+                    if len(reqs[b].output_ids) and reqs[b].output_ids[-1] == bl[b]
+                ]
+        rd = None
+        if fresh:
+            req_drafts, mask = self.ngram_corpus.batch_get(
+                [rids[b] for b in fresh],
+                [tails[b] for b in fresh],
+                [total_lens[b] for b in fresh],
+            )
+            import numpy as np
+            rd = req_drafts.reshape(len(fresh), -1)
+            mk = mask.reshape(len(fresh), -1, rd.shape[1])
+        for bi, b in enumerate(fresh):
+            # chain mode: the deepest leaf path is [last_token, next1, next2, ...]
+            # (the corpus echoes the query's last token at slot 0), so the
+            # usable continuation is path_len - 1 tokens from rd[1:].
+            path_len = int(mk[bi].sum(-1).max())
+            n_usable = path_len - 1
+            if n_usable < NGRAM_MIN_MATCH:
+                continue
+            n = min(n_usable, steps)
+            chain = torch.from_numpy(rd[bi, 1:1 + n].astype("int64")).to(
+                draft_tokens.device
+            )
+            draft_tokens[b, :n] = chain.to(draft_tokens.dtype)
+            if draft_probs is not None:
+                # one-hot proposal distribution q = delta(proposal): lossless
+                # under rejection sampling (accept prob = p(token)).
+                if draft_probs.dim() == 3:
+                    idx = torch.arange(n, device=draft_probs.device)
+                    draft_probs[b, :n] = 0.0
+                    draft_probs[b, idx, chain.to(draft_probs.device)] = 1.0
+                else:  # (b, vocab) single-step form
+                    draft_probs[b] = 0.0
+                    draft_probs[b, chain[0].to(draft_probs.device)] = 1.0
+            self._ngram_hits += 1
+        self._ngram_queries += len(reqs)
+        _dt = _ng_time.perf_counter() - _t0
+        self._ngram_time_s += _dt
+        self._ngram_max_s = max(self._ngram_max_s, _dt)
+        if NGRAM_DEBUG and self._ngram_queries % 200 < len(reqs):
+            logger.info(
+                "[ngram-draft] hits %d/%d queries, merge %.3f ms avg / %.1f ms max "
+                "(min_match=%d kmax=%d)",
+                self._ngram_hits, self._ngram_queries,
+                1000.0 * self._ngram_time_s / max(1, self._ngram_queries),
+                1000.0 * self._ngram_max_s, NGRAM_MIN_MATCH, NGRAM_KMAX,
+            )
+        return draft_tokens, top_scores_index, draft_probs
+
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
@@ -646,6 +796,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
+
+        if self.ngram_enabled and not batch.forward_mode.is_idle():
+            draft_tokens, top_scores_index, draft_probs = self._ngram_merge(
+                batch, draft_tokens, top_scores_index, draft_probs
+            )
 
         ragged_layout = None
         draft_confidences = None
