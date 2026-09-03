@@ -2540,16 +2540,18 @@ def add_prometheus_middleware(app, load_snapshot_collector=None):
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
-    mp_collector = multiprocess.MultiProcessCollector()
     if load_snapshot_collector is not None:
-        # The all-ranks collector wraps the multiprocess collector (it emits
-        # the per-rank families itself for remote-node ranks and filters the
-        # duplicates out of the multiprocess exposition), so only it is
-        # registered. See observability/metrics_collector.py.
+        # The venv's prometheus_client predates MultiProcessCollector's
+        # optional-registry signature (registry is a REQUIRED positional),
+        # so the wrapped collector is constructed against a throwaway
+        # registry it can harmlessly register itself into; only the wrapper
+        # is registered on the serving registry (otherwise its families
+        # would be yielded twice).
+        mp_collector = multiprocess.MultiProcessCollector(CollectorRegistry())
         load_snapshot_collector.attach_multiprocess_collector(mp_collector)
         registry.register(load_snapshot_collector)
     else:
-        registry.register(mp_collector)
+        multiprocess.MultiProcessCollector(registry)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
 
     # Workaround for 307 Redirect for /metrics
