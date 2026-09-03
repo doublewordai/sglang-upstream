@@ -58,3 +58,29 @@ def wrap_weights_iterator(weights):
              noncontig=stats["noncontig"], yielded_mb=stats["mb"])
 
     return gen()
+
+
+def maybe_copy_weight_view_before_h2d(loaded_weight):
+    """fast-boot: stage safetensors mmap-backed weights into anon storage before H2D.
+
+    Behind SGLANG_WEIGHT_LOAD_STAGE_VIEWS (default off). Pageable H2D straight
+    from file-backed pages re-reads them 2-6x from disk on GH200 (measured: a
+    decode rank's 67 GB slice read 162 GB via direct copy_ vs 78 GB staged,
+    47.9s -> 26.5s cold). safetensors tensors view the mmap but report
+    storage_offset==0 with storage==tensor bytes, so the upstream
+    SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D view test never fires for per-expert
+    checkpoints - hence this unconditional CPU clone (byte-identical; transient
+    per-tensor anon copy). Non-CPU sources pass through. Lives in this leaf
+    module to avoid the linear -> weight_utils -> model_config -> quantization
+    -> linear import cycle.
+    """
+    import torch
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_WEIGHT_LOAD_STAGE_VIEWS.get():
+        return loaded_weight
+    if loaded_weight.device.type != "cpu":
+        return loaded_weight
+    if loaded_weight.numel() == 0:
+        return loaded_weight
+    return loaded_weight.clone(memory_format=torch.contiguous_format)

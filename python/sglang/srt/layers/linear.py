@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
+
+from sglang.srt.boot_timeline import maybe_copy_weight_view_before_h2d
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
@@ -283,7 +285,7 @@ class ReplicatedLinear(LinearBase):
         assert (
             param.size() == loaded_weight.size()
         ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
-        param.data.copy_(loaded_weight)
+        param.data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
@@ -452,7 +454,7 @@ class ColumnParallelLinear(LinearBase):
         assert (
             param_data.shape == loaded_weight.shape
         ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
-        param_data.copy_(loaded_weight)
+        param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -616,7 +618,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
                 return
             current_shard_offset = 0
             shard_offsets: List[Tuple[int, int, int]] = []
@@ -749,7 +751,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -1233,7 +1235,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
@@ -1401,7 +1403,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=} {loaded_weight.shape=}"
-        param_data.copy_(loaded_weight)
+        param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
 
 
 class RowParallelLinear(LinearBase):
@@ -1561,7 +1563,7 @@ class RowParallelLinear(LinearBase):
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=} {loaded_weight.shape=}"
-        param_data.copy_(loaded_weight)
+        param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
 
@@ -1741,7 +1743,7 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-        param_data.copy_(loaded_weight)
+        param_data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
 
 
 class ColumnParallelBatchedLinear(nn.Module):

@@ -294,6 +294,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # fast-boot: stage safetensors mmap views into anon CPU storage before H2D
+    # (removes the 2-6x file-page re-read of pageable H2D; byte-identical).
+    SGLANG_WEIGHT_LOAD_STAGE_VIEWS = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
