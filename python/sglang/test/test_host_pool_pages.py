@@ -87,19 +87,29 @@ def _ptr_of(t: torch.Tensor) -> int:
 
 
 def _pattern_roundtrip(t: torch.Tensor) -> bool:
-    """Write + read back a pattern at head, tail and stride; True iff intact."""
+    """Write + read back a pattern at head, tail and stride; True iff intact.
+
+    The strided samples are drawn from the INTERIOR (excluding the head/tail
+    regions) so the three writes can never alias: for pathological sizes
+    (e.g. 3,574,813,696 = 4096*872757 + 1024) the last strided position of
+    the old v[::stride] selection landed exactly on the tail region and the
+    test clobbered its own pattern.
+    """
     v = t.flatten().view(torch.uint8)
-    stride = max(1, v.numel() // 4096)
-    sel = v[::stride]
-    sel.copy_(torch.arange(sel.numel(), dtype=torch.uint8))
     h = min(1024, v.numel())
     v[:h] = torch.arange(h, dtype=torch.uint8)
     if v.numel() > h:
         v[-h:] = torch.arange(h, dtype=torch.uint8) + 1
+    stride = max(1, (v.numel() - 2 * h) // 4096)
+    sel = v[h : v.numel() - h : stride]
+    sel.copy_(torch.arange(sel.numel(), dtype=torch.uint8))
     assert v[0].item() == 0
     if v.numel() > h:
         assert v[-1].item() == 0, (v[-1].item(),)
-    assert bool(torch.equal(v[::stride], torch.arange(sel.numel(), dtype=torch.uint8)))
+    assert bool(torch.equal(v[:h], torch.arange(h, dtype=torch.uint8)))
+    if v.numel() > h:
+        assert bool(torch.equal(v[-h:], torch.arange(h, dtype=torch.uint8) + 1))
+    assert bool(torch.equal(sel, torch.arange(sel.numel(), dtype=torch.uint8)))
     return True
 
 
@@ -221,16 +231,18 @@ def test_hugetlb_register_exact_indexer_size():
     pin through the engine path."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device")
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
     try:
         t = _alloc_and_register(3_574_813_696, 0)
     except OSError as e:
         pytest.skip(f"2 MiB hugetlbfs unavailable: {e}")
-    sm = _smaps_entry(_ptr_of(t))
-    assert int(sm["MMUPageSize:"].split()[0]) * 1024 == 2 * MIB, sm
-    assert getattr(t, "_sglang_mmap_alloc_bytes", 0) >= 3_574_813_696
-    assert _pattern_roundtrip(t)
-    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
-    _cuda_host_unregister(t)
+    try:
+        sm = _smaps_entry(_ptr_of(t))
+        assert int(sm["MMUPageSize:"].split()[0]) * 1024 == 2 * MIB, sm
+        assert getattr(t, "_sglang_mmap_alloc_bytes", 0) >= 3_574_813_696
+        assert _pattern_roundtrip(t)
+    finally:
+        _cuda_host_unregister(t)
 
 
 def test_hugetlb_register_exact_staging_decode_size():
@@ -244,18 +256,21 @@ def test_hugetlb_register_exact_staging_decode_size():
 
     dims = (78, 1_664_064, 1, 656)
     assert dims[0] * dims[1] * dims[2] * dims[3] == 85_146_826_752
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
     try:
         t = _alloc_and_register(85_146_826_752, 0)
     except OSError as e:
         pytest.skip(f"2 MiB hugetlbfs unavailable: {e}")
-    sm = _smaps_entry(_ptr_of(t))
-    assert int(sm["MMUPageSize:"].split()[0]) * 1024 == 2 * MIB, sm
-    assert getattr(t, "_sglang_mmap_alloc_bytes", 0) >= 85_146_826_752
-    # bit-exact by construction: only pinning changed; spot-check the tensor
-    v = t.view(torch.uint8).flatten()
-    v[:1024] = torch.arange(1024, dtype=torch.uint8)
-    assert v[1023].item() == 1023
-    _cuda_host_unregister(t)
+    try:
+        sm = _smaps_entry(_ptr_of(t))
+        assert int(sm["MMUPageSize:"].split()[0]) * 1024 == 2 * MIB, sm
+        assert getattr(t, "_sglang_mmap_alloc_bytes", 0) >= 85_146_826_752
+        # bit-exact by construction: only pinning changed; spot-check the tensor
+        v = t.view(torch.uint8).flatten()
+        v[:1024] = torch.arange(1024, dtype=torch.uint8)
+        assert v[1023].item() == 1023
+    finally:
+        _cuda_host_unregister(t)
 
 
 def test_hugetlb_default_gate_small_pool_stays_base():
@@ -274,9 +289,11 @@ def test_hugetlb_default_gate_small_pool_stays_base():
             (1 * GIB,), torch.uint8, "cpu", pin_memory=True,
             allocator=HostTensorAllocator(),
         )
-    sm = _smaps_entry(_ptr_of(t))
-    assert int(sm["MMUPageSize:"].split()[0]) * 1024 == mmap.PAGESIZE, sm
-    _cuda_host_unregister(t)
+    try:
+        sm = _smaps_entry(_ptr_of(t))
+        assert int(sm["MMUPageSize:"].split()[0]) * 1024 == mmap.PAGESIZE, sm
+    finally:
+        _cuda_host_unregister(t)
 
 
 def test_non_strict_unknown_size_falls_back():
