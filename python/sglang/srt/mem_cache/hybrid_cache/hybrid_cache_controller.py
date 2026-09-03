@@ -603,6 +603,11 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        logger.info(
+            "[kvl3] hit query rid=%s pages=%d/%d kv_hit=%d extra=%s",
+            operation.request_id, kv_hit_pages, len(hash_value), kv_hit_pages,
+            dict(hit_result.extra_pool_hit_pages),
+        )
 
         return (
             hash_value[:kv_hit_pages],
@@ -638,6 +643,23 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        try:
+            self._page_transfer_inner(operation)
+        except Exception as e:
+            # A store read failure must never kill the loading thread:
+            # warn, keep whatever pages already loaded (partial hit), and
+            # let the request recompute the rest.
+            logger.warning(
+                "[kvl3] transfer failed rid=%s (pages stay unloaded, "
+                "request recomputes): %s",
+                getattr(operation, "id", "?"),
+                e,
+            )
+            operation.pool_transfers_done = True
+
+    def _page_transfer_inner(self, operation):
+        if self._can_use_v3_io(read=True, operation=operation):
+            return self._page_transfer_v3(operation)
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
 
@@ -659,6 +681,24 @@ class HybridCacheController(BaseHiCacheController):
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
+        try:
+            self._page_backup_inner(operation)
+        except Exception as e:
+            # A store write failure must never kill the backup thread:
+            # warn, leave the op's completed_tokens where the backend left
+            # it (0 on early failure -> save watermark rolls back and the
+            # node stays not-backed-up, so a later op can retry), and ack
+            # normally so queues never stall.
+            logger.warning(
+                "[kvl3] backup failed rid=%s (save watermark rolled back, "
+                "retry possible on next op): %s",
+                getattr(operation, "id", "?"),
+                e,
+            )
+
+    def _page_backup_inner(self, operation):
+        if self._can_use_v3_io(read=False, operation=operation):
+            return self._page_backup_v3(operation)
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -694,6 +734,110 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+    # ------------------------------------------------------------------
+    # v3 combined per-op storage IO (blob backend): one call serves the KV
+    # pool and every sidecar pool, so a single group-object read/write covers
+    # all pools (the v1+v2 pair would touch the same object twice and stage
+    # whole-op sidecar pages in host memory).
+    # ------------------------------------------------------------------
+
+    def _can_use_v3_io(self, read: bool, operation) -> bool:
+        backend = getattr(self, "storage_backend", None)
+        if backend is None:
+            return False
+        attr = "batch_read_v3" if read else "batch_write_v3"
+        if getattr(backend, attr, None) is None:
+            return False
+        if read:
+            if operation.host_indices is None or not operation.hash_value:
+                return False
+        else:
+            # Non-anchor TP ranks keep the legacy sidecar-only path.
+            if self.backup_skip:
+                return False
+        if self.has_draft:
+            return False  # draft sidecars ride the per-batch legacy path
+        for transfer in operation.pool_transfers or []:
+            if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                return False
+        return True
+
+    def _v3_transfers(self, operation) -> list[PoolTransfer]:
+        self._resolve_sidecar_derived_pool_transfers(operation)
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV,
+                host_indices=operation.host_indices,
+                keys=operation.hash_value,
+            )
+        ]
+        transfers.extend(
+            PoolTransfer(
+                name=t.name,
+                host_indices=t.host_indices,
+                keys=t.keys,
+                hit_policy=t.hit_policy,
+                indices_from_pool=t.indices_from_pool,
+            )
+            for t in (operation.pool_transfers or [])
+        )
+        return transfers
+
+    @staticmethod
+    def _leading_success(results) -> int:
+        if results is None:
+            return 0
+        n = 0
+        for ok in results:
+            if not ok:
+                break
+            n += 1
+        return n
+
+    @staticmethod
+    def _collect_v3_results(operation, results) -> dict:
+        op_results = {}
+        for t in operation.pool_transfers or []:
+            r = results.get(t.name)
+            if r is None:
+                r = results.get(str(t.name))
+            if r is not None:
+                op_results[t.name] = r
+        return op_results
+
+    def _page_transfer_v3(self, operation):
+        transfers = self._v3_transfers(operation)
+        extra_info = HiCacheStorageExtraInfo(
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+        )
+        results = self.storage_backend.batch_read_v3(transfers, extra_info)
+        kv_results = results.get(PoolName.KV)
+        if kv_results is None:
+            kv_results = results.get(str(PoolName.KV))
+        inc = self._leading_success(kv_results) * self.page_size
+        operation.increment(inc)
+        if operation.pool_transfers:
+            operation.pool_storage_result.update_extra_pool_hit_pages(
+                self._collect_v3_results(operation, results)
+            )
+        operation.pool_transfers_done = True
+
+    def _page_backup_v3(self, operation):
+        transfers = self._v3_transfers(operation)
+        extra_info = HiCacheStorageExtraInfo(
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+        )
+        results = self.storage_backend.batch_write_v3(transfers, extra_info)
+        kv_results = results.get(PoolName.KV)
+        if kv_results is None:
+            kv_results = results.get(str(PoolName.KV))
+        ok_pages = self._leading_success(kv_results)
+        if operation.pool_transfers:
+            operation.pool_storage_result.update_extra_pool_hit_pages(
+                self._collect_v3_results(operation, results)
+            )
+        operation.completed_tokens = ok_pages * self.page_size
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
