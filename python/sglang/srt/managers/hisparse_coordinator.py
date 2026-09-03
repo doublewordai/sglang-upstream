@@ -1130,7 +1130,10 @@ class HiSparseCoordinator:
                 io_backend="kernel",
             )
             idx = torch.searchsorted(union, pos_c.reshape(-1)).reshape(pos.shape)
-            prefix_locs = scratch[idx]
+            # searchsorted returns len(union) for positions past the union
+            # (delta selections); clamp before the gather -- those entries are
+            # discarded by the where-mask below but the gather still evaluates.
+            prefix_locs = scratch[idx.clamp(max=u - 1)]
         else:
             prefix_locs = None
 
