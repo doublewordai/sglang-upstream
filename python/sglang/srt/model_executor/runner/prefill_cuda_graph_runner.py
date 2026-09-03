@@ -696,7 +696,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if slots is None:
             lm = self.layer_model
             hidden = lm.config.hidden_size
-            dtype = next(lm.parameters()).dtype
+            # Activation dtype, NOT a weight dtype: on fp8-quantized models a
+            # PP stage's first parameter can be an fp8 weight while
+            # hidden_states/residual are bf16 (found by the PP2 dummy-rig repro:
+            # sgl_fused_add_rmsnorm failed to dispatch Float8_e4m3fn).
+            dtype = getattr(
+                getattr(self.model_runner, "model_config", None), "dtype", None
+            )
+            if dtype is None:
+                dtype = next(lm.parameters()).dtype
             device = next(lm.parameters()).device
             tensors = {
                 "hidden_states": torch.zeros(
