@@ -896,6 +896,9 @@ __global__ __launch_bounds__(kBlock) void fg_ws_thr_out_kernel(const FGTopKParam
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t row = blockIdx.x;
   const int32_t length = p.lengths[row];
+  // capture the sum accumulators BEFORE re-zeroing them (sigma for the seed)
+  const float s1 = p.ws_f[row * 2 + 0];
+  const float s2 = p.ws_f[row * 2 + 1];
   for (uint32_t i = threadIdx.x; i < kRadix; i += kBlock) {
     p.hist[static_cast<int64_t>(row) * kRadix + i] = 0;
     p.hist2[static_cast<int64_t>(row) * kRadix + i] = 0;
@@ -926,8 +929,6 @@ __global__ __launch_bounds__(kBlock) void fg_ws_thr_out_kernel(const FGTopKParam
   if (threadIdx.x == 0) {
     const float kth = s_min[0];
     const float len = static_cast<float>(length);
-    const float s1 = p.ws_f[row * 2 + 0];
-    const float s2 = p.ws_f[row * 2 + 1];
     const float var = fmaxf(0.f, s2 / len - (s1 / len) * (s1 / len));
     p.thresholds[row] = kth - p.delta * sqrtf(var);
   }
