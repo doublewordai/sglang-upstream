@@ -35,6 +35,9 @@ def _dgf_norm_quant_module(
         cuda_wrappers=[
             ("dgf_norm_quant", f"sglang::DGFNormQuantKernel<{args}>::run"),
         ],
+        # match the production per_token_group_quant build: div.approx for
+        # 448/amax (bit-identical fp8 codes given identical h)
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 

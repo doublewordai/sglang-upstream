@@ -79,11 +79,15 @@ __global__ __launch_bounds__(kBlockSize, 1) void dgf_norm_quant_kernel(
       AlignedVector<bf16_t, 8> xv, rv, sv;
       xv.load(x_row + base);
       if constexpr (kMoeIn) {
+        // production chain: moe_out = bf16(shared + alpha*x) (torch add_), then
+        // fused_add_rmsnorm: res' = bf16(res + moe_out) -- TWO bf16 roundings.
         rv.load(res_row + base);
         sv.load(shared + (int64_t)token * kK + base);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          float v = cast<float>(rv[j]) + cast<float>(sv[j]) + alpha_f * cast<float>(xv[j]);
+          float v1 = cast<float>(sv[j]) + alpha_f * cast<float>(xv[j]);
+          bf16_t v1r = cast<bf16_t>(v1);
+          float v = cast<float>(rv[j]) + cast<float>(v1r);
           sm_v[base + j] = v;
           sum_sq += v * v;
         }
