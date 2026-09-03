@@ -367,7 +367,11 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
+    # lane prefill-graphs: with pipeline parallelism each stage holds only a
+    # slice of the decoder layers, but model_config.num_hidden_layers is the
+    # global count — comparing against it disables BCG for every PP>1 rig.
+    # Compare against the local layer count instead.
+    if len(model_runner.attention_layers) < len(list(layer_model.layers)):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,
