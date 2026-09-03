@@ -768,6 +768,12 @@ class Envs:
     # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
     # hugetlb mmap failure, THP coverage below ~98%).
     SGLANG_HUGEPAGE_STRICT = EnvBool(False)
+    # Pools smaller than this many bytes stay on base pages even when
+    # SGLANG_HUGEPAGE_SIZE is set (v16-memory-plan sizing: only the large
+    # decode hisparse host pool is hugetlb-backed; hicache/shadow pools on
+    # base pages). The register-size fix makes small hugetlb pools pin fine,
+    # so this is tunable; default keeps the v16 behavior (32 GiB).
+    SGLANG_HUGEPAGE_MIN_BYTES = EnvInt(32 * (1 << 30))
     # Disable transparent hugepages for the whole engine process tree at init
     # (prctl PR_SET_THP_DISABLE, inherited by children). Stops khugepaged/
     # kcompactd churn on non-pool host allocations while the pools themselves
@@ -1500,6 +1506,13 @@ class Envs:
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
     SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
+    # persistent launch with in-kernel grid barriers reading each row once
+    # (plus a small sample and a rare fg-equivalent fallback re-read),
+    # replacing both fast_topk_v2 and the fg chain on decode/verify shapes
+    # (same gate domain as SGLANG_DSA_TOPK_DECODE_FG; precedence: floor > fg).
+    # Same selection semantics as the fg kernel.
+    SGLANG_DSA_TOPK_DECODE_FLOOR = EnvBool(False)
     # Warm-start the full-grid decode top-k: carry the previous decode step's
     # k-th logit minus a delta-sigma margin per (request, layer) as the
     # threshold seed; 1 streaming pass + exact refine on a hit, full 2-pass
@@ -1597,6 +1610,13 @@ class Envs:
     # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
     # than the production kernel; kept for development/A-B, default OFF.
     SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-fused persistent Triton kernel: single launch,
+    # in-kernel split+combine (no second launch / combine kernel), grid
+    # capped at co-resident capacity so it is deadlock-free at any batch.
+    # Numerics: prod-class vs the fp32 oracle (0.17-0.21% of RMS), NOT
+    # bit-exact vs FlashMLA (different dequant path and split order).
+    SGLANG_DSA_DECODE_FUSED_PERSISTENT = EnvBool(False)
     # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
     # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
     # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV

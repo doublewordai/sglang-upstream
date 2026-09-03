@@ -2276,6 +2276,7 @@ class Scheduler(
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_tree_cache=lambda: self.tree_cache,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -2891,6 +2892,8 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._reject_on_host_pool_exhausted(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -2950,6 +2953,33 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
+        return True
+
+    def _reject_on_host_pool_exhausted(self, recv_req: Req) -> bool:
+        """prefill-pool-degrade ladder step 3: when the hicache host tier is
+        exhausted (evict + skip cannot keep up), reject the admit with a
+        503 the router can retry instead of accepting work that cannot be
+        retained."""
+        tree_cache = self.tree_cache
+        host_pool_exhausted = getattr(tree_cache, "host_pool_exhausted", None)
+        if host_pool_exhausted is None or not host_pool_exhausted():
+            return False
+        message = (
+            "The prefill host KV pool (hicache) is exhausted; "
+            "request rejected for retry."
+        )
+        logger.warning("Rejecting %s: %s", recv_req.rid, message)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -4855,6 +4885,35 @@ class Scheduler(
                     self.disagg_decode_prealloc_queue.host_pool_wait_events
                 ),
             }
+
+        if self.enable_hierarchical_cache and self.tree_cache is not None:
+            # prefill-pool-degrade: per-rank hicache host-pool state + the
+            # degrade-ladder counters so routers/ops can see the retention
+            # constraint and its pressure.
+            cc = getattr(self.tree_cache, "cache_controller", None)
+            if cc is not None:
+                host_pool = cc.mem_pool_host
+                ret["hicache_host_pool"] = {
+                    "free_tokens": int(host_pool.available_size()),
+                    "total_tokens": int(host_pool.size),
+                    "page_size": int(host_pool.page_size),
+                    "write_skips": int(
+                        getattr(self.tree_cache, "host_pool_write_skips", 0)
+                    ),
+                    "write_skip_tokens": int(
+                        getattr(self.tree_cache, "host_pool_write_skip_tokens", 0)
+                    ),
+                    "force_evicted_tokens": int(
+                        getattr(
+                            self.tree_cache, "host_pool_force_evicted_tokens", 0
+                        )
+                    ),
+                    "exhausted": bool(
+                        getattr(
+                            self.tree_cache, "host_pool_exhausted", lambda: False
+                        )()
+                    ),
+                }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
