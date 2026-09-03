@@ -1518,6 +1518,83 @@ class HiSparseCoordinator:
         table = torch.where(valid, table, -1)
         return table.to(torch.int32)
 
+    def extend_swap_in_page_table_fused(
+        self,
+        req_pool_indices: torch.Tensor,
+        topk_locs: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Fused-topk variant of :meth:`extend_swap_in_page_table`.
+
+        ``topk_locs``: (num_queries, top_k) slot-resolved selections from the
+        fused PAGED transform (logical KV locs, -1 padded). A selection whose
+        loc has a retained host row (``logical_to_host_row[loc] >= 0``) is a
+        prefix selection: the union of those locs is loaded into the extend
+        scratch (order-preserving per query, like the unfused variant) and
+        the table points at the scratch slots. Every other valid selection
+        is a delta-token loc, translated to its hisparse device slot -- the
+        same mapping the unfused path applies to ``translated``. Freshly
+        allocated delta locs never carry a retained host row (rows are
+        cleared at logical free), so the discrimination is exact.
+        """
+        num_reqs = int(req_pool_indices.numel())
+        if num_reqs != 1:
+            raise NotImplementedError(
+                "warm-local-prefill extend supports single-request batches "
+                f"(got {num_reqs})"
+            )
+        r = int(req_pool_indices[0].item())
+        prefix_len = int(prefix_lens[0].item())
+
+        loc = topk_locs.to(torch.int64)
+        valid = loc >= 0
+        loc_c = loc.clamp(min=0)
+        host_row = self.logical_to_host_row[loc_c.reshape(-1)].reshape(loc.shape)
+        is_prefix = valid & (host_row >= 0)
+
+        flat = loc_c[is_prefix].reshape(-1)
+        if flat.numel() > 0:
+            union = torch.unique(flat)  # sorted ascending
+            u = int(union.numel())
+            if self.wlp_trace and layer_id == 0:
+                mb = u * self.item_size_bytes / 1e6
+                logger.info(
+                    "WLP swapin fused rid_layer=0 prefix=%d union=%d c2c_mb=%.2f",
+                    prefix_len,
+                    u,
+                    mb,
+                )
+            locs = self._extend_scratch.get(r)
+            if locs is None or int(locs.numel()) < u:
+                locs = self._grow_extend_scratch(r, max(u, 1))
+            scratch = locs[:u]
+            host_rows = self.logical_to_host_row[union]
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_rows,
+                scratch,
+                layer_id,
+                io_backend="kernel",
+            )
+            idx = torch.searchsorted(union, loc_c.reshape(-1)).reshape(loc.shape)
+            # searchsorted returns len(union) for delta locs (not in the
+            # union); clamp before the gather -- those entries are discarded
+            # by the where-mask below but the gather still evaluates.
+            prefix_locs = scratch[idx.clamp(max=u - 1)]
+        else:
+            prefix_locs = None
+
+        device_locs = self.mem_pool_device.translate_loc_to_hisparse_device(
+            loc_c
+        )
+        if prefix_locs is not None:
+            table = torch.where(is_prefix, prefix_locs, device_locs)
+        else:
+            table = device_locs
+        table = torch.where(valid, table, -1)
+        return table.to(torch.int32)
+
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.
 

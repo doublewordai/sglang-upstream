@@ -472,6 +472,15 @@ class Envs:
     # rank): rig weight-equality probe + the local-refill fallback variant.
     SGLANG_WLP_ALLOW_COLD = EnvBool(False)
     SGLANG_WLP_TRACE = EnvBool(False)
+    # wlp-fused-topk: consume prod's fused PAGED top-k output (slot-resolved
+    # logical locs) in the WLP retained-prefix extend. ON (default): the
+    # union swap-in discriminates prefix/delta selections in the loc domain
+    # via logical_to_host_row -- the same fused/1PASS kernel (and therefore
+    # the same selection) as the prefill arm's warm extends. OFF: WLP extends
+    # force the unfused top-k (raw positions; the original lane-validated
+    # path; exact vs the PD path only when SGLANG_DSA_FUSE_TOPK=0 on both
+    # arms).
+    SGLANG_WLP_FUSED_TOPK = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
