@@ -643,6 +643,21 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
+        try:
+            self._page_transfer_inner(operation)
+        except Exception as e:
+            # A store read failure must never kill the loading thread:
+            # warn, keep whatever pages already loaded (partial hit), and
+            # let the request recompute the rest.
+            logger.warning(
+                "[kvl3] transfer failed rid=%s (pages stay unloaded, "
+                "request recomputes): %s",
+                getattr(operation, "id", "?"),
+                e,
+            )
+            operation.pool_transfers_done = True
+
+    def _page_transfer_inner(self, operation):
         if self._can_use_v3_io(read=True, operation=operation):
             return self._page_transfer_v3(operation)
         # KV pools first — determines actual completed page count
@@ -666,6 +681,22 @@ class HybridCacheController(BaseHiCacheController):
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
+        try:
+            self._page_backup_inner(operation)
+        except Exception as e:
+            # A store write failure must never kill the backup thread:
+            # warn, leave the op's completed_tokens where the backend left
+            # it (0 on early failure -> save watermark rolls back and the
+            # node stays not-backed-up, so a later op can retry), and ack
+            # normally so queues never stall.
+            logger.warning(
+                "[kvl3] backup failed rid=%s (save watermark rolled back, "
+                "retry possible on next op): %s",
+                getattr(operation, "id", "?"),
+                e,
+            )
+
+    def _page_backup_inner(self, operation):
         if self._can_use_v3_io(read=False, operation=operation):
             return self._page_backup_v3(operation)
         # MLA KV is replicated across TP ranks and should still be written only

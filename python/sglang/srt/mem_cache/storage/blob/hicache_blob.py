@@ -689,8 +689,8 @@ class HiCacheBlob(HiCacheStorage):
                 # explicit close() raises while torch views exist; drop refs
                 # and let refcounting unmap the anonymous mmaps
                 seg_cache.clear()
-        except (IOError, OSError, ValueError) as e:
-            logger.warning("[blob] read %s failed: %s", group_id, e)
+        except Exception as e:  # store failure = miss, never a raise
+            logger.warning("[blob] read group %s failed: %s", group_id, e)
         finally:
             os.close(fd)
 
@@ -833,7 +833,7 @@ class HiCacheBlob(HiCacheStorage):
             self._total_written_objects += 1
             self._total_written_bytes += total
             return "ok", num_pages
-        except (IOError, OSError, ValueError) as e:
+        except Exception as e:  # store failure = fail status, never a raise
             logger.warning("[blob] write %s failed: %s", group_id, e)
             try:
                 os.remove(tmp)
