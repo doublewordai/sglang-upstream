@@ -112,12 +112,17 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+import sglang.srt.mem_cache.handover  # noqa: F401  (registers hiradix_dsa backend)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
+    HandoverExportReqInput,
+    HandoverExportReqOutput,
+    HandoverImportReqInput,
+    HandoverImportReqOutput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -1615,6 +1620,8 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (HandoverImportReqInput, self.handover_import_wrapped),
+                (HandoverExportReqInput, self.handover_export_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -4555,6 +4562,65 @@ class Scheduler(
         return all(x.is_empty() for x in self.running_mbs) and all(
             mb is None or mb.is_empty() for mb in self.mbs
         )
+
+    def handover_import_wrapped(
+        self, recv_req: HandoverImportReqInput
+    ) -> HandoverImportReqOutput:
+        if not self.enable_hierarchical_cache:
+            return HandoverImportReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        if not self.is_fully_idle():
+            return HandoverImportReqOutput(
+                success=False,
+                message=(
+                    "Reject handover import: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+        from sglang.srt.mem_cache.handover.admin import heir_import
+
+        model_path = getattr(self.model_config, "path", None) or (
+            self.server_args.model_path
+        )
+        ok, msg, data = heir_import(
+            self.tree_cache,
+            model_path,
+            recv_req.src_host,
+            0,
+            recv_req.src_http_port,
+            recv_req.timeout_s,
+            recv_req.verify,
+            recv_req.admin_key,
+        )
+        return HandoverImportReqOutput(success=ok, message=msg, data=data)
+
+    def handover_export_wrapped(
+        self, recv_req: HandoverExportReqInput
+    ) -> HandoverExportReqOutput:
+        if not self.enable_hierarchical_cache:
+            return HandoverExportReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        from sglang.srt.mem_cache.handover import admin
+
+        if recv_req.phase == "info":
+            model_path = recv_req.model_path or getattr(
+                self.model_config, "path", None
+            ) or (self.server_args.model_path)
+            ok, msg, data = admin.handover_export_info(
+                self.tree_cache, model_path, staged=recv_req.staged
+            )
+        elif recv_req.phase == "push":
+            ok, msg, data = admin.handover_export_push(
+                recv_req.payload_json or "{}", recv_req.timeout_s
+            )
+        elif recv_req.phase == "release":
+            ok, msg, data = admin.handover_export_release()
+        else:
+            ok, msg, data = False, f"unknown phase {recv_req.phase!r}", None
+        return HandoverExportReqOutput(success=ok, message=msg, data=data)
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
