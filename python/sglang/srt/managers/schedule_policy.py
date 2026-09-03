@@ -953,6 +953,12 @@ class PrefillAdder:
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # device-pool-degrade: stash the release params for this admission
+        # lock so a scheduler rollback of an unscheduled batch can release it
+        # exactly (mirrors PrefillAdder._lock_node's acquire/release pairing).
+        req.admission_lock_dec_params = (
+            result.to_dec_params() if self.tree_cache.is_tree_cache() else None
+        )
         # match locks this node's components, so clear any stale skip set
         # carried from a previous scheduling of this req.
         req.skip_lock_node_ids = {}

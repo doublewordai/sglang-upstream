@@ -278,6 +278,10 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation import (
+    DeviceKVPoolExhaustedError,
+    rollback_alloc_for_extend,
+)
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -1327,6 +1331,19 @@ class Scheduler(
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
+        # device-pool-degrade: counters + rate-limit anchor (never-crash
+        # ladder for the DEVICE tier; see _prepare_prefill_batch_or_degrade).
+        self.device_pool_degrades = 0
+        self.device_pool_degrade_tokens = 0
+        self.device_pool_rejects = 0
+        self._last_device_pool_degrade_log_ts = 0.0
+        # pdho in-flight-handover back-pressure (same ladder, step 2.5): see
+        # _pdho_backpressure_state for the mechanism and the composition
+        # contract with lane transition-page-budget.
+        self.pdho_backpressure_blocks = 0
+        self.pdho_backpressure_last_blocked_tokens = 0
+        self._last_pdho_backpressure_log_ts = 0.0
+
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
@@ -2283,6 +2300,7 @@ class Scheduler(
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_tree_cache=lambda: self.tree_cache,
+            get_pdho_inflight_state=lambda: self._pdho_inflight_state(),
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -2900,6 +2918,8 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self._reject_on_host_pool_exhausted(req):
                 return
+            if self._reject_on_device_pool_exhausted(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -2972,6 +2992,173 @@ class Scheduler(
             return False
         message = (
             "The prefill host KV pool (hicache) is exhausted; "
+            "request rejected for retry."
+        )
+        logger.warning("Rejecting %s: %s", recv_req.rid, message)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
+        return True
+
+    def _req_held_kv_tokens(self, req: Req) -> int:
+        """Device KV tokens a request holds (its allocated length; on the
+        prefill arm at handover time this is the whole prompt)."""
+        kv = getattr(req, "kv", None)
+        if kv is not None and getattr(kv, "kv_allocated_len", 0):
+            return int(kv.kv_allocated_len)
+        pi = getattr(req, "prefix_indices", None)
+        return int(len(pi)) if pi is not None else 0
+
+    def _pdho_inflight_bound_tokens(self) -> int:
+        """The back-pressure bound: SGLANG_PDHO_INFLIGHT_FRACTION x the device
+        token pool. 0 disables the gate (experiment default)."""
+        frac = envs.SGLANG_PDHO_INFLIGHT_FRACTION.get()
+        if frac <= 0:
+            return 0
+        return int(frac * self.max_total_num_tokens)
+
+    def _pdho_reserve_tokens(self) -> int:
+        """The ADMISSION FLOOR (device-pool-degrade, the enforced margin):
+        refuse NEW cold admissions while the device pool's reclaimable mass
+        (available + evictable) is below this many tokens, so the
+        UN-REFUSABLE in-flight chunked continuation can always complete.
+
+        Sizing (from prefill-oom-1328 row 11, the falsifier): the un-enforced
+        margin between the old head's survived displayed-1.00 (<~9k tokens
+        reclaimable = exactly one chunk) and production's exact-zero crash
+        with an 8192-token continuation pending was a few thousand tokens.
+        The reserve must cover one continuation's worst demand:
+        chunked_prefill_size + page over-estimate per mid-chunk request.
+        Suggested value for prod (chunk 8192, page 64):
+        8192 + 2*64 + 8192 slack = 16512 tokens (~0.9% of the 1.82M pool).
+        Default 0 = off (experiment-gated; the delta-vs-lock accounting fix —
+        prefill-oom-1328's, default-on — stops the overshoot; this floor
+        makes the margin exist regardless, and fires EARLY: at admission,
+        before the point of no return)."""
+        return int(envs.SGLANG_PDHO_RESERVE_TOKENS.get())
+
+    def _pdho_backpressure_state(self) -> tuple:
+        """device-pool-degrade ladder step 2.5: the in-flight-handover bound.
+
+        In-flight handover pages are device KV held by requests that FINISHED
+        prefill and are waiting for the PD KV transfer to complete
+        (disagg_prefill_inflight_queue). Their prefix locks and pages are
+        unreclaimable — eviction cannot free them — until the transfer
+        finishes, so under a transfer-path stall this mass grows without
+        bound and wedges the device pool (2026-09-03 13:28Z outage:
+        full_available_size=0 + full_evictable_size_=0).
+
+        Returns (blocked, holders). Above the bound, the caller stops
+        admitting NEW cold work (queued cleanly, never dropped; running
+        chunks continue). Refusal-shaped deliberately: `holders` names each
+        holder (owner rid, held tokens, age since transfer-queue entry) so a
+        future PREEMPT-the-holder policy (see lane transition-page-budget)
+        can act on the same state instead of retrofitting it — this method
+        refuses only, it does not preempt.
+
+        Composition contract for transition-page-budget: the accounting is
+        intentionally per-request (each admission adds its full held length),
+        not a deduped page union — it measures admission cost, which is what
+        an admission bound must bound.
+        """
+        bound = self._pdho_inflight_bound_tokens()
+        if (
+            self.disaggregation_mode != DisaggregationMode.PREFILL
+            or not self._disagg_prefill_inflight_reqs()
+        ):
+            return False, []
+        holders = []
+        total = 0
+        now = time.perf_counter()
+        for req in self._disagg_prefill_inflight_reqs():
+            toks = self._req_held_kv_tokens(req)
+            if toks <= 0:
+                continue
+            total += toks
+            entry_ts = 0.0
+            ts = getattr(req, "time_stats", None)
+            if ts is not None:
+                entry_ts = getattr(ts, "prefill_transfer_queue_entry_time", 0.0)
+            holders.append(
+                {
+                    "rid": req.rid,
+                    "tokens": toks,
+                    "age_s": round(now - entry_ts, 3) if entry_ts > 0 else None,
+                }
+            )
+        # Blocked only when a bound is ACTIVE and exceeded. Holders are
+        # computed regardless (bound=0 shows the mass on the gauges without
+        # gating anything — the unbounded experiment arm needs exactly that).
+        if not (bound > 0 and total > bound):
+            return False, holders
+        holders.sort(key=lambda h: h["tokens"], reverse=True)
+        return True, holders
+
+    def _disagg_prefill_inflight_reqs(self) -> List["Req"]:
+        """The in-flight handover queue as a list. None on non-prefill
+        schedulers (set to None in __init__, only prefill disagg rebinds it to
+        a list) — getattr/hasattr both see the attribute, so guard the value.
+        Bound10: iterating it unguarded crashed the DECODE scheduler 7s after
+        ready via get_internal_state (router /get_server_info probe)."""
+        q = getattr(self, "disagg_prefill_inflight_queue", None)
+        return q if q else []
+
+    def _pdho_inflight_state(self) -> tuple:
+        """(in-flight handover tokens, bound tokens, cumulative blocks) for
+        the load snapshot / metrics channel — the device-pool-degrade control
+        state, reported even when the gate is off so the unbounded arm of the
+        experiment can watch the mass grow."""
+        _blocked, holders = self._pdho_backpressure_state()
+        return (
+            int(sum(h["tokens"] for h in holders)),
+            int(self._pdho_inflight_bound_tokens()),
+            int(self.pdho_backpressure_blocks),
+        )
+
+    def _note_pdho_backpressure_block(self, holders: list, total: int) -> None:
+        """Rate-limited visibility for a back-pressure block: name the top
+        holders (owner + held tokens + age) so the refusal is attributable —
+        a stuck transfer shows up as old, large holders."""
+        self.pdho_backpressure_blocks += 1
+        self.pdho_backpressure_last_blocked_tokens = total
+        now = time.monotonic()
+        if now - self._last_pdho_backpressure_log_ts >= 10.0:
+            self._last_pdho_backpressure_log_ts = now
+            top = ", ".join(
+                f"{h['rid']}:{h['tokens']}tok(age={h['age_s']}s)"
+                for h in holders[:3]
+            )
+            logger.warning(
+                "pdho back-pressure: in-flight handover %d tok > bound %d tok; "
+                "queueing new cold work (running chunks continue). "
+                "Top holders: %s",
+                total,
+                self._pdho_inflight_bound_tokens(),
+                top or "(none)",
+            )
+
+    def _reject_on_device_pool_exhausted(self, recv_req: Req) -> bool:
+        """device-pool-degrade ladder step 3: when the device KV tier is
+        exhausted (nothing evictable — every page protected), reject the
+        admit with a 503 the router can retry instead of accepting work the
+        rank cannot schedule. Never fires on a merely-full pool: eviction
+        still frees pages there, which is normal operation. Live predicate:
+        clears itself as soon as transfers drain and pages free up."""
+        tree_cache = self.tree_cache
+        device_pool_exhausted = getattr(tree_cache, "device_pool_exhausted", None)
+        if device_pool_exhausted is None or not device_pool_exhausted():
+            return False
+        self.device_pool_rejects += 1
+        message = (
+            "The prefill device KV pool is exhausted (all pages protected); "
             "request rejected for retry."
         )
         logger.warning("Rejecting %s: %s", recv_req.rid, message)
@@ -3666,6 +3853,34 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        # device-pool-degrade ladder step 2.5: pdho in-flight-handover
+        # back-pressure. Above the bound, stop admitting NEW cold work (the
+        # waiting queue holds it cleanly); the mid-chunk request and every
+        # already-accepted request continue. Cleared as transfers drain.
+        pdho_blocked, pdho_holders = self._pdho_backpressure_state()
+        if pdho_blocked:
+            self._note_pdho_backpressure_block(
+                pdho_holders, sum(h["tokens"] for h in pdho_holders)
+            )
+        # Ladder step 2.6: the ADMISSION FLOOR — the enforced margin. Below
+        # the reserve, refuse new cold work so the un-refusable in-flight
+        # chunked continuation always has room to complete. Checked live in
+        # the walk too: each admitted warm request LOCKS its matched prefix
+        # and shrinks evictable immediately (the delta-vs-lock defect —
+        # prefill-oom-1328's charge fix is the arithmetic; this floor is the
+        # margin).
+        pdho_reserve = self._pdho_reserve_tokens()
+        pdho_below_floor = (
+            pdho_reserve > 0
+            and self.tree_cache.device_pool_reclaimable_tokens() < pdho_reserve
+        )
+        if pdho_blocked or pdho_below_floor:
+            if self.chunked_req is None:
+                # No batch_is_full here: the arm re-evaluates the bound fresh
+                # next pass (batch_is_full can stick on PD prefill arms whose
+                # running batch never drains through update_running_batch).
+                return None, running_batch
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -3758,6 +3973,9 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            # device-pool-degrade: remember the pre-adder chunked req so a
+            # rollback can restore the hand-off state exactly.
+            adder._dpd_prev_chunked_req = self.chunked_req
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -3778,6 +3996,20 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if pdho_blocked:
+                # Back-pressure: no NEW admissions this pass (the chunked req,
+                # if any, was added above and continues). No batch_is_full:
+                # the bound is re-evaluated fresh next pass.
+                break
+            if (
+                pdho_reserve > 0
+                and self.tree_cache.device_pool_reclaimable_tokens()
+                < pdho_reserve
+            ):
+                # Admission floor: the enforced margin for the un-refusable
+                # continuation (checked live — admissions lock prefixes and
+                # shrink evictable mid-walk).
+                break
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3898,7 +4130,8 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        if not self._prepare_prefill_batch_or_degrade(new_batch, adder, running_batch):
+            return None, running_batch
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -3939,6 +4172,135 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _prepare_prefill_batch_or_degrade(
+        self,
+        new_batch: ScheduleBatch,
+        adder: PrefillAdder,
+        running_batch: ScheduleBatch,
+    ) -> bool:
+        """device-pool-degrade ladder step 2: allocate the batch's device KV,
+        and if the tier cannot satisfy it (everything protected), DEGRADE —
+        roll the batch back and skip this scheduling pass — instead of raising
+        into the event loop, which kills the whole arm (2026-09-03 13:28Z
+        outage: full_available_size=0 + full_evictable_size_=0).
+
+        Lockstep: the batch is planned independently on every rank that
+        executes it (same determinism contract the scheduler already
+        assumes), so a rank-local skip would desync the PP proxy handshake.
+        The failure flag is therefore MIN all-reduced over the PP group — the
+        chain of ranks executing this DP rank's batches — and the call is
+        unconditional so call order pairs the stages. With pp_size == 1 the
+        group is trivial and this is the local verdict alone.
+        """
+        error: Optional[DeviceKVPoolExhaustedError] = None
+        try:
+            new_batch.prepare_for_extend()
+        except DeviceKVPoolExhaustedError as e:
+            error = e
+
+        # 1 = this rank's batch is runnable, 0 = it failed. MIN across the
+        # PP group turns this into "every rank runnable" (1) vs "at least
+        # one rank failed" (0) — the latter degrades on EVERY rank.
+        runnable = torch.tensor(
+            0 if error is not None else 1, dtype=torch.int, device="cpu"
+        )
+        try:
+            group = self.pp_group.cpu_group
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(
+                    runnable, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+        except Exception:
+            # No usable PP collective (single-rank group, backend missing):
+            # fall back to the local verdict.
+            pass
+
+        if int(runnable.item()) == 0:  # at least one rank failed
+            self._device_pool_degrade_rollback(new_batch, adder, running_batch, error)
+            return False
+        return True
+
+    def _device_pool_degrade_rollback(
+        self,
+        new_batch: ScheduleBatch,
+        adder: PrefillAdder,
+        running_batch: ScheduleBatch,
+        error: Optional[DeviceKVPoolExhaustedError],
+    ) -> None:
+        """Roll an unscheduled prefill batch back to its pre-planning state.
+
+        Undoes, in order: the KV/req-slot allocations (also on ranks whose own
+        alloc succeeded but a PP-peer's failed), the admission locks on
+        matched prefixes, the chunked-req hand-off, and the waiting-queue
+        removal. Non-chunked requests go back to the head of the waiting
+        queue; the MID-CHUNK request is never dropped — it stays
+        ``self.chunked_req`` and its next chunk is retried when the pool
+        drains (transfers completing free pages every pass). The pass is
+        skipped; admission is refused with a 503 while the pool stays
+        exhausted (see _reject_on_device_pool_exhausted).
+        """
+        self.device_pool_degrades += 1
+        self.device_pool_degrade_tokens += int(
+            getattr(new_batch, "extend_num_tokens", 0) or 0
+        )
+        now = time.monotonic()
+        if now - self._last_device_pool_degrade_log_ts >= 10.0:
+            self._last_device_pool_degrade_log_ts = now
+            logger.warning(
+                "device-pool-degrade: prefill batch alloc failed (%s); "
+                "re-queueing %d req(s) and skipping this pass. %s"
+                "degrades=%d",
+                (str(error).splitlines() or [""])[0],
+                len(adder.can_run_list),
+                self.tree_cache.available_and_evictable_str(),
+                self.device_pool_degrades,
+            )
+
+        # 1) Undo the allocations (KV slots + req slots + req bookkeeping).
+        rollback_alloc_for_extend(new_batch)
+
+        # The chunked req that was already in flight BEFORE this pass had its
+        # admission lock taken on an earlier pass (add_chunked_req does not
+        # re-lock); its lock must NOT be released here.
+        prev_chunked_req = getattr(adder, "_dpd_prev_chunked_req", None)
+
+        # 2) Release the admission locks taken by _req_inc_lock_ref THIS pass
+        #    so the matched prefixes become evictable again.
+        for req in adder.can_run_list:
+            if req is prev_chunked_req:
+                continue
+            dec_params = getattr(req, "admission_lock_dec_params", None)
+            try:
+                self.tree_cache.dec_lock_ref(req.last_node, dec_params)
+            except Exception:
+                logger.exception(
+                    "device-pool-degrade: admission lock release failed for %s",
+                    req.rid,
+                )
+            req.admission_lock_dec_params = None
+
+        # 4) Restore the chunked-req hand-off. Cases (prev = the chunked req
+        #    before this pass, stashed by _get_new_batch_prefill_raw):
+        #      new chunk created this pass  -> un-create it; it re-queues below
+        #      continuing, still truncated -> unchanged (is prev)
+        #      continuing, finished this pass -> restore as chunked_req
+        #    The MID-CHUNK request is never dropped and never re-queued: it
+        #    keeps its committed pages and retries its next chunk next pass.
+        if self.chunked_req is not None:
+            self.chunked_req.inflight_middle_chunks -= 1  # undo this pass's += 1
+        if adder.new_chunked_req is not None:
+            self.chunked_req = None
+        else:
+            self.chunked_req = prev_chunked_req
+
+        # 5) Re-queue the non-chunked requests at the head of the waiting
+        #    queue (they were taken from it this pass; priority is re-derived
+        #    by calc_priority on the next pass).
+        requeue = [r for r in adder.can_run_list if r is not self.chunked_req]
+        self.waiting_queue[:0] = requeue
+
+        running_batch.batch_is_full = True
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -4071,7 +4433,50 @@ class Scheduler(
             return batch
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        try:
+            batch.prepare_for_decode()
+        except DeviceKVPoolExhaustedError:
+            # device-pool-degrade: the decode alloc failed even though the
+            # pre-check passed (the evictable accounting overstated what
+            # eviction could free). Degrade exactly like a full-pool event:
+            # retract running requests to free pages, then retry the
+            # allocation once. A second failure re-raises (fail-loud).
+            (
+                retracted_reqs,
+                new_token_ratio,
+                reqs_to_abort,
+            ) = batch.retract_decode(self.server_args)
+            self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
+            if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
+                self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+                    num_retracted_reqs=len(retracted_reqs),
+                    num_retracted_input_tokens=sum(
+                        len(r.origin_input_ids) for r in retracted_reqs
+                    ),
+                    num_retracted_output_tokens=sum(
+                        len(r.output_ids) for r in retracted_reqs
+                    ),
+                )
+            self.new_token_ratio_tracker.current = new_token_ratio
+            for req in reqs_to_abort:
+                abort_reason: FINISH_ABORT = req.to_finish
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+            logger.warning(
+                "device-pool-degrade: decode alloc failed; retracted %d req(s) "
+                "and retrying the allocation",
+                len(retracted_reqs),
+            )
+            for req in retracted_reqs:
+                self._add_request_to_queue(req, is_retracted=True)
+            if batch.is_empty():
+                return batch
+            batch.prepare_for_decode()
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -4937,6 +5342,54 @@ class Scheduler(
                         getattr(
                             self.tree_cache, "host_pool_exhausted", lambda: False
                         )()
+                    ),
+                }
+
+        if self.tree_cache is not None:
+            # device-pool-degrade: per-rank device KV pool state + the
+            # degrade-ladder counters so routers/ops can see the scheduling
+            # constraint (everything protected) and its pressure.
+            _alloc = getattr(self.tree_cache, "token_to_kv_pool_allocator", None)
+            if _alloc is not None:
+                ret["device_pool"] = {
+                    "available_tokens": int(_alloc.available_size()),
+                    "evictable_tokens": int(
+                        getattr(self.tree_cache, "evictable_size", lambda: 0)()
+                    ),
+                    "page_size": int(getattr(_alloc, "page_size", 1) or 1),
+                    "exhausted": bool(
+                        getattr(
+                            self.tree_cache, "device_pool_exhausted", lambda: False
+                        )()
+                    ),
+                    "oom_degrades": int(getattr(self, "device_pool_degrades", 0)),
+                    "oom_degrade_tokens": int(
+                        getattr(self, "device_pool_degrade_tokens", 0)
+                    ),
+                    "admission_rejects": int(
+                        getattr(self, "device_pool_rejects", 0)
+                    ),
+                    "inflight_handover_tokens": int(
+                        sum(
+                            self._req_held_kv_tokens(r)
+                            for r in self._disagg_prefill_inflight_reqs()
+                        )
+                    ),
+                    "inflight_bound_tokens": int(
+                        self._pdho_inflight_bound_tokens()
+                    ),
+                    "admission_reserve_tokens": int(
+                        self._pdho_reserve_tokens()
+                    ),
+                    "reclaimable_tokens": int(
+                        getattr(
+                            self.tree_cache,
+                            "device_pool_reclaimable_tokens",
+                            lambda: 0,
+                        )()
+                    ),
+                    "backpressure_blocks": int(
+                        getattr(self, "pdho_backpressure_blocks", 0)
                     ),
                 }
 

@@ -50,6 +50,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for "attribute absent before the pass mutated it" in the
+# device-pool-degrade rollback snapshot.
+_DPD_MISSING = object()
+
+
+class DeviceKVPoolExhaustedError(RuntimeError):
+    """The device KV pool cannot satisfy an allocation even after eviction
+    (everything protected: in use or locked).
+
+    Subclasses RuntimeError so existing handlers are unaffected. The
+    scheduler catches it to degrade (re-queue + skip the batch) instead of
+    letting it kill the rank — device-pool-degrade ladder step 2.
+    """
+
 
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
@@ -166,7 +180,7 @@ def alloc_token_slots(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise DeviceKVPoolExhaustedError(error_msg)
 
     return out_cache_loc
 
@@ -222,7 +236,7 @@ def alloc_paged_token_slots_extend(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise DeviceKVPoolExhaustedError(error_msg)
 
     return out_cache_loc
 
@@ -291,6 +305,30 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
+    # device-pool-degrade ladder step 2 support: snapshot the per-request
+    # state this pass is about to mutate (req slots, kv bookkeeping, cache
+    # stats), so `rollback_alloc_for_extend` can restore it when the KV
+    # allocation fails on this rank or on a PP-peer rank executing the same
+    # batch. Overwritten (not appended) each pass.
+    batch._dpd_alloc_rollback = {
+        "kv_locs": None,
+        "reqs": [
+            (
+                req,
+                req.req_pool_idx,
+                req.kv,
+                getattr(req, "mamba_pool_idx", None),
+                getattr(req, "extend_batch_idx", 0),
+                getattr(req, "kv_committed_len", _DPD_MISSING),
+                getattr(req, "cached_tokens", _DPD_MISSING),
+                getattr(req, "already_computed", _DPD_MISSING),
+                getattr(req, "_cache_breakdown_computed", _DPD_MISSING),
+                getattr(req, "is_retracted", _DPD_MISSING),
+            )
+            for req in batch.reqs
+        ],
+    }
+
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     reuse_kv = None
@@ -327,6 +365,7 @@ def alloc_for_extend(
         )
     elif alloc_page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        batch._dpd_alloc_rollback["kv_locs"] = out_cache_loc
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -344,6 +383,7 @@ def alloc_for_extend(
             req_pool_indices=req_pool_indices_device,
             batch=batch,
         )
+        batch._dpd_alloc_rollback["kv_locs"] = out_cache_loc
 
     # Write to req_to_token_pool
     write_cache_indices(
@@ -378,6 +418,63 @@ def alloc_for_extend(
             req.kv.kv_allocated_len = seq_len
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+def rollback_alloc_for_extend(batch: ScheduleBatch) -> None:
+    """Undo `alloc_for_extend`'s allocations and the per-request bookkeeping
+    `prepare_for_extend` applied on top (device-pool-degrade ladder step 2).
+
+    Frees the KV slots a successful allocation took, the request slots taken
+    this pass, and restores the mutated per-request fields, so the scheduler
+    can re-queue the requests and retry when the pool drains. Stale
+    `req_to_token` rows written by the successful path are overwritten when
+    the same slots are re-allocated. Idempotent (the snapshot is consumed).
+    """
+    state = getattr(batch, "_dpd_alloc_rollback", None)
+    if state is None:
+        return
+    batch._dpd_alloc_rollback = None
+
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    kv_locs = state["kv_locs"]
+    if kv_locs is not None and kv_locs.numel() > 0:
+        allocator.free(kv_locs)
+
+    mamba_allocator = getattr(batch.req_to_token_pool, "mamba_allocator", None)
+    for (
+        req,
+        req_pool_idx,
+        kv,
+        mamba_pool_idx,
+        extend_batch_idx,
+        kv_committed_len,
+        cached_tokens,
+        already_computed,
+        cache_breakdown_computed,
+        is_retracted,
+    ) in state["reqs"]:
+        if req.req_pool_idx is not None and req.req_pool_idx != req_pool_idx:
+            # Slot taken by this pass: give it back (free() clears the field).
+            batch.req_to_token_pool.free(req)
+        req.req_pool_idx = req_pool_idx
+        req.kv = kv
+        if mamba_pool_idx is None and req.mamba_pool_idx is not None:
+            if mamba_allocator is not None and not getattr(req, "session", None):
+                mamba_allocator.free(req.mamba_pool_idx.unsqueeze(-1))
+            req.mamba_pool_idx = None
+        else:
+            req.mamba_pool_idx = mamba_pool_idx
+        req.extend_batch_idx = extend_batch_idx
+        for name, value in (
+            ("kv_committed_len", kv_committed_len),
+            ("cached_tokens", cached_tokens),
+            ("already_computed", already_computed),
+            ("_cache_breakdown_computed", cache_breakdown_computed),
+        ):
+            if value is not _DPD_MISSING:
+                setattr(req, name, value)
+        if is_retracted is not _DPD_MISSING:
+            req.is_retracted = is_retracted
 
 
 def _alloc_extend_loc_with_kv_reuse(
@@ -439,6 +536,9 @@ def _alloc_extend_loc_with_kv_reuse(
                 req_pool_indices=req_pool_indices_device,
                 batch=batch,
             )
+        # device-pool-degrade: only the fresh slots are rollback-freeable here
+        # (the rest of out_cache_loc aliases KV the requests already held).
+        batch._dpd_alloc_rollback["kv_locs"] = fresh_slots
 
     reuse_dtype = fresh_slots.dtype if fresh_slots is not None else torch.int64
     parts: list[torch.Tensor] = []
@@ -504,7 +604,7 @@ def alloc_paged_token_slots_decode(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise DeviceKVPoolExhaustedError(error_msg)
 
     return out_cache_loc
 

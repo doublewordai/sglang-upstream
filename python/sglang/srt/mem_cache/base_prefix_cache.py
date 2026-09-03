@@ -439,3 +439,36 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+    def device_pool_exhausted(self) -> bool:
+        """device-pool-degrade ladder step 3 predicate: True when the device
+        KV tier cannot allocate even a single page — every page is protected
+        (in use by a running/queued request or locked in the tree), so a new
+        admit cannot be scheduled at all.
+
+        A merely-FULL pool with evictable pages is normal operation and must
+        NOT refuse: eviction frees those pages. The distinction (everything
+        protected vs merely full) is the whole point — see the 2026-09-03
+        13:28Z incident (full_available_size=0 + full_evictable_size_=0).
+        """
+        return self.device_pool_reclaimable_tokens() < self._device_pool_page()
+
+    def _device_pool_page(self) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        return int(getattr(allocator, "page_size", 1) or 1)
+
+    def device_pool_reclaimable_tokens(self) -> int:
+        """available + evictable: what a device-pool allocation can still
+        take, eviction included. The FULL sub-pool's figure when the allocator
+        is hybrid SWA — that is the pool the paged extend allocator raises on
+        (the 13:28Z message was full_available_size + full_evictable_size).
+        The SWA sub-pool is checked separately by device_pool_exhausted via
+        the page floor; the admission floor bounds the FULL mass.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        if hasattr(allocator, "full_available_size"):
+            full_evictable = getattr(self, "full_evictable_size", None)
+            return allocator.full_available_size() + (
+                full_evictable() if full_evictable is not None else 0
+            )
+        return allocator.available_size() + self.evictable_size()

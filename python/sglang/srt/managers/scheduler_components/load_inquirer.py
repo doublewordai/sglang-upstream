@@ -50,6 +50,7 @@ class SchedulerLoadInquirer:
     get_disagg_decode_prealloc_queue: Callable
     get_disagg_decode_transfer_queue: Callable
     get_tree_cache: Callable
+    get_pdho_inflight_state: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
     get_total_prefill_uncached_tokens: Callable
@@ -131,6 +132,8 @@ class SchedulerLoadInquirer:
         host_pool_free_tokens = host_pool_total_tokens = host_pool_pinned_tokens = 0
         host_pool_evictable_tokens = host_pool_wait_events = 0
         host_pool_wait_age_s = 0.0
+        pdho_inflight_handover_tokens = pdho_inflight_bound_tokens = 0
+        pdho_backpressure_blocks = 0
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             coordinator = None
             if self.server_args.enable_hisparse:
@@ -184,6 +187,18 @@ class SchedulerLoadInquirer:
                         host_pool_total_tokens = int(host_pool.size)
                     except (AttributeError, TypeError) as e:
                         logger.debug(f"HiCache host pool metrics not available: {e}")
+            # device-pool-degrade: in-flight handover mass + bound + blocks
+            # (the back-pressure control state) — the device-side counterpart
+            # of the host-pool gauges, on the same snapshot channel. Computed
+            # by the scheduler (single accounting site: _pdho_backpressure_state).
+            try:
+                (
+                    pdho_inflight_handover_tokens,
+                    pdho_inflight_bound_tokens,
+                    pdho_backpressure_blocks,
+                ) = self.get_pdho_inflight_state()
+            except (AttributeError, TypeError) as e:
+                logger.debug(f"pdho inflight metrics not available: {e}")
 
         # Device token-pool lock breakdown (prefill-oom-1328): same taxonomy
         # as the [pool-locks] log line and the attributed OOM message, so the
@@ -337,6 +352,9 @@ class SchedulerLoadInquirer:
             host_pool_evictable_tokens=host_pool_evictable_tokens,
             host_pool_wait_events=host_pool_wait_events,
             host_pool_wait_age_s=round(host_pool_wait_age_s, 3),
+            pdho_inflight_handover_tokens=int(pdho_inflight_handover_tokens),
+            pdho_inflight_bound_tokens=int(pdho_inflight_bound_tokens),
+            pdho_backpressure_blocks=int(pdho_backpressure_blocks),
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),
