@@ -616,6 +616,8 @@ class Envs:
     # c10d::Work::wait with its GPU idle (the synchronized 8-12 ms decode
     # stalls; see lanes hiccup/hiccup-2). Default off.
     SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
+    # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
+    SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.

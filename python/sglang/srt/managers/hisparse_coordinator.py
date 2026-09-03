@@ -279,6 +279,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._backup_log_fh = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -1049,6 +1050,13 @@ class HiSparseCoordinator:
             1,
         )
 
+        self._backup_log(
+            len(seq_lens_cpu),
+            backup_indices_cpu.tolist(),
+            host_locs,
+            device_locs,
+            req_pool_indices_cpu,
+        )
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
@@ -1071,6 +1079,30 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+
+    def _backup_log(self, bs, backup_indices, host_locs, device_locs, req_pool_indices_cpu):
+        """Measurement-only (hiccup-3): log every eager-backup call's rows."""
+        import json as _json
+
+        path = envs.SGLANG_HISPARSE_BACKUP_LOG.get()
+        if not path:
+            return
+        if self._backup_log_fh is None:
+            self._backup_log_fh = open(path, "a", buffering=1)
+        self._backup_log_fh.write(
+            _json.dumps(
+                {
+                    "bs": int(bs),
+                    "idx": [int(i) for i in backup_indices],
+                    "host": host_locs.tolist(),
+                    "dev": device_locs.tolist(),
+                    "alloc": self.req_to_host_pool_allocated_len[
+                        req_pool_indices_cpu
+                    ].tolist(),
+                }
+            )
+            + "\n"
+        )
 
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
