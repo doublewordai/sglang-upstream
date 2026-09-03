@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.cold_trace import cold_trace
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -2721,7 +2722,21 @@ class NixlKVManager(CommonKVManager):
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
+                try:
+                    self._handle_bootstrap_message(waiting_req_bytes)
+                except Exception:
+                    # A single malformed message or a failed peer-agent setup
+                    # (e.g. UCCL CXI endpoint handshake timeout against a
+                    # still-booting peer) must NOT kill this thread: it is the
+                    # only bootstrap handler for the whole prefill arm.
+                    logger.exception(
+                        "bootstrap_thread: error handling message "
+                        f"(first frame={waiting_req_bytes[0][:16]!r}); continuing"
+                    )
 
+        threading.Thread(target=bootstrap_thread).start()
+
+    def _handle_bootstrap_message(self, waiting_req_bytes):
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
                     if self.enable_staging:
@@ -2730,7 +2745,7 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
+                    return
 
                 # Staging: decode replies with allocated staging offset
                 if waiting_req_bytes[0] == b"STAGING_RSP":
@@ -2740,10 +2755,10 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
+                    return
 
                 if self._handle_abort_notification(waiting_req_bytes):
-                    continue
+                    return
 
                 assert (
                     waiting_req_bytes[0] == GUARD
@@ -2757,7 +2772,7 @@ class NixlKVManager(CommonKVManager):
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
+                    return
                 room = int(room)
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
@@ -2779,9 +2794,8 @@ class NixlKVManager(CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
+                    cold_trace("pf_room_registered", room=room, senders=len(self.transfer_infos[room]))
                     self.update_status(room, KVPoll.WaitingForInput)
-
-        threading.Thread(target=bootstrap_thread).start()
 
 
 class NixlKVSender(CommonKVSender):

@@ -9,6 +9,11 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +35,16 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+
+    # Per-request verify lengths for the ragged (compact) verify path; set by
+    # build_eagle_verify_input when adaptive/ragged verify is enabled. Rides
+    # the SpecInput base-class contract (see spec_info.SpecInput).
+    ragged_verify_layout: Optional["RaggedVerifyLayout"] = None
+
+    # Per-draft-step acceptance-probability estimates P_draft(draft token k)
+    # [bs, spec_steps]; produced by the draft phase when adaptive verify is
+    # enabled (topk=1 chains). Consumed by the verify scheduling.
+    draft_confidences: Optional[torch.Tensor] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.

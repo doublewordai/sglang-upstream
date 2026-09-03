@@ -3193,9 +3193,13 @@ class ServerArgs:
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
+                "'rebootstrap' frees the KV entirely (true retraction) and "
+                "recomputes it on the original prefill worker when the request "
+                "re-enters (PD true-retraction rebootstrap; the default for "
+                "pools without CPU offload support, e.g. DSA/DeepSeekV4). "
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
-            choices=["cpu_tensor", "host_pool"],
+            choices=["cpu_tensor", "host_pool", "rebootstrap"],
         ),
         NS("disagg"),
     ] = None

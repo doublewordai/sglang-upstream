@@ -12,9 +12,11 @@ def _draft_topk1_partial_argmax_kernel(
     logits,
     partial_vals,
     partial_indices,
+    partial_sumexp,
     logits_row_stride,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
+    COMPUTE_SUMEXP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
@@ -35,20 +37,29 @@ def _draft_topk1_partial_argmax_kernel(
     out_offset = row * num_splits + split
     tl.store(partial_vals + out_offset, max_val)
     tl.store(partial_indices + out_offset, split * BLOCK + local_index)
+    if COMPUTE_SUMEXP:
+        # sum of exp(val - local_max): masked lanes contribute exp(-inf)=0;
+        # the finalize kernel rescales by exp(local_max - global_max).
+        sumexp = tl.sum(tl.exp(vals - max_val), axis=0)
+        tl.store(partial_sumexp + out_offset, sumexp)
 
 
 @triton.jit
 def _draft_topk1_finalize_kernel(
     partial_vals,
     partial_indices,
+    partial_sumexp,
     topk_p,
     topk_index,
     positions,
     draft_tokens,
+    draft_probs,
     draft_tokens_stride,
+    draft_probs_stride,
     draft_token_column,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    WRITE_PROBS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -66,6 +77,21 @@ def _draft_topk1_finalize_kernel(
     tl.store(topk_p + row, 1.0)
     if WRITE_DRAFT_TOKEN:
         tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
+    if WRITE_PROBS:
+        # P(argmax token) = exp(max - logsumexp) = 1 / sum(exp(v - max)).
+        sumexp = tl.sum(
+            tl.load(
+                partial_sumexp + row * num_splits + offsets,
+                mask=mask,
+                other=0.0,
+            )
+            * tl.exp(vals - tl.max(vals, axis=0)),
+            axis=0,
+        )
+        tl.store(
+            draft_probs + row * draft_probs_stride + draft_token_column,
+            1.0 / sumexp,
+        )
 
     position = tl.load(positions + row)
     tl.store(positions + row, position + 1)
@@ -76,6 +102,7 @@ def draft_topk1_postprocess(
     positions: torch.Tensor,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    draft_probs: torch.Tensor | None = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -87,6 +114,12 @@ def draft_topk1_postprocess(
     into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
     buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
     is greedy and the chain probabilities are unused downstream.
+
+    If ``draft_probs`` is given ([rows, num_steps] float32, same row stride
+    contract as ``draft_tokens``), the finalize kernel also stores the argmax
+    probability P(argmax token) into
+    ``draft_probs[:, draft_token_column]`` -- the per-step confidence source
+    for adaptive verify scheduling (lane/adaptive-spec).
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
@@ -102,6 +135,14 @@ def draft_topk1_postprocess(
         assert draft_tokens.shape[0] == next_token_logits.shape[0]
         assert draft_tokens.stride(1) == 1
         assert 0 <= draft_token_column < draft_tokens.shape[1]
+    write_probs = draft_probs is not None
+    if write_probs:
+        assert draft_probs.ndim == 2
+        assert draft_probs.dtype == torch.float32
+        assert draft_probs.device == next_token_logits.device
+        assert draft_probs.shape[0] == next_token_logits.shape[0]
+        assert draft_probs.stride(1) == 1
+        assert 0 <= draft_token_column < draft_probs.shape[1]
 
     bs, vocab_size = next_token_logits.shape
     topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
@@ -119,31 +160,46 @@ def draft_topk1_postprocess(
     partial_indices = torch.empty(
         (bs, num_splits), dtype=torch.int32, device=next_token_logits.device
     )
+    # Dummy operand for the disabled sumexp slot: the pointer must be valid
+    # even though the kernel never dereferences it (gated off by
+    # COMPUTE_SUMEXP / WRITE_PROBS).
+    partial_sumexp = (
+        torch.empty(
+            (bs, num_splits), dtype=torch.float32, device=next_token_logits.device
+        )
+        if write_probs
+        else partial_vals
+    )
 
     _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
         next_token_logits,
         partial_vals,
         partial_indices,
+        partial_sumexp,
         next_token_logits.stride(0),
         vocab_size,
         num_splits,
+        COMPUTE_SUMEXP=write_probs,
         BLOCK=block,
         num_warps=8,
     )
-    # Dummy operand for the disabled draft-token slot: the pointer must be
-    # valid even though the kernel never dereferences it (gated off by
-    # WRITE_DRAFT_TOKEN).
+    # Dummy operands for the disabled slots: the pointers must be valid even
+    # though the kernel never dereferences them (gated off by the constexprs).
     _draft_topk1_finalize_kernel[(bs,)](
         partial_vals,
         partial_indices,
+        partial_sumexp,
         topk_p,
         topk_index,
         positions,
         draft_tokens if write_draft_token else topk_index,
+        draft_probs if write_probs else topk_p,
         draft_tokens.stride(0) if write_draft_token else 0,
+        draft_probs.stride(0) if write_probs else 0,
         draft_token_column,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        WRITE_PROBS=write_probs,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
     )

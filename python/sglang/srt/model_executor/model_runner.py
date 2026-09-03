@@ -879,6 +879,11 @@ class ModelRunner:
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
+            num_draft_tokens=(
+                self.server_args.speculative_num_draft_tokens
+                if self.spec_algorithm.is_speculative()
+                else 1
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
@@ -1774,14 +1779,27 @@ class ModelRunner:
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        fused_sampling_ok: bool = False,
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        # Fused-sampling (lane fused-sampling): when the fused kernel will run,
+        # it applies the acc_* penalties itself; skip the eager penalty kernels
+        # and stash the tensors for the Sampler.
+        if fused_sampling_ok:
+            sampling_info._fused_pending_penalties = (
+                sampling_info.acc_additive_penalties,
+                sampling_info.acc_scaling_penalties,
+            )
+        sampling_info.apply_logits_bias(
+            logits_output.next_token_logits, skip_penalties=fused_sampling_ok
+        )
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
@@ -1804,7 +1822,32 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        # Fused-sampling eligibility; MUST be a subset of Sampler.forward's
+        # fused gate (see layers/sampler.py) so penalties are never skipped
+        # without the fused kernel consuming them.
+        _logits = logits_output.next_token_logits
+        _si = forward_batch.sampling_info
+        fused_sampling_ok = (
+            envs.SGLANG_FUSED_SAMPLING.get()
+            and _logits.is_cuda
+            and _logits.shape[0] > 0
+            and _logits.dtype == torch.float32
+            and not forward_batch.return_logprob
+            and not any(_si.return_sampling_masks or [])
+            and _si.sampling_seed is None
+            and not self.sampler.use_log_softmax_logprob
+            and (
+                _si.is_all_greedy
+                or (
+                    not _si.need_top_p_sampling
+                    and not _si.need_top_k_sampling
+                    and not _si.need_min_p_sampling
+                )
+            )
+        )
+        self._preprocess_logits(
+            logits_output, forward_batch.sampling_info, fused_sampling_ok=fused_sampling_ok
+        )
 
         # Sample the next tokens
         next_token_ids = self.sampler(
