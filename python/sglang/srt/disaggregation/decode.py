@@ -20,7 +20,9 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -355,6 +357,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # /server_info + load snapshots so it can be charted/dispatched on).
         self.host_pool_wait_events: int = 0
         self._host_pool_wait_last_log_ts: float = 0.0
+        # Starvation follow-up (2026-09-03, prod 6256482 DP9):
+        # per-request wait age since the first failed host-pool
+        # admission. After SGLANG_HISPARSE_STARVE_S (default 5 s)
+        # admission escalates to starvation-honoring deficit
+        # eviction -- retained-idle rows LRU-first; running /
+        # in-transfer rows are never evictable, so never taken.
+        self._host_pool_wait_since: Dict[str, float] = {}
+        self.host_pool_starve_evictions: int = 0
+        try:
+            self._host_pool_starve_s = max(
+                0.0,
+                float(os.environ.get("SGLANG_HISPARSE_STARVE_S", "5.0")),
+            )
+        except ValueError:
+            self._host_pool_starve_s = 5.0
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -708,6 +725,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self.queue.clear()
+        self._host_pool_wait_since.clear()
         for req in self.retracted_queue:
             retraction_discard(
                 req,
@@ -1362,6 +1380,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if self._host_pool_wait_since:
+            live_rids = {entry.req.rid for entry in self.queue}
+            for stale_rid in set(self._host_pool_wait_since) - live_rids:
+                self._host_pool_wait_since.pop(stale_rid, None)
 
         return preallocated_reqs, failed_reqs
 
@@ -1600,6 +1622,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # request's own host-row table is still empty at this point.
         needed_pages = host_pool.host_pages_needed(start_pos, num_tokens, 0)
         if needed_pages <= 0 or host_pool.has_free_pages(needed_pages):
+            self._host_pool_wait_since.pop(decode_req.req.rid, None)
             return True
 
         # Host pressure, unlike logical-pool pressure, frees nothing by
@@ -1614,12 +1637,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 EvictParams(num_tokens=min(deficit_tokens, evictable))
             )
             if host_pool.has_free_pages(needed_pages):
+                self._host_pool_wait_since.pop(decode_req.req.rid, None)
                 return True
 
-        self._note_host_pool_wait(needed_pages)
+        rid = decode_req.req.rid
+        now = time.monotonic()
+        wait_since = self._host_pool_wait_since.setdefault(rid, now)
+        wait_age = now - wait_since
+        if wait_age > self._host_pool_starve_s:
+            # Starvation override (SGLANG_HISPARSE_STARVE_S, default
+            # 5 s): evict retained-idle rows LRU-first regardless
+            # of retention age until the deficit is covered. This
+            # retention design has no TTL; idle rows are exactly
+            # the unlocked ones, and running / in-transferring
+            # pages are locked chains or private reservations, so
+            # the eviction below can never take them.
+            if self._evict_starved(deficit_tokens) and host_pool.has_free_pages(
+                needed_pages
+            ):
+                self._host_pool_wait_since.pop(rid, None)
+                return True
+
+        self._note_host_pool_wait(needed_pages, wait_age)
         return False
 
-    def _note_host_pool_wait(self, needed_pages: int) -> None:
+    def _note_host_pool_wait(
+        self, needed_pages: int, wait_age: float = -1.0
+    ) -> None:
         """Count one host-pool admission skip; rate-limit the log line."""
         self.host_pool_wait_events += 1
         now = time.monotonic()
@@ -1630,13 +1674,54 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         logger.warning(
             "HiSparse: host mem pool full; prealloc request waits "
             "(need=%d pages, free=%d pages, queue_len=%d, evictable=%d tok, "
-            "wait_events=%d)",
+            "wait_events=%d, wait_age_s=%.1f, starve_evictions=%d)",
             needed_pages,
             host_pool.available_size() // host_pool.page_size,
             len(self.queue),
             self.tree_cache.evictable_size(),
             self.host_pool_wait_events,
+            wait_age,
+            self.host_pool_starve_evictions,
         )
+
+    def _evict_starved(self, deficit_tokens: int) -> bool:
+        """Starvation-honoring deficit eviction (2026-09-03 follow-up).
+
+        Runs only after a prealloc has waited past
+        ``SGLANG_HISPARSE_STARVE_S``: evict retained-idle radix
+        rows LRU-first until the deficit is covered. Rows of
+        running or in-transferring requests are never taken: they
+        are either locked radix chains (``lock_ref > 0``, excluded
+        from ``evictable_leaves``) or the requests' own
+        pre-allocated host rows (not radix rows at all). One log
+        line per evicted node records the cost -- a later turn of
+        an evicted session re-prefills exactly those tokens.
+        """
+        tree_cache = self.tree_cache
+        if tree_cache.evictable_size() <= 0:
+            return False
+
+        def _note_evicted_node(node) -> None:
+            key_head = ",".join(str(t) for t in list(node.key.token_ids)[:8])
+            sid = hashlib.sha1(key_head.encode()).hexdigest()[:12]
+            idle_s = max(0.0, time.monotonic() - node.last_access_time)
+            self.host_pool_starve_evictions += 1
+            logger.warning(
+                "HiSparse: starve eviction sid=%s tokens=%d idle_s=%.1f",
+                sid,
+                len(node.key),
+                idle_s,
+            )
+
+        # The hook is armed only around this evict() call: base
+        # RadixCache.evict() fires _record_remove_event exactly
+        # once per evicted leaf node, with the node still intact.
+        tree_cache._starve_on_evict = _note_evicted_node
+        try:
+            tree_cache.evict(EvictParams(num_tokens=deficit_tokens))
+        finally:
+            tree_cache._starve_on_evict = None
+        return True
 
     def _pre_alloc(
         self,
