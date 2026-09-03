@@ -578,19 +578,6 @@ class Scheduler(
 
         self.maybe_init_session_migration()
 
-        # decode-cpu-path: freeze the boot-time object graph once init is done
-        # (the /freeze_gc endpoint exists but nothing calls it in production;
-        # a frozen heap removes gen-2 collection scans from the decode path).
-        if envs.SGLANG_AUTO_FREEZE_GC.get():
-            import gc as _gc
-
-            _gc.collect()
-            freeze_gc("Scheduler (post-init, auto)")
-        if envs.SGLANG_DCP_GC_LOG.get():
-            from sglang.srt.utils.common import configure_gc_warning
-
-            configure_gc_warning(0.001)
-
         # warm-local-prefill (lane warm-local-prefill): decode-rank local
         # extends of warm-turn appends. Requests whose rid carries the
         # "WLP-" marker (set by the bench client / future router hook) take
@@ -1949,11 +1936,6 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
-
-            # decode-cpu-path: stage the next decode step's eager-backup
-            # inputs while this forward executes (off the launch path).
-            if self.hisparse_coordinator is not None:
-                self.hisparse_coordinator.precompute_eager_backup(batch)
 
             # Update last_batch
             self.last_batch = batch

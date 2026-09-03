@@ -309,14 +309,6 @@ class HiSparseCoordinator:
         self._has_pending_backup = False
         self._backup_log_fh = None
 
-        # decode-cpu-path: precomputed eager-backup staging, filled by
-        # precompute_eager_backup at the END of the previous scheduler
-        # iteration (while the forward executes on the GPU) and consumed by
-        # the next prepare_for_decode. None => integration inline path.
-        self._pending_backup = None
-        self._backup_stage = None  # (pinned_req, pinned_slot, pinned_pos)
-        self._staging_capacity = req_to_token_pool.req_to_token.shape[0]
-
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
@@ -1463,71 +1455,6 @@ class HiSparseCoordinator:
             device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
 
-    def invalidate_pending_backup(self) -> None:
-        """decode-cpu-path: drop precomputed eager-backup staging. Called on
-        membership changes the consume-time shrink guard cannot see (aborts,
-        releases); the next prepare_for_decode takes the inline path."""
-        self._pending_backup = None
-
-    def precompute_eager_backup(self, batch) -> None:
-        """decode-cpu-path: stage the NEXT prepare_for_decode's eager-backup
-        inputs at the END of the current scheduler iteration, while the just
-        launched forward executes on the GPU.
-
-        Uses the batch's post-increment seq_lens L; the next prepare sees
-        L' = L + 1 and the inline path's decisions reduce identically:
-          align:  (L' - 1) % cr == 0  <=>  L % cr == 0
-          pos:    (L' - 1) // cr - 1  ==   L // cr - 1
-        Entries are keyed by req_pool_idx (not batch position): requests that
-        join later are simply absent (they skip their first backup, matching
-        the inline path); any shrink or invalidation falls back to the inline
-        path at consume time. Same mask arithmetic and the same batched host
-        alloc as the integration inline path, just one iteration earlier and
-        off the launch path.
-        """
-        if batch is None or not batch.forward_mode.is_decode():
-            self._pending_backup = None
-            return
-        if self.is_dsv4_hisparse:
-            self._pending_backup = None
-            return
-        seq_lens_cpu = batch.seq_lens_cpu
-        req_pool_indices_cpu = batch.req_pool_indices_cpu
-        cr = self.compress_ratio
-        mask = (seq_lens_cpu % cr == 0) & ~self._skip_first_backup[
-            req_pool_indices_cpu
-        ]
-        pos_cpu = torch.where(mask)[0]
-        if pos_cpu.numel() == 0:
-            self._pending_backup = (0, None, None, None, None, None)
-            return
-        reqs_cpu = req_pool_indices_cpu[pos_cpu]
-        start_cpu = seq_lens_cpu[pos_cpu] // cr - 1
-        slot_cpu = start_cpu.clamp(max=self.device_buffer_size)
-        # NOTE: no host-pool alloc here. The req's host rows may not have
-        # landed yet (a transfer completes in the next iteration's
-        # process_decode_queue, BEFORE prepare_for_decode); allocating here
-        # asserts (start_pos <= allocated_len). The alloc runs at consume
-        # time with the same order/values as the inline path.
-        if self._backup_stage is None:
-            self._backup_stage = tuple(
-                torch.empty(self._staging_capacity, dtype=torch.int64, pin_memory=True)
-                for _ in range(3)
-            )
-        pinned_req, pinned_slot, pinned_pos = self._backup_stage
-        n = pos_cpu.numel()
-        pinned_req[:n].copy_(reqs_cpu)
-        pinned_slot[:n].copy_(slot_cpu)
-        pinned_pos[:n].copy_(start_cpu)
-        self._pending_backup = (
-            n,
-            pinned_req[:n].to(self.device, non_blocking=True),
-            pinned_slot[:n].to(self.device, non_blocking=True),
-            pinned_pos[:n].to(self.device, non_blocking=True),
-            reqs_cpu,
-            start_cpu,
-        )
-
     def _fast_backup_eligible(
         self,
         seq_lens_cpu: torch.Tensor,
@@ -1604,70 +1531,6 @@ class HiSparseCoordinator:
         - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
           token was produced this step.
         """
-        # decode-cpu-path: consume staging precomputed at the end of the
-        # previous iteration (precompute_eager_backup) while the forward ran:
-        # no mask compute, no H2D, no host alloc on the launch path. The GPU
-        # op sequence and stream chaining mirror the inline path exactly.
-        staged = self._pending_backup
-        self._pending_backup = None
-        if staged is not None and staged[0] > len(seq_lens_cpu):
-            # The batch shrank since staging (retract/abort raced): recompute.
-            staged = None
-        if staged is not None:
-            (
-                n,
-                backup_req_indices,
-                buffer_slot,
-                actual_compressed_pos,
-                staged_reqs,
-                staged_poss,
-            ) = staged
-            # Clear first-backup skips for the current batch (the inline path
-            # clears them on each req's first prepare; vectorised here).
-            self._skip_first_backup[req_pool_indices_cpu] = False
-            if n == 0:
-                return
-            # Host rows are allocated HERE (consume time): rows may only land
-            # in this iteration's process_decode_queue, before this call.
-            host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                staged_reqs,
-                staged_poss,
-                1,
-            )
-            device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
-            self._backup_log(
-                len(seq_lens_cpu),
-                backup_req_indices.tolist(),
-                host_locs,
-                device_locs,
-                req_pool_indices_cpu,
-            )
-            self.wait_for_pending_backup()
-            schedule_stream = device_module.current_stream()
-            with device_module.stream(self.decode_backup_stream):
-                self.decode_backup_stream.wait_stream(schedule_stream)
-                if self.decode_producer_stream is not None:
-                    self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-                self.mem_pool_host.backup_from_device_all_layer(
-                    self.mem_pool_device,
-                    host_locs,
-                    device_locs,
-                    io_backend="kernel",
-                )
-                self._backup_done_event.record()
-                if host_locs.is_cuda:
-                    host_locs.record_stream(self.decode_backup_stream)
-                if backup_req_indices.is_cuda:
-                    backup_req_indices.record_stream(self.decode_backup_stream)
-                if actual_compressed_pos.is_cuda:
-                    actual_compressed_pos.record_stream(self.decode_backup_stream)
-                if device_locs.is_cuda:
-                    device_locs.record_stream(self.decode_backup_stream)
-            self._has_pending_backup = True
-            return
-
         # [lane attn-streams] Steady-state fast path (SGLANG_HISPARSE_FAST_BACKUP,
         # compress_ratio == 1): every request backs up its previous token, so the
         # index list is the whole batch and both loc vectors are two gathers --
@@ -2064,8 +1927,6 @@ class HiSparseCoordinator:
         Must be called when aborting a request that has been admitted into staging
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
-        # decode-cpu-path: staged backup metadata may reference this req.
-        self.invalidate_pending_backup()
         # Remove from staging queue
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
@@ -2123,7 +1984,6 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
-        self.invalidate_pending_backup()
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
