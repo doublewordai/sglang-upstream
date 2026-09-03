@@ -2487,29 +2487,50 @@ class DeepseekSparseAttnBackend(
                 if has_retained_prefix:
                     # warm-local-prefill: the matched prefix is host-resident
                     # (retained); its selections need a union swap-in from host
-                    # pages. Rebuild the table from the raw positions: prefix
-                    # selections point at scratch slots holding the host bytes,
-                    # delta selections translate through the device mapping.
-                    if self.use_fused_topk:
-                        raise NotImplementedError(
-                            "WLP: fused topk is not supported on the "
-                            "retained-prefix extend path (set both arms to the "
-                            "unfused topk for exactness)"
-                        )
+                    # pages. Two top-k index domains reach this branch:
+                    #  - unfused (raw positions): prefix selections point at
+                    #    scratch slots holding the host bytes, delta
+                    #    selections translate through the device mapping;
+                    #  - fused PAGED (slot-resolved logical locs; prod's
+                    #    SGLANG_DSA_FUSE_TOPK=1 + 1PASS): prefix selections
+                    #    are locs with retained host rows, delta selections
+                    #    are locs translated to their device slots directly.
+                    #    Same selection kernel as the prefill arm's warm
+                    #    extends, so PD-path/WLP exactness is preserved.
                     if topk_indices is None:
                         raise AssertionError(
                             "WLP: extend with a retained prefix requires topk_indices"
                         )
-                    padded_positions = self._pad_topk_indices(
-                        topk_indices, q_nope.shape[0]
-                    )
-                    page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        topk_positions=padded_positions,
-                        prefix_lens=forward_batch.extend_prefix_lens,
-                        translated=page_table_1,
-                        layer_id=layer.layer_id,
-                    )
+                    if self.use_fused_topk:
+                        if (
+                            not envs.SGLANG_WLP_FUSED_TOPK.get()
+                            or topk_transform_method != TopkTransformMethod.PAGED
+                        ):
+                            raise AssertionError(
+                                "WLP: fused topk on a retained-prefix extend "
+                                "requires the PAGED transform and "
+                                "SGLANG_WLP_FUSED_TOPK=1 (get_indexer_metadata "
+                                "should have forced the unfused top-k)"
+                            )
+                        page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table_fused(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            topk_locs=self._pad_topk_indices(
+                                topk_indices, q_nope.shape[0]
+                            ),
+                            prefix_lens=forward_batch.extend_prefix_lens,
+                            layer_id=layer.layer_id,
+                        )
+                    else:
+                        padded_positions = self._pad_topk_indices(
+                            topk_indices, q_nope.shape[0]
+                        )
+                        page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            topk_positions=padded_positions,
+                            prefix_lens=forward_batch.extend_prefix_lens,
+                            translated=page_table_1,
+                            layer_id=layer.layer_id,
+                        )
                 else:
                     # flash_mla_sparse_fwd / tilelang require int32 page indices.
                     page_table_1 = (
@@ -4141,6 +4162,28 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
+        # wlp-fused-topk: a retained-prefix extend on a hisparse arm (the
+        # warm-local-prefill local extend) rebuilds its page table from the
+        # top-k output. With the fused PAGED transform that output is
+        # slot-resolved logical locs, which the fused swap-in branch in
+        # forward_extend consumes (SGLANG_WLP_FUSED_TOPK, default on). Every
+        # other transform domain (RAGGED offsets are neither locs nor
+        # positions) or an explicit opt-out still needs raw positions, so
+        # force the unfused top-k there.
+        wlp_extend_unfused = (
+            not forward_batch.forward_mode.is_target_verify()
+            and bool(
+                forward_batch.extend_prefix_lens_cpu
+                and any(forward_batch.extend_prefix_lens_cpu)
+            )
+            and (
+                not envs.SGLANG_WLP_FUSED_TOPK.get()
+                or topk_transform_method != TopkTransformMethod.PAGED
+            )
+        )
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and (
@@ -4149,13 +4192,12 @@ class DeepseekSparseAttnBackend(
                 # per-position swap-in from POSITIONS; the fused topk would
                 # emit logical locs (real-page-table domain) instead.
                 or forward_batch.forward_mode.is_target_verify()
+                or wlp_extend_unfused
             )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(
-                forward_batch.forward_mode
-            ),
+            topk_transform_method=topk_transform_method,
             topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,

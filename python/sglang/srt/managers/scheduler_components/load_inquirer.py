@@ -130,6 +130,7 @@ class SchedulerLoadInquirer:
         # attributes, so such guards silently evaluate to their defaults.
         host_pool_free_tokens = host_pool_total_tokens = host_pool_pinned_tokens = 0
         host_pool_evictable_tokens = host_pool_wait_events = 0
+        host_pool_wait_age_s = 0.0
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             coordinator = None
             if self.server_args.enable_hisparse:
@@ -144,16 +145,24 @@ class SchedulerLoadInquirer:
                     host_pool_pinned_tokens = (
                         host_pool_total_tokens - host_pool_free_tokens
                     )
-                    host_pool_wait_events = int(
-                        self.get_disagg_decode_prealloc_queue().host_pool_wait_events
-                    )
+                    prealloc_queue = self.get_disagg_decode_prealloc_queue()
+                    host_pool_wait_events = int(prealloc_queue.host_pool_wait_events)
                     # Unlocked retained radix rows: host tokens the admission
                     # path can free by eviction (what the scheduler log calls
                     # `evictable=`). locked = pinned - evictable.
                     host_pool_evictable_tokens = int(
-                        self.get_disagg_decode_prealloc_queue()
-                        .tree_cache.evictable_size()
+                        prealloc_queue.tree_cache.evictable_size()
                     )
+                    # Oldest prealloc blocked on the full host pool. The dict
+                    # is pruned of dead rids by the queue itself.
+                    wait_since = getattr(
+                        prealloc_queue, "_host_pool_wait_since", None
+                    )
+                    if wait_since:
+                        now = time.monotonic()
+                        host_pool_wait_age_s = (
+                            max(now - t for t in wait_since.values())
+                        )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -263,6 +272,10 @@ class SchedulerLoadInquirer:
 
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
+            tp_rank=int(self.ps.tp_rank),
+            pp_rank=int(self.ps.pp_rank),
+            moe_ep_rank=int(self.ps.moe_ep_rank),
+            node_rank=int(getattr(self.server_args, "node_rank", 0) or 0),
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
@@ -275,6 +288,7 @@ class SchedulerLoadInquirer:
             host_pool_pinned_tokens=host_pool_pinned_tokens,
             host_pool_evictable_tokens=host_pool_evictable_tokens,
             host_pool_wait_events=host_pool_wait_events,
+            host_pool_wait_age_s=round(host_pool_wait_age_s, 3),
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

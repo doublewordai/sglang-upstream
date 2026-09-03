@@ -2510,11 +2510,6 @@ class SchedulerDisaggregationDecodeMixin:
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-            # decode-cpu-path: stage the next decode step's eager-backup
-            # inputs while this forward executes (off the launch path).
-            if self.hisparse_coordinator is not None:
-                self.hisparse_coordinator.precompute_eager_backup(batch)
-
             # Update last_batch
             self.last_batch = batch
 

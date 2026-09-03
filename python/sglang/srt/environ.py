@@ -325,10 +325,6 @@ class Envs:
     # Logging
     # ===================================================================
     SGLANG_LOG_GC = EnvBool(False)
-    # decode-cpu-path: auto gc.freeze after scheduler init; log every GC pause
-    # >= 1ms (scheduler process) for the timeline attribution.
-    SGLANG_AUTO_FREEZE_GC = EnvBool(True)
-    SGLANG_DCP_GC_LOG = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
@@ -467,14 +463,14 @@ class Envs:
     # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
     # copies; affects the HiCache H2D load path (page_first host pools) and
     # the layer_first D2H backup path (hisparse staging backup).
-    SGLANG_HICACHE_BULK_COPY = EnvBool(False)
+    SGLANG_HICACHE_BULK_COPY = EnvBool(True)
     # D2H bulk backup via warp-coalesced SM stores instead of the copy engine
     # (the CE D2H path is capped at ~170 GB/s over C2C on GH200; coalesced SM
     # stores sustain ~383 GB/s into the same pinned pool). Replaces the
     # segment copies AND the remainder kernel of the bulk backup when
     # SGLANG_HICACHE_BULK_COPY is also on; byte-identical; falls back to the
     # merged copy-engine path when the JIT module is unavailable.
-    SGLANG_D2H_SM_STORES = EnvBool(False)
+    SGLANG_D2H_SM_STORES = EnvBool(True)
     # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
     # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
     # eligibility (max new-span tokens, min matched fraction of the prompt) and
@@ -486,6 +482,15 @@ class Envs:
     # rank): rig weight-equality probe + the local-refill fallback variant.
     SGLANG_WLP_ALLOW_COLD = EnvBool(False)
     SGLANG_WLP_TRACE = EnvBool(False)
+    # wlp-fused-topk: consume prod's fused PAGED top-k output (slot-resolved
+    # logical locs) in the WLP retained-prefix extend. ON (default): the
+    # union swap-in discriminates prefix/delta selections in the loc domain
+    # via logical_to_host_row -- the same fused/1PASS kernel (and therefore
+    # the same selection) as the prefill arm's warm extends. OFF: WLP extends
+    # force the unfused top-k (raw positions; the original lane-validated
+    # path; exact vs the PD path only when SGLANG_DSA_FUSE_TOPK=0 on both
+    # arms).
+    SGLANG_WLP_FUSED_TOPK = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -631,6 +636,17 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+
+    # MTP verify path's multi-position shared-index prefetch (union swap-in
+    # per skip layer). Default True (merge policy 2026-09-03: exact and
+    # measured-positive lands as the default path): the per-position fork
+    # measures 2.6-3.2x vs the synchronous per-position swap-in and is
+    # bit-identical. Set 0 to restore the synchronous fallback (speculation
+    # itself is default-off in prod, so this only affects spec runs).
+    SGLANG_HISPARSE_SPEC_PREFETCH = EnvBool(True)
+    # Debug: verify each step swap-in selection contains distinct token
+    # positions (kernel miss-compaction invariant; see hisparse_coordinator).
+    SGLANG_DEBUG_HISPARSE_CHECK_TOPK = EnvBool(False)
     # draft-prefetch lane probe: per verify step, stash the draft seed top-k,
     # the target's per-layer/per-position top-k, the per-layer resident tables,
     # per-(layer,position) swap-in CUDA-event timings and miss counts, then
@@ -1512,7 +1528,7 @@ class Envs:
     # sgl_kernel fast_topk_v2 on decode/verify shapes (row_starts is None,
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
-    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(True)
     # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
     # persistent launch with in-kernel grid barriers reading each row once
     # (plus a small sample and a rare fg-equivalent fallback re-read),
@@ -1537,7 +1553,7 @@ class Envs:
     # Prefill-shaped PAGED DSA top-k: use the single-pass JIT kernel
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
-    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(True)
     # lane/pagetable-gather: in the chunked-mqa PAGED prefill top-k path,
     # pass the per-step page table to the 1-pass kernel whole plus a per-row
     # table-row map (row_to_page) instead of materializing
@@ -1585,6 +1601,11 @@ class Envs:
     # lane/indexer-prologue: keep the Hadamard inside the fused DSA indexer
     # prologue kernels (production arithmetic).
     SGLANG_DSA_INDEXER_FUSION_KEEP_HADAMARD = EnvBool(False)
+    # lane/decode-glue-fusion: fused decode-layer glue kernels (default off)
+    SGLANG_DECODE_GLUE_FUSE_NORM_QUANT = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_MOE_EPILOGUE = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_ROUTER = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_KV_EPILOGUE = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel
