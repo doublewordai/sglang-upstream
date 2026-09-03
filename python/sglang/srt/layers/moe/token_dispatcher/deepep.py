@@ -620,7 +620,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 per_rank = max(chunk // dp, 1024)
         except Exception:
             pass
-        return per_rank * self.group.size()
+        bound = per_rank * self.group.size()
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "worst-case recv bound: per_rank=%d group=%d bound=%d (env=%d)",
+            per_rank, self.group.size(), bound, _deepep_worst_case_recv_tokens_env,
+        )
+        return bound
 
     def dispatch_a(
         self,
