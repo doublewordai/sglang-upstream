@@ -2146,6 +2146,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        # pd-handover-latency lane: cold-trace marker for the first decode step
+        decode_req.req.pdho_first_step = True
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:

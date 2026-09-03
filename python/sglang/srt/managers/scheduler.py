@@ -4112,6 +4112,18 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if batch.forward_mode.is_decode() and cold_trace_enabled():
+            for req in batch.reqs:
+                if getattr(req, "pdho_first_step", False):
+                    req.pdho_first_step = False
+                    req.pdho_first_result = True
+                    cold_trace(
+                        "dec_step_launch",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        iter=batch.forward_iter,
+                    )
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
