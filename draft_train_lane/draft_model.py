@@ -276,7 +276,15 @@ def chain_loss(
     return_metrics: bool = False,
     generator: torch.Generator | None = None,
     ctx: int = 0,  # prefix context (0 = full window before the chain start)
+    residual_weight: float = 0.0,  # logit-delta matching (residual objective)
+    lm_head=None,  # [V, H] snapshot of the (frozen) lm_head; required if
+    # residual_weight > 0 (FSDP-safe: pass a detached copy taken pre-wrap)
 ):
+    """residual_weight > 0 adds the residual-draft-distillation objective:
+    the chain's consecutive-step logit DELTA must match the target's
+    consecutive-position logit delta (lm_head of the captured hiddens).
+    Zero extra parameters (training-objective-only, export-compatible)."""
+
     """EAGLE-3.1-style chain fine-tune (depth-stability variant).
 
     Seeds a chain with the TARGET hidden at one window position (exactly the
@@ -306,6 +314,8 @@ def chain_loss(
                 s = int(torch.randint(lo, hi, (1,), device=device))
             m["chains"] += 1
             gs = []
+            _lg_prev = None
+            _lmw = lm_head
             # prefix start: include window context before the chain so the
             # chain sees the same KV context as real inference (ctx=0 -> all).
             # Convention: prev_hidden[b, i] = target hidden h_{i-1}; the input
@@ -334,7 +344,26 @@ def chain_loss(
                 # feature loss: g_j approximates h_{s+j} = prev_hidden[b, s+j+1]
                 feat = prev_hidden[b, s + j + 1]
                 mse = torch.nn.functional.mse_loss(g_j.float(), feat.float())
-                losses.append(ce + feature_weight * mse)
+                step_loss = ce + feature_weight * mse
+                if residual_weight > 0:
+                    # target logit delta: lm_head of consecutive target hiddens
+                    with torch.no_grad():
+                        tl_prev = torch.nn.functional.linear(
+                            prev_hidden[b, s + j].float(), _lmw
+                        )
+                        tl_now = torch.nn.functional.linear(
+                            prev_hidden[b, s + j + 1].float(), _lmw
+                        )
+                        tgt_delta = tl_now - tl_prev
+                    lg_prev = _lg_prev if _lg_prev is not None else torch.nn.functional.linear(
+                        prev_hidden[b, s + j].float(), _lmw
+                    )
+                    pred_delta = lg.float() - lg_prev.float()
+                    step_loss = step_loss + residual_weight * torch.nn.functional.mse_loss(
+                        pred_delta, tgt_delta
+                    )
+                    _lg_prev = lg
+                losses.append(step_loss)
                 m["ce"].append(ce.item())
                 m["mse"].append(mse.item())
                 with torch.no_grad():

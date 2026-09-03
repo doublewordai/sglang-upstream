@@ -86,6 +86,19 @@ echo "nodes=$NODES"
 echo "log=$LOG"
 echo "NONDISAGG=${NONDISAGG:-0} EAGER=${EAGER:-0}"
 
+wait_for_health() {
+    local url=$1 name=$2 max=${3:-600}
+    for i in $(seq 1 "$max"); do
+        if curl -sf "$url/health" >/dev/null 2>&1; then
+            echo "[$(date -Is)] $name ready at $url"
+            return 0
+        fi
+        sleep 5
+    done
+    echo "[$(date -Is)] $name NOT ready after ${max}x5s at $url"
+    return 1
+}
+
 # --- Non-disaggregated mode: 4-node unified EP16 server -----------------------
 if [[ "${NONDISAGG:-0}" == "1" ]]; then
     UNIFIED_NODES=$(echo "$NODES" | cut -d, -f1-4)
@@ -110,6 +123,55 @@ if [[ "${NONDISAGG:-0}" == "1" ]]; then
                 --chunked-prefill-size 4096 --context-length 16384 --max-running-requests 64 \
                 --moe-dense-tp-size 1 --load-balance-method prefix_affinity --mem-fraction-static 0.88
         ' > "$LOG" 2>&1
+    exit $?
+fi
+
+# --- SMOKE mode: 1-node/1-GPU dry-run of this launcher flow (dummy78) ---------
+if [[ "${SMOKE:-0}" == "1" ]]; then
+    SMOKE_NODE=${SMOKE_NODE:-${NODES%%,*}}
+    echo "=== SMOKE=1: 1-GPU dry-run on $SMOKE_NODE (model=$MODEL) ==="
+    echo "launcher SGLANG_DRAFT_CAPTURE_DIR=$SGLANG_DRAFT_CAPTURE_DIR"
+    srun ${HOLDER:+--overlap --jobid=$HOLDER} -N1 -n1 -w "$SMOKE_NODE" --gres=gpu:1 \
+        --cpus-per-task=16 --input=none \
+        --export=ALL,MODEL="$MODEL",PORT="$PREFILL_PORT",U_ROOT="$U_ROOT",SGLANG_DRAFT_CAPTURE_DIR="$SGLANG_DRAFT_CAPTURE_DIR",SGLANG_DRAFT_CAPTURE_MODES="${SGLANG_DRAFT_CAPTURE_MODES:-extend}",SGLANG_DRAFT_CAPTURE_TAG="${SGLANG_DRAFT_CAPTURE_TAG:-prefill}" \
+        bash -c '
+            set -e
+            echo "ENGINE-CAPTURE-DIR=$SGLANG_DRAFT_CAPTURE_DIR TAG=$SGLANG_DRAFT_CAPTURE_TAG" >&2
+            export T_WITH_EP=1
+            source "$U_ROOT/scripts/env-U.sh" 2>/dev/null
+            export PYTHONPATH=/scratch/s6p/fergus.s6p/src/sglang-draft-train-0902/python:${PYTHONPATH:-}
+            export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 SGLANG_JIT_DEEPGEMM_PRECOMPILE=false
+            export PYTHONDONTWRITEBYTECODE=1
+            exec python -m sglang.launch_server --model-path "$MODEL" --load-format dummy \
+                --trust-remote-code --json-model-override-args "{\"qk_rope_head_dim\": 64}" \
+                --host 0.0.0.0 --port "$PORT" --tp-size 1 --random-seed 42 \
+                --disable-cuda-graph \
+                --chunked-prefill-size 4096 --context-length 8192 --max-running-requests 4 \
+                --max-total-tokens 16384 --mem-fraction-static 0.80
+        ' > "$LOG" 2>&1 &
+    SRUN_PID=$!
+    echo "srun launched (pid=$SRUN_PID). Waiting for servers to boot..."
+    ENGINE_URL="http://$SMOKE_NODE:$PREFILL_PORT"
+    wait_for_health "$ENGINE_URL" "engine" 120 || { echo "engine boot failed"; tail -50 "$LOG"; kill $SRUN_PID 2>/dev/null; exit 1; }
+
+    LB_URL="http://$SMOKE_NODE:$LB_PORT"
+    srun ${HOLDER:+--overlap --jobid=$HOLDER} -N1 -n1 -w "$SMOKE_NODE" --gres=gpu:0 --cpus-per-task=2 \
+        --export=ALL,FROM_PORT="$LB_PORT",TO_PORT="$PREFILL_PORT",U_ROOT="$U_ROOT" \
+        bash -c '
+            export T_WITH_EP=1
+            source "$U_ROOT/scripts/env-U.sh" 2>/dev/null
+            exec python /scratch/s6p/fergus.s6p/grace-1m/lanes/draft-train/smoke_lb_proxy.py
+        ' >> "$LOG" 2>&1 &
+    LB_PID=$!
+    echo "LB router launched (pid=$LB_PID)"
+    wait_for_health "$LB_URL" "LB" 24 || { echo "LB boot failed"; tail -50 "$LOG"; kill $SRUN_PID $LB_PID 2>/dev/null; exit 1; }
+    echo ""
+    echo "============================================"
+    echo "PD disagg system ready!"
+    echo "  LB:       $LB_URL"
+    echo "  (SMOKE: single dummy78 engine behind a TCP-proxy LB)"
+    echo "============================================"
+    wait $SRUN_PID
     exit $?
 fi
 
@@ -212,18 +274,6 @@ SRUN_PID=$!
 echo "srun launched (pid=$SRUN_PID). Waiting for servers to boot..."
 
 # --- Health check helpers -----------------------------------------------------
-wait_for_health() {
-    local url=$1 name=$2 max=${3:-600}
-    for i in $(seq 1 "$max"); do
-        if curl -sf "$url/health" >/dev/null 2>&1; then
-            echo "[$(date -Is)] $name ready at $url"
-            return 0
-        fi
-        sleep 5
-    done
-    echo "[$(date -Is)] $name NOT ready after ${max}x5s at $url"
-    return 1
-}
 
 PREFILL_URL="http://$PREFILL_MASTER:$PREFILL_PORT"
 DECODE_URL="http://$DECODE_MASTER:$DECODE_PORT"

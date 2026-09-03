@@ -99,6 +99,8 @@ def main():
     ap.add_argument("--chains-per-window", type=int, default=2)
     ap.add_argument("--chain-detach", action="store_true",
                     help="detach the draft's own hidden feedback (no BPTT through the chain)")
+    ap.add_argument("--chain-residual", type=float, default=0.0,
+                    help="logit-delta (residual) objective weight in the chain loss")
     ap.add_argument("--val-every", type=int, default=50)
     ap.add_argument("--val-windows", type=int, default=16)
     ap.add_argument("--holdout", type=int, default=6,
@@ -107,6 +109,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--strategy", default="fsdp", choices=["fsdp", "ddp", "none"])
     ap.add_argument("--val-only", action="store_true")
+    ap.add_argument("--save-trainable-only", action="store_true",
+                    help="final ckpt holds only trainable params (frozen buffers stay original)")
     args = ap.parse_args()
 
     dist.init_process_group("nccl")
@@ -118,6 +122,10 @@ def main():
 
     model = build_model(args.weights, device)
     nparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_keys = {
+        n for n, p in model.named_parameters() if p.requires_grad
+    }
+    lm_snap = model.lm_head.detach().clone()  # frozen; FSDP-safe snapshot
     if rank == 0:
         print(f"model loaded: {nparams/1e9:.2f}B trainable params")
 
@@ -224,6 +232,8 @@ def main():
                     n_chains=args.chains_per_window,
                     detach_feedback=args.chain_detach,
                     return_metrics=True,
+                    residual_weight=args.chain_residual,
+                    lm_head=lm_snap,
                 )
                 loss = loss + args.chain_weight * closs
                 m = dict(m)
@@ -276,6 +286,12 @@ def main():
                     k: v.detach().to(torch.bfloat16).cpu()
                     for k, v in raw_model.state_dict().items()
                 }
+                if args.save_trainable_only:
+                    sd = {
+                        k: v
+                        for k, v in sd.items()
+                        if k in trainable_keys
+                    }
             if rank == 0:
                 torch.save(sd, os.path.join(args.out, "draft_finetuned.pt"))
                 print(f"saved step {step}", flush=True)

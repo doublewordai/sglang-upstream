@@ -55,7 +55,11 @@ def main():
         import train_draft
         sd = torch.load(args.ft_ckpt, map_location="cpu")
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        real_missing = [k for k in missing if "embed" not in k and "lm_head" not in k]
+        # only actual trainable parameters must be present in the overlay;
+        # frozen buffers (experts, kv_b, gate bias), embed and lm_head keep
+        # their original values and may be absent
+        trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+        real_missing = [k for k in missing if k in trainable]
         assert not real_missing and not unexpected, (real_missing, unexpected)
         print(f"overlaid {args.ft_ckpt}")
     # holdout_sessions=0: baseline eval over all data (train/val split is the

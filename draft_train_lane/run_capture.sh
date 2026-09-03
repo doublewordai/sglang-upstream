@@ -19,14 +19,25 @@ SESS=$S/grace-1m/lanes/workload/out/sessions_pi_measured.jsonl
 CORPUS=$S/grace-1m/lanes/workload/out/corpus_pi.txt
 TOK=/projects/s6p/hf/hub/models--zai-org--GLM-5.3/snapshots/e0b07fd2751b42d5efa199cc02c2b271deadc516/tokenizer.json
 DUR=${DURATION:-}   # empty = full session timeline (~4.5 h of traffic)
+# CAP as argv (bulletproof vs env-chain weirdness): bash run_capture.sh <capdir>
+CAP=${1:-${CAP:-$LANE/capture/real}}
 cd "$LANE"
+
+# single-instance lock: concurrent invocations clobber each other (shared
+# boot log + capture dir). A second instance exits immediately.
+exec 9>"$LANE/.capture-job.lock"
+if ! flock -n 9; then
+    echo "another capture job is running (lock held); exiting"
+    exit 1
+fi
 
 echo "=== capture job: HOLDER=$HOLDER DURATION=${DUR:-full} start $(date -u +%FT%TZ) ==="
 rm -rf "$CAP"; mkdir -p "$CAP"
 
 # 1. boot the capture rig
 SGLANG_DRAFT_CAPTURE_DIR=$CAP SGLANG_DRAFT_CAPTURE_TAG=prefill \
-  HOLDER=$HOLDER nohup bash $LANE/l3-launch-capture.sh > $LOGS/capjob-boot.out 2>&1 &
+  HOLDER=$HOLDER SMOKE=${SMOKE:-0} SMOKE_NODE=${SMOKE_NODE:-} MODEL=${MODEL:-} \
+  nohup bash $LANE/l3-launch-capture.sh > $LOGS/capjob-boot.out 2>&1 &
 BOOT=$!
 for i in $(seq 1 300); do
   grep -q "PD disagg system ready" $LOGS/capjob-boot.out && break
@@ -36,7 +47,7 @@ for i in $(seq 1 300); do
 done
 grep -q "PD disagg system ready" $LOGS/capjob-boot.out || { echo BOOT-TIMEOUT; exit 1; }
 echo SYSTEM-READY
-DECODE_MASTER=$(scontrol show hostnames "$(squeue -j "$HOLDER" -h -o %N)" | sed -n 5p)
+DECODE_MASTER=${DECODE_MASTER:-$(scontrol show hostnames "$(squeue -j "$HOLDER" -h -o %N)" | sed -n 5p)}
 
 # 2. replay
 echo "=== replay start $(date -u +%T) ==="
@@ -46,8 +57,8 @@ srun --overlap --jobid="$HOLDER" -N1 -n1 -w "$DECODE_MASTER" --gres=gpu:0 \
     export T_WITH_EP=1; source $S/runs/glm-isambard/U-uccl-send-abort/scripts/env-U.sh >/dev/null 2>&1
     cd $LANE && PYTHONDONTWRITEBYTECODE=1 ~/sglang-venv/bin/python '$REPLAY' '$SESS' \
       --base-url http://127.0.0.1:57200 --model glm-5.3-fp8 \
-      --concurrency 16 --gap-scale 1.0 --timeout 1800 $DURFLAG \
-      --tokenizer '$TOK' --corpus '$CORPUS' --out '$LANE/capture_replay_requests.jsonl'
+      --concurrency 16 --gap-scale 1.0 --timeout 1800 $DURFLAG $REPLAY_EXTRA \
+      --tokenizer '$TOK' --corpus '$CORPUS' --out '$CAP/requests.jsonl'
   " > $LOGS/capjob-replay.out 2>&1
 echo "replay exit=$? at $(date -u +%T)"
 tail -3 $LOGS/capjob-replay.out

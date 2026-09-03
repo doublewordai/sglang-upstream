@@ -52,3 +52,75 @@ marker density (per 2 MB): 1994 code fences, 3716 `def`, ~315 tool-JSON blocks.
 - Chain-rollout diagnostic on synthetic data: chain CE 13.3-15.0 vs parallel
   11.9 (unlearnable data — magnitudes meaningless, mechanics proven only).
 - No real-data per-segment numbers yet (needs capture).
+
+## Gate B — second drafter paradigm for code segments (AngelSpec-style routing)
+
+Supervisor deep-read (scout-arxiv-sweep, spec-drafter-paradigm-routing-deep /
+AngelSpec): no single drafter wins across workloads; complementary drafters
+(MTP for high-entropy chat; block-diffusion + predecessor-conditioned AR head
+for code/math) routed per request give **1.98-2.40x** on their segments, spec
+stays exact.
+
+**Routing signal** (this lane's tooling): `eval_draft.py --per-segment`
+top-1/est-accept-len by {prose, code, tool-JSON} on real capture — plus the
+per-DEPTH chain metrics per segment (extension planned: segment × depth).
+
+**Gate B (open a second-drafter lane) fires iff, on real data with the
+chain-trained MTP draft**: (1) code+JSON (37.4% of tokens) est-accept-len
+lag prose by ≥0.5 tokens/step at the prod depth, AND (2) the lag persists
+after objective/hparam tuning (the sweep shows depth stability is trainable —
+lr2e-4/w256 lifted depths 0→0.31-0.63 without any new architecture), AND
+(3) projected blended gain ≥ +0.15 accept tokens (i.e. the code drafter must
+close ≥40% of the segment's gap). A predecessor-conditioned AR head on the
+same draft trunk is the cheapest second paradigm (reuses capture + training
+stack; no block-diffusion infra).
+
+Current evidence: none yet (needs real capture per-segment numbers). The
+pilot's uniform dummy target cannot measure segment differentials.
+
+## P-EAGLE / DFlash fit (scout note: parallel-drafting-deep, 2026-09-03)
+
+**DFlash (verifier hidden states projected into the speculator KV)** — the
+best fit, and remarkably cheap for us: our DraftNextN is TRAINED on exactly
+this distribution — its input at every position is (x_t, TARGET hidden
+h_{t-1}) (teacher forcing; the capture provides target final-layer hiddens).
+The depth collapse we measured happens only because inference feeds the
+draft's OWN g back. The verify forward computes target hiddens for every
+verified position — an EAGLE-worker change that feeds those verifier hiddens
+into the draft's inputs (instead of / alongside the draft's g) puts the draft
+back on its training distribution with ZERO new training and no architecture
+change. Cheapest deep-K stability fix; candidate "Gate C-prime": try this
+worker path before any new drafter paradigm.
+
+**P-EAGLE (all draft positions from one verifier forward's hiddens)** —
+parallel multi-position heads on the verifier's hidden block; needs new
+output heads (x_{t+1..t+k} each from a shared trunk over verifier hiddens)
+and a custom verify shape. Our capture format (token, target hidden) per
+position trains it directly; our MLA trunk could host the heads. Medium fork
+surface; only if DFlash-style worker conditioning + chain training
+underdeliver on real data.
+
+Both keep spec exact (verify unchanged). Recorded, not built — real-data
+per-segment and depth numbers first.
+
+## EAGLE-3.1 depth pathologies (scout note: eagle31-postnorm-draft-deep)
+
+Two fixes to apply when training deeper drafts (depth-5 arm for the GLM-5.3
+report):
+1. **Attention drift toward own generated tokens at depth** — the chain
+   objective trains exactly this regime (self-feedback KV); the DFlash-style
+   worker conditioning (verifier hiddens into the draft inputs) removes it
+   outright. If neither suffices at depth 5 on real data, the explicit 3.1
+   attention constraint (rebalance toward verified-prefix positions) is an
+   architecture change — keep as the escalation.
+2. **Hidden-magnitude growth from the unnormalized residual (post-norm
+   fix)** — our NextN draft already has the norm discipline: the fed-back
+   chain hidden passes through `hnorm` (rms), the residual stream is
+   rms-normed before `lm_head` (`shared_head_norm`), and KV inputs are
+   `eh_proj([enorm(emb); hnorm(g)])` on normalized operands. The unbounded
+   residual accumulation the 3.1 post-norm fix targets is a multi-layer
+   drafter pathology; our single-layer NextN does not accumulate across
+   layers, but depth-5 chain rollout DOES accumulate across steps — the
+   depth-5 training arm should verify g-magnitude stability per depth
+   (add ||g||-by-depth to eval_draft if the real-data depth-5 arm shows
+   drift).
