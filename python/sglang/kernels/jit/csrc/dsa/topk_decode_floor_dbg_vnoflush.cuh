@@ -1,5 +1,5 @@
 /**
- * \file topk_decode_floor.cuh
+ * \file topk_decode_floor_dbg_vnoflush.cuh
  * \brief Byte-floor decode-time top-k (k <= 2048) for DSA indexers: ONE
  * persistent launch, each logits row read (almost) once, optional fused
  * page-table transform.
@@ -7,43 +7,36 @@
  * Replaces the 6-launch PDL chain of topk_decode_fg.cuh (two full reads per
  * row) with a single persistent kernel using two grid-wide spin barriers:
  *
- *   P0 plan   owner CTA (CTA r < B) samples its row (16 windows x 128 elems
- *             = 2048 elems, independent loads) into a smem coarse histogram
- *             and picks the capture threshold t_s = largest coarse bin whose
- *             scaled sample suffix >= min(6144, L/2). Naive rows (length <=
- *             topk) are deferred to P2.
+ *   P0 plan   owner CTA (CTA r < B) samples its row (16 coalesced 128-elem
+ *             windows = 2048 elems) into a smem coarse histogram and picks
+ *             the capture threshold t_s (largest coarse bin whose scaled
+ *             sample suffix >= ~6k). Rows with length <= cap capture
+ *             everything (t_s = 0) and can never fall back. Naive rows
+ *             (length <= topk) are deferred to P2.
  *   ---- grid barrier 1 ----
- *   P1 stream  THE read: block-cyclic (row, 4096-chunk) over the full grid;
- *             per element only convert + compare + ballot, and for the ~1%
- *             of elements with coarse bin >= t_s a warp-aggregated append
- *             (one smem atomicAdd per warp group) of (f16-key << 32 | pos)
- *             into the per-row global candidate list (smem-staged, one
- *             global atomicAdd per chunk flush). NO per-element histogram:
- *             the exact captured count IS count(bin >= t_s). Overflows past
- *             the cap set a flag.
+ *   P1 stream  THE read: block-cyclic (row, 4096-chunk) over the full grid.
+ *             Each CTA accumulates the EXACT full coarse histogram in smem
+ *             (flushed per row-switch with global atomics) and captures every
+ *             element with coarse bin >= t_s into the per-row global candidate
+ *             list ((f16-key << 32) | pos, u64, smem-staged, one global
+ *             atomicAdd per flush). Overflows past the cap set a flag.
  *   ---- grid barrier 2 ----
- *   P2 select owner CTA per row:
- *             fast path (no overflow and n_captured >= topk): the captured
- *             list provably contains the true top-k (count(bin >= t_s) >=
- *             topk means the top-k all have bin >= t_s = the capture
- *             threshold -- checked against the EXACT counter, never the
- *             sample, so exactness never depends on sample quality).
- *             overflow: select on the capped list (fg's documented
- *             inexactness class, cap = min(65536, stride)).
- *             under-capture (n_captured < topk, only when the sample
- *             overestimated): the owner alone re-streams its row building
- *             the full coarse histogram and capturing bin >= t_s - 1;
- *             if that still overflows or falls short, a second re-stream
- *             captures bin >= t_sel exactly (rare; slow; always exact up
- *             to the cap).
- *             Selection = fg's K4a+K4b fused: coarse hist of the list ->
- *             t_sel (largest bin with suffix >= topk; t_sel >= t_s) ->
- *             bin > t_sel -> output; bin == t_sel -> 256-bin sub-histogram
- *             (low byte of the f16 key) -> sub > t2 -> output; sub == t2 ->
- *             residual -> fg's exact 4-round fp32 radix refinement.
- *             Optional fused transform: out[j] = page_table[row][pos] for
- *             pos >= 0 else -1 (transform_index_page_table_decode's
- *             arithmetic, integer-exact).
+ *   P2 select owner CTA per row: suffix-scans the exact full histogram to
+ *             t_sel = largest bin with suffix >= topk, n_gt, r, n_eq (this
+ *             always satisfies t_sel >= t_s, so {bin > t_sel} and {bin ==
+ *             t_sel} are fully contained in the captured set). Fast path iff
+ *             no overflow AND suffix(t_s) >= topk -- then the captured list
+ *             is a superset of the true top-k, checked against the EXACT
+ *             histogram (never the sample), so exactness never depends on
+ *             sample quality. Otherwise the owner alone re-streams its row
+ *             capturing bin >= t_sel (a second full read; only when the
+ *             sample mispredicted or the threshold bin overflows the cap).
+ *             Selection = fg's K4a+K4b fused: bin > t_sel -> output;
+ *             bin == t_sel -> 256-bin sub-histogram (low byte of the f16
+ *             key) -> sub > t2 -> output; sub == t2 -> residual -> fg's
+ *             exact 4-round fp32 radix refinement. Optional fused transform:
+ *             out[j] = page_table[row][pos] for pos >= 0 else -1 (the
+ *             arithmetic of transform_index_page_table_decode, integer-exact).
  *
  * Semantics are topk_decode_fg's (= sgl_kernel topk_kernel's):
  *   - scores [B, stride] fp32/bf16, unit inner stride, only [0, length) read;
@@ -54,11 +47,12 @@
  *   - tie rule (fg's documented rule): boundary ties -- equal fp32 values at
  *     the k-th boundary -- are resolved arbitrarily (atomic arrival order);
  *   - inexactness class (fg's): if the threshold bin holds more candidates
- *     than the per-row cap, an arbitrary capped subset is refined. Unlike
- *     fg, overflow never leaves stale output slots: unwritten slots are -1.
+ *     than the per-row cap, an arbitrary capped subset is refined (default
+ *     cap = min(65536, stride), 16x production's 4096). Unlike fg, overflow
+ *     never leaves stale output slots: unwritten slots are filled with -1.
  *
  * Grid: G = clamp(ceil(B*stride/4096), B, 132*4) CTAs of 256 threads,
- * co-resident by construction (__launch_bounds__(256, 4), <= 34 KB smem), so
+ * co-resident by construction (__launch_bounds__(256, 4), 34 KB smem), so
  * the spin barriers cannot deadlock on an exclusive GPU. CUDA-graph safe:
  * no host syncs, fixed launch shape from (B, stride, cap); every consumed
  * workspace word is written before use within the same replay and re-zeroed
@@ -88,15 +82,17 @@ constexpr uint32_t kBlock = 256;
 constexpr uint32_t kChunk = 4096;  // elements per P1 unit (16/thread)
 constexpr uint32_t kWindow = 128;  // sample window (elems)
 constexpr uint32_t kWindows = 16;  // windows per row -> 2048 sample elems
-constexpr uint32_t kStage = 4096;  // u64 candidate staging entries (>= kChunk)
+constexpr uint32_t kStage = 4096;  // u64 candidate staging entries
 constexpr uint32_t kRStage = 2048; // i32 residual staging entries
 constexpr uint32_t kMaxTopK = 2048;
 constexpr uint32_t kCTAsPerSM = 4; // co-residency for the spin barriers
 constexpr uint32_t kMaxGrid = 132 * kCTAsPerSM;
 constexpr int64_t kSampleTarget = 6144; // capture-size target (~3x topk)
+// staging flush guard: headroom for one tile of appends (4/thread) + tail
+constexpr int kStageGuard = 4 * kBlock + 8;
 
 // smem layout (int32 words):
-//   [0, 256)                  s_hist   (P0b sample hist, P2 list/fallback hist)
+//   [0, 256)                  s_hist   (P0b sample hist, P1 exact hist)
 //   [256, 256 + 2*kStage)     s_cand   (P1 u64 staging)
 //   P2 aliases the s_cand region:
 //     [256, 256+2048)         s_outA
@@ -112,6 +108,7 @@ struct FloorTopKParams {
   const int32_t* __restrict__ lengths;    // [B]
   int32_t* __restrict__ out;              // [B, topk]
   const int32_t* __restrict__ page_table; // [B, pt_stride] or null (raw out)
+  int32_t* __restrict__ hist;             // [B, 256] exact full coarse hist
   int32_t* __restrict__ plan;             // [B, 8] {t_s}
   int32_t* __restrict__ counters;         // [B, 8] {n_captured, flags}
   unsigned long long* __restrict__ cand;  // [B, cap] (f16key << 32) | pos
@@ -138,24 +135,6 @@ SGL_DEVICE uint16_t sortable_f16(float x) {
 SGL_DEVICE uint32_t sortable_u32(float x) {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
-
-SGL_DEVICE unsigned long long pack_key_pos(uint16_t key, int64_t pos) {
-  return (static_cast<unsigned long long>(key) << 32) | static_cast<unsigned long long>(pos);
-}
-
-/// Conservative capture threshold for coarse bin t: the float value of the
-/// f16-sortable key ONE BELOW the bin's smallest key. `x >= this` is a
-/// SUPERSET of {key(x) >= t<<8} (floats just below the bin's lowest key
-/// still round UP into it under RNE, so the bin's own value would miss
-/// them); the exact key is recomputed per captured element anyway.
-SGL_DEVICE float capture_threshold_value(int t) {
-  if (t <= 0) return __int_as_float(0xff800000u); // -inf: capture everything
-  const uint16_t key_lo = static_cast<uint16_t>((t << 8) - 1);
-  const uint16_t bits =
-      (key_lo & 0x8000u) ? static_cast<uint16_t>(key_lo & 0x7FFFu)
-                         : static_cast<uint16_t>(~key_lo);
-  return __half2float(__ushort_as_half(bits));
 }
 
 template <typename T>
@@ -223,9 +202,18 @@ SGL_DEVICE void grid_sync(int* count, volatile int* release) {
   __syncthreads();
 }
 
+
+// debug: global timestamp in ns (coherent across CTAs)
+SGL_DEVICE unsigned long long dbg_timer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
 template <bool kUsePDL, typename T>
 __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const FloorTopKParams p) {
   device::PDLWaitPrimary<kUsePDL>(); // P0 reads the predecessor's logits
+  const unsigned long long dbg_t0 = (threadIdx.x == 0) ? dbg_timer() : 0;
   const uint32_t g = blockIdx.x;
   const uint32_t G = gridDim.x;
   const uint32_t b = p.batch;
@@ -244,7 +232,7 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
   int (*s_hist2)[kRadix + 1] =
       reinterpret_cast<int (*)[kRadix + 1]>(s_raw + kRadix + 2 * kMaxTopK + kRadix +
                                             2 * (kRadix + 1) + kRStage);
-  __shared__ int s_stage_n, s_cur_row, s_flush_base;
+  __shared__ int s_stage_n, s_cur_row, s_flush_base, s_do_flush;
   __shared__ int s_outA_n, s_outB_n, s_eq_n, s_rstage_n, s_resid_n;
   __shared__ int s_t, s_t2, s_n_eq, s_r, s_filled;
   __shared__ int s_last_remain, s_ctr, s_next_cnt;
@@ -260,13 +248,10 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
       for (uint32_t i = tid; i < kRadix; i += kBlock) s_hist[i] = 0;
       __syncthreads();
       const int64_t wstride = L / kWindows; // >= 128 because L > topk >= 2048
-      // 2048 independent sample loads (8 per thread)
-      for (int i = tid; i < static_cast<int>(kWindows) * static_cast<int>(kWindow);
-           i += kBlock) {
-        const int wi = i / kWindow;
-        const int off = i - wi * kWindow;
-        const int64_t pos = static_cast<int64_t>(wi) * wstride + off;
-        if (pos < L) atomicAdd(&s_hist[sortable_f16(to_float(rowp[pos])) >> 8], 1);
+      for (uint32_t wi = 0; wi < kWindows; ++wi) {
+        const int64_t base = static_cast<int64_t>(wi) * wstride;
+        for (int64_t i = base + tid; i < base + kWindow; i += kBlock)
+          atomicAdd(&s_hist[sortable_f16(to_float(rowp[i])) >> 8], 1);
       }
       __syncthreads();
       s_scan[0][kRadix] = 0;
@@ -274,34 +259,32 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
       if (tid < kRadix) s_scan[0][tid] = s_hist[tid];
       __syncthreads();
       suffix_scan_257(s_scan[0], s_scan[1]);
-      if (tid == 0) s_t = 0; // default: capture everything (tiny rows)
+      if (tid == 0) s_t = 0; // default: capture everything (small rows)
       __syncthreads();
       if (tid < kRadix) {
         // t_s = largest coarse bin whose scaled sample suffix >= target
         const int64_t sample_n = static_cast<int64_t>(kWindows) * kWindow;
-        const int64_t target = min(kSampleTarget, static_cast<int64_t>(L) / 2);
         const int64_t cur = static_cast<int64_t>(s_scan[0][tid]) * L / sample_n;
         const int64_t next = static_cast<int64_t>(s_scan[0][tid + 1]) * L / sample_n;
-        if (cur >= target && next < target) s_t = static_cast<int>(tid);
+        if (cur >= kSampleTarget && next < kSampleTarget) s_t = static_cast<int>(tid);
       }
       __syncthreads();
-      if (tid == 0) {
-        p.plan[static_cast<int64_t>(r) * 8 + 0] = s_t;
-        // capture test value: {x >= v_s} is a superset of {bin(x) >= t_s}
-        // (NaN handled in the stream by an isnan test)
-        p.plan[static_cast<int64_t>(r) * 8 + 1] =
-            __float_as_uint(capture_threshold_value(s_t));
-      }
+      int t_s = s_t;
+      if (static_cast<int64_t>(L) <= static_cast<int64_t>(p.cap)) t_s = 0; // exact, never falls back
+      if (tid == 0) p.plan[static_cast<int64_t>(r) * 8 + 0] = t_s;
     }
+    if (tid == 0 && p.stats != nullptr) p.stats[static_cast<int64_t>(r) * 8 + 4] = (int32_t)(dbg_timer() - dbg_t0);
   }
 
   grid_sync(p.barrier + 0, reinterpret_cast<volatile int*>(p.barrier + 1));
 
   // ---------------- P1: the single streaming read + capture ----------------
   {
+    for (uint32_t i = tid; i < kRadix; i += kBlock) s_hist[i] = 0;
     if (tid == 0) {
       s_stage_n = 0;
       s_cur_row = -1;
+      s_do_flush = 0;
     }
     __syncthreads();
 
@@ -327,6 +310,20 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
       __syncthreads();
     };
 
+    // flush the exact coarse histogram into hist[row]; all threads
+    auto flush_hist = [&]() {
+      __syncthreads();
+      const int row = s_cur_row;
+      if (row >= 0 && tid < kRadix) {
+        const int v = s_hist[tid];
+        if (v != 0) {
+          atomicAdd(&p.hist[static_cast<int64_t>(row) * kRadix + tid], v);
+          s_hist[tid] = 0;
+        }
+      }
+      __syncthreads();
+    };
+
     auto chunks_of_row = [&](uint32_t r) -> uint32_t {
       const int32_t L = p.lengths[r];
       if (L <= static_cast<int32_t>(p.topk)) return 0;
@@ -337,7 +334,7 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
 
     for (uint32_t u = g; u < total; u += G) {
       // map flat chunk index -> (row, chunk); every CTA visits rows in
-      // increasing order, so staging can be flushed on row switch
+      // increasing order, so per-row smem state can be flushed on switch
       uint32_t r = 0, ci = 0, acc = 0;
       for (uint32_t rr = 0; rr < b; ++rr) {
         const uint32_t n = chunks_of_row(rr);
@@ -346,6 +343,7 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
       }
       if (s_cur_row != static_cast<int>(r)) {
         flush_stage();
+        flush_hist();
         if (tid == 0) s_cur_row = static_cast<int>(r);
         __syncthreads();
       }
@@ -353,58 +351,44 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
       const int64_t beg = static_cast<int64_t>(ci) * kChunk;
       const int64_t end = min(beg + kChunk, static_cast<int64_t>(L));
       const T* rowp = rowp_of + static_cast<int64_t>(r) * p.stride;
-      const float v_s = __uint_as_float(
-          static_cast<uint32_t>(p.plan[static_cast<int64_t>(r) * 8 + 1]));
+      const uint32_t t_s = static_cast<uint32_t>(p.plan[static_cast<int64_t>(r) * 8 + 0]);
 
-      // capture test = one float compare (+ isnan); the exact f16 key is
-      // computed only for captured elements. ONE smem atomicAdd per float4
-      // group, reserving ALL its kept slots at once. Appends per chunk
-      // <= kChunk <= kStage.
-      auto process4 = [&](int64_t pos, const float (&x)[4]) {
-        int cnt = 0;
-#pragma unroll
-        for (int e = 0; e < 4; ++e)
-          if (x[e] >= v_s || x[e] != x[e]) ++cnt;
-        if (cnt != 0) {
-          const int base = atomicAdd(&s_stage_n, cnt);
-          int w = 0;
-#pragma unroll
-          for (int e = 0; e < 4; ++e) {
-            if (x[e] >= v_s || x[e] != x[e]) {
-              s_cand[base + w] = pack_key_pos(sortable_f16(x[e]), pos + e);
-              ++w;
-            }
-          }
-        }
-      };
-      auto process1 = [&](int64_t pos, float x) {
-        if (x >= v_s || x != x) {
+      auto process = [&](int64_t pos, float x) {
+        const uint16_t key = sortable_f16(x);
+        atomicAdd(&s_hist[key >> 8], 1);
+        if ((key >> 8) >= t_s) {
           const int slot = atomicAdd(&s_stage_n, 1);
-          s_cand[slot] = pack_key_pos(sortable_f16(x), pos);
+          s_cand[slot] = (static_cast<unsigned long long>(key) << 32) |
+                         static_cast<unsigned long long>(pos);
         }
       };
 
+      // no syncs inside the chunk: worst case one append per element = kChunk
+      // = kStage, flushed at the chunk boundary (a uniform loop iteration)
       if (p.aligned) {
         const int64_t n4 = (end - beg) >> 2;
-        for (int64_t grp = tid; grp < n4; grp += kBlock) {
+        for (int64_t g = tid; g < n4; g += kBlock) {
           float x[4];
-          load4<T>(rowp + beg + grp * 4, x);
-          process4(beg + grp * 4, x);
+          load4<T>(rowp + beg + g * 4, x);
+#pragma unroll
+          for (int e = 0; e < 4; ++e) process(beg + g * 4 + e, x[e]);
         }
         for (int64_t i = beg + (n4 << 2) + tid; i < end; i += kBlock)
-          process1(i, to_float(rowp[i])); // <= 3 appends: fits kStage headroom
+          process(i, to_float(rowp[i]));
       } else {
-        for (int64_t i = beg + tid; i < end; i += kBlock) process1(i, to_float(rowp[i]));
+        for (int64_t i = beg + tid; i < end; i += kBlock) process(i, to_float(rowp[i]));
       }
-      flush_stage(); // chunk boundary: appends this chunk <= kChunk <= kStage
+      // (vnoflush: no per-chunk flush)
     }
-    flush_stage();
+    flush_hist();
   }
 
   grid_sync(p.barrier + 2, reinterpret_cast<volatile int*>(p.barrier + 3));
+  const unsigned long long dbg_t2 = (threadIdx.x == 0) ? dbg_timer() : 0;
 
   // ---------------- P2: verify + select (owner CTA per row) ----------------
   if (g < b) {
+    if (threadIdx.x == 0 && p.stats != nullptr) p.stats[static_cast<int64_t>(g) * 8 + 5] = (int32_t)(dbg_t2 - dbg_t0);
     const uint32_t r = g;
     const int32_t L = p.lengths[r];
     int32_t* out_row = p.out + static_cast<int64_t>(r) * p.topk;
@@ -434,157 +418,113 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
         }
       }
     } else {
+      // exact full-histogram suffix scan -> t_sel, n_eq, r
+      s_scan[0][kRadix] = 0;
+      s_scan[1][kRadix] = 0;
+      if (tid < kRadix) s_scan[0][tid] = p.hist[static_cast<int64_t>(r) * kRadix + tid];
+      __syncthreads();
+      suffix_scan_257(s_scan[0], s_scan[1]);
+      if (tid == 0) { s_t = -1; s_filled = 0; }
+      __syncthreads();
+      if (tid < kRadix) {
+        if (s_scan[0][tid] >= static_cast<int>(p.topk) &&
+            s_scan[0][tid + 1] < static_cast<int>(p.topk)) {
+          s_t = static_cast<int>(tid);
+          s_n_eq = s_scan[0][tid] - s_scan[0][tid + 1];
+          s_r = static_cast<int>(p.topk) - s_scan[0][tid + 1];
+        }
+      }
+      __syncthreads();
+      const int t_sel = s_t;
+      const int r_need = s_r;
       int flags = 0;
-      const int t_s = p.plan[static_cast<int64_t>(r) * 8 + 0];
-      const int n_cap = p.counters[static_cast<int64_t>(r) * 8 + 0];
-      const int ovfl = p.counters[static_cast<int64_t>(r) * 8 + 1] & 2;
-
-      int n_list;
-      bool have_full_hist = false;
-      if (!ovfl && n_cap >= static_cast<int>(p.topk)) {
-        // fast path: the P1 list provably contains the true top-k
-        n_list = n_cap;
+      if (t_sel < 0) {
+        // impossible (suffix(0) = L > topk, suffix(256) = 0); bail defensively
+        // but keep the workspace clean for the next replay
+        flags |= 4;
+        for (uint32_t j = tid; j < p.topk; j += kBlock) write_out(j, -1);
+        if (tid < kRadix) p.hist[static_cast<int64_t>(r) * kRadix + tid] = 0;
+        if (tid == 0) {
+          p.counters[static_cast<int64_t>(r) * 8 + 0] = 0;
+          p.counters[static_cast<int64_t>(r) * 8 + 1] = 0;
+          if (p.stats != nullptr) {
+            p.stats[static_cast<int64_t>(r) * 4 + 0] = 0;
+            p.stats[static_cast<int64_t>(r) * 4 + 1] = 0;
+            p.stats[static_cast<int64_t>(r) * 4 + 2] = 0;
+            p.stats[static_cast<int64_t>(r) * 4 + 3] = flags;
+          }
+        }
       } else {
-        // under-capture (sample overestimated) or cap overflow: the owner
-        // alone re-streams the row building the FULL coarse histogram,
-        // capturing >= t_s - 1 (under-capture) or nothing (overflow; the
-        // tight t_sel capture follows in tier-2)
-        flags |= 1;
-        const bool fb_overflow = ovfl != 0;
-        const uint32_t t_f1 = fb_overflow ? 255u : static_cast<uint32_t>(max(t_s - 1, 0));
-        const float v_f1 = fb_overflow
-                               ? __int_as_float(0x7f800000) // +inf: capture nothing
-                               : capture_threshold_value(static_cast<int>(t_f1));
-        for (uint32_t i = tid; i < kRadix; i += kBlock) s_hist[i] = 0;
-        if (tid == 0) s_stage_n = 0;
-        __syncthreads();
-        int64_t kept = 0;
-        auto fb_process = [&](int64_t pos, float x) {
-          const uint16_t key = sortable_f16(x);
-          atomicAdd(&s_hist[key >> 8], 1);
-          if (x >= v_f1 || x != x) {
-            const int slot = atomicAdd(&s_stage_n, 1);
-            if (slot < static_cast<int>(kStage)) s_cand[slot] = pack_key_pos(key, pos);
-          }
-        };
-        // (chunked to flush the staging; full hist always accumulated)
-        for (int64_t c0 = 0; c0 < L; c0 += kChunk) {
-          const int64_t beg = c0;
-          const int64_t end = min(c0 + kChunk, static_cast<int64_t>(L));
-          if (p.aligned) {
-            const int64_t n4 = (end - beg) >> 2;
-            for (int64_t grp = tid; grp < n4; grp += kBlock) {
-              float x[4];
-              load4<T>(rowp + beg + grp * 4, x);
-#pragma unroll
-              for (int e = 0; e < 4; ++e) fb_process(beg + grp * 4 + e, x[e]);
-            }
-            for (int64_t i = beg + (n4 << 2) + tid; i < end; i += kBlock)
-              fb_process(i, to_float(rowp[i]));
-          } else {
-            for (int64_t i = beg + tid; i < end; i += kBlock) fb_process(i, to_float(rowp[i]));
-          }
+        const int t_s = p.plan[static_cast<int64_t>(r) * 8 + 0];
+        const int suffix_ts = s_scan[0][t_s];
+        const int ovfl = p.counters[static_cast<int64_t>(r) * 8 + 1] & 2;
+        const int n_cap = p.counters[static_cast<int64_t>(r) * 8 + 0];
+
+        int n_list;
+        if (!ovfl && suffix_ts >= static_cast<int>(p.topk)) {
+          n_list = n_cap; // == suffix(t_s): fast path, captured ⊇ true top-k
+        } else {
+          // fallback: this owner alone re-streams the row, capturing bin >= t_sel
+          flags |= 1;
+          const uint32_t t_sel_u = static_cast<uint32_t>(t_sel);
+          if (tid == 0) { s_stage_n = 0; s_do_flush = 0; }
           __syncthreads();
-          // local flush into cand
-          const int n = s_stage_n;
-          const int n_store = min(n, static_cast<int>(p.cap) - static_cast<int>(kept));
-          if (n_store < n) flags |= 2;
-          unsigned long long* dst = p.cand + static_cast<int64_t>(r) * p.cap + kept;
-          for (int i = tid; i < n_store; i += kBlock) dst[i] = s_cand[i];
-          kept += n;
-          if (tid == 0) s_stage_n = 0;
-          __syncthreads();
-        }
-        // full hist -> t_sel
-        s_scan[0][kRadix] = 0;
-        s_scan[1][kRadix] = 0;
-        for (uint32_t i = tid; i < kRadix; i += kBlock) s_scan[0][i] = s_hist[i];
-        __syncthreads();
-        suffix_scan_257(s_scan[0], s_scan[1]);
-        if (tid == 0) s_t = -1;
-        __syncthreads();
-        if (tid < kRadix) {
-          if (s_scan[0][tid] >= static_cast<int>(p.topk) &&
-              s_scan[0][tid + 1] < static_cast<int>(p.topk))
-            s_t = static_cast<int>(tid);
-        }
-        __syncthreads();
-        have_full_hist = true;
-        const int64_t count_f1 = (t_f1 == 0)
-                                     ? static_cast<int64_t>(L)
-                                     : static_cast<int64_t>(s_scan[0][t_f1]);
-        if (fb_overflow || kept > static_cast<int64_t>(p.cap) || count_f1 < static_cast<int>(p.topk)) {
-          // tier-2: capture >= t_sel exactly (slow path; pathological only)
-          const uint32_t t_f2 = static_cast<uint32_t>(max(s_t, 0));
-          const float v_f2 = capture_threshold_value(static_cast<int>(t_f2));
-          if (tid == 0) s_stage_n = 0;
-          __syncthreads();
-          kept = 0;
-          for (int64_t c0 = 0; c0 < L; c0 += kChunk) {
-            const int64_t beg = c0;
-            const int64_t end = min(c0 + kChunk, static_cast<int64_t>(L));
-            for (int64_t i = beg + tid; i < end; i += kBlock) {
-              const float x = to_float(rowp[i]);
-              if (x >= v_f2 || x != x) {
-                const uint16_t key = sortable_f16(x);
-                const int slot = atomicAdd(&s_stage_n, 1);
-                if (slot < static_cast<int>(kStage)) s_cand[slot] = pack_key_pos(key, i);
-              }
-            }
-            __syncthreads();
-            const int n = s_stage_n;
+          int64_t kept = 0;
+          auto fb_store = [&](int n) {
             const int n_store = min(n, static_cast<int>(p.cap) - static_cast<int>(kept));
-            if (n_store < n) flags |= 2;
+            if (n_store < n) flags |= 2; // cap overflow (fg's inexactness class)
             unsigned long long* dst = p.cand + static_cast<int64_t>(r) * p.cap + kept;
             for (int i = tid; i < n_store; i += kBlock) dst[i] = s_cand[i];
             kept += n;
-            if (tid == 0) s_stage_n = 0;
-            __syncthreads();
+          };
+          auto fb_process = [&](int64_t pos, float x) {
+            const uint16_t key = sortable_f16(x);
+            if ((key >> 8) >= t_sel_u) {
+              const int slot = atomicAdd(&s_stage_n, 1);
+              s_cand[slot] = (static_cast<unsigned long long>(key) << 32) |
+                             static_cast<unsigned long long>(pos);
+            }
+          };
+          if (p.aligned) {
+            const int64_t n4all = L >> 2;
+            for (int64_t c0 = 0; c0 < L; c0 += kChunk) {
+              const int64_t beg = c0;
+              const int64_t end = min(c0 + kChunk, static_cast<int64_t>(L));
+              const int64_t n4 = (end - beg) >> 2;
+              for (int64_t g = tid; g < n4; g += kBlock) {
+                float x[4];
+                load4<T>(rowp + beg + g * 4, x);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) fb_process(beg + g * 4 + e, x[e]);
+              }
+              for (int64_t i = beg + (n4 << 2) + tid; i < end; i += kBlock)
+                fb_process(i, to_float(rowp[i]));
+              __syncthreads();
+              fb_store(s_stage_n);
+              if (tid == 0) s_stage_n = 0;
+              __syncthreads();
+            }
+          } else {
+            for (int64_t c0 = 0; c0 < L; c0 += kChunk) {
+              const int64_t beg = c0;
+              const int64_t end = min(c0 + kChunk, static_cast<int64_t>(L));
+              for (int64_t i = beg + tid; i < end; i += kBlock)
+                fb_process(i, to_float(rowp[i]));
+              __syncthreads();
+              fb_store(s_stage_n);
+              if (tid == 0) s_stage_n = 0;
+              __syncthreads();
+            }
           }
+          n_list = static_cast<int>(min(kept, static_cast<int64_t>(p.cap)));
+          if (kept > static_cast<int64_t>(p.cap)) flags |= 2;
         }
-        n_list = static_cast<int>(min(kept, static_cast<int64_t>(p.cap)));
-      }
 
-      // ---- coarse hist of the list -> t_sel (skip if full hist known) ----
-      const unsigned long long* list = p.cand + static_cast<int64_t>(r) * p.cap;
-      if (!have_full_hist) {
-        for (uint32_t i = tid; i < kRadix; i += kBlock) s_hist[i] = 0;
-        __syncthreads();
-        for (int i = tid; i < n_list; i += kBlock) {
-          const unsigned long long e = list[i];
-          atomicAdd(&s_hist[static_cast<uint16_t>(e >> 32) >> 8], 1);
-        }
-        __syncthreads();
-        s_scan[0][kRadix] = 0;
-        s_scan[1][kRadix] = 0;
-        for (uint32_t i = tid; i < kRadix; i += kBlock) s_scan[0][i] = s_hist[i];
-        __syncthreads();
-        suffix_scan_257(s_scan[0], s_scan[1]);
-        if (tid == 0) s_t = -1;
-        __syncthreads();
-        if (tid < kRadix) {
-          if (s_scan[0][tid] >= static_cast<int>(p.topk) &&
-              s_scan[0][tid + 1] < static_cast<int>(p.topk))
-            s_t = static_cast<int>(tid);
-        }
-        __syncthreads();
-      }
-      const int t_sel = s_t;
-      const int r_need0 = (t_sel >= 0) ? static_cast<int>(p.topk) - s_scan[0][t_sel + 1] : 0;
-      int r_need = r_need0;
-      if (tid == 0) s_n_eq = (t_sel >= 0) ? s_scan[0][t_sel] - s_scan[0][t_sel + 1] : 0;
-      if (t_sel < 0) {
-        // impossible when n_list >= topk; capped-overflow corner only
-        flags |= 4;
-        for (uint32_t j = tid; j < p.topk; j += kBlock) write_out(j, -1);
-        r_need = 0;
-      }
-
-      if (t_sel >= 0) {
-        // ---- pass 1: bin > t_sel -> outA; bin == t_sel -> sub-hist ----
-        if (tid == 0) { s_outA_n = 0; s_eq_n = 0; s_filled = 0; }
+        // ---- selection over cand[r][0, n_list) ----
+        if (tid == 0) { s_outA_n = 0; s_eq_n = 0; }
         for (uint32_t i = tid; i < kRadix; i += kBlock) s_sub[i] = 0;
         __syncthreads();
+        const unsigned long long* list = p.cand + static_cast<int64_t>(r) * p.cap;
         for (int i = tid; i < n_list; i += kBlock) {
           const unsigned long long e = list[i];
           const uint16_t key = static_cast<uint16_t>(e >> 32);
@@ -600,8 +540,8 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
         __syncthreads();
         const int nA = s_outA_n;
 
-        // sub-bin threshold t2 (fg plan2 semantics); absent crossing
-        // (eq exhausted below r_need, cap-overflow class) -> -1 = take all
+        // sub-bin threshold t2 (fg K4a/K4-plan2 semantics); absent crossing
+        // (eq exhausted below r_need, cap-overflow class only) -> -1 = take all
         s_scan[0][kRadix] = 0;
         s_scan[1][kRadix] = 0;
         for (uint32_t i = tid; i < kRadix; i += kBlock) s_scan[0][i] = s_sub[i];
@@ -615,7 +555,7 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
         __syncthreads();
         const int t2 = s_t2;
 
-        // ---- pass 2: bin == t_sel: sub > t2 -> outB, sub == t2 -> resid ----
+        // pass 2: bin == t_sel: sub > t2 -> outB, sub == t2 -> residual list
         if (tid == 0) { s_outB_n = 0; s_rstage_n = 0; s_resid_n = 0; }
         __syncthreads();
         for (int base = 0; base < n_list; base += kRStage) {
@@ -654,7 +594,7 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
 
         // ---- K4b: exact fp32 radix refinement over the residual ----
         const int n2 = (t2 >= 0 && r2 > 0) ? s_resid_n : 0;
-        if (r2 > 0 && n2 <= 0) flags |= 4;
+        if (r2 > 0 && n2 <= 0) flags |= 4; // residual empty but r2 > 0: inconsistent
         if (n2 > 0) {
           const int32_t* src = p.resid + static_cast<int64_t>(r) * p.cap;
           int32_t* dst = p.resid2 + static_cast<int64_t>(r) * p.cap;
@@ -728,17 +668,19 @@ __global__ __launch_bounds__(kBlock, kCTAsPerSM) void floor_topk_kernel(const Fl
         const int filled = s_filled;
         for (int j = filled + tid; j < static_cast<int>(p.topk); j += kBlock)
           write_out(j, -1);
-      }
 
-      // self-clean: counters (hist is smem-only now)
-      if (tid == 0) {
-        p.counters[static_cast<int64_t>(r) * 8 + 0] = 0;
-        p.counters[static_cast<int64_t>(r) * 8 + 1] = 0;
-        if (p.stats != nullptr) {
-          p.stats[static_cast<int64_t>(r) * 4 + 0] = s_n_eq;
-          p.stats[static_cast<int64_t>(r) * 4 + 1] = s_eq_n;
-          p.stats[static_cast<int64_t>(r) * 4 + 2] = r_need;
-          p.stats[static_cast<int64_t>(r) * 4 + 3] = flags;
+        // self-clean: hist + counters (consumed above)
+        if (tid < kRadix) p.hist[static_cast<int64_t>(r) * kRadix + tid] = 0;
+        if (tid == 0) {
+          p.counters[static_cast<int64_t>(r) * 8 + 0] = 0;
+          p.counters[static_cast<int64_t>(r) * 8 + 1] = 0;
+          if (p.stats != nullptr) {
+            p.stats[static_cast<int64_t>(r) * 8 + 6] = (int32_t)(dbg_timer() - dbg_t0);
+            p.stats[static_cast<int64_t>(r) * 8 + 0] = s_n_eq;
+            p.stats[static_cast<int64_t>(r) * 4 + 1] = s_eq_n;
+            p.stats[static_cast<int64_t>(r) * 4 + 2] = r_need;
+            p.stats[static_cast<int64_t>(r) * 4 + 3] = flags;
+          }
         }
       }
     }
@@ -801,7 +743,7 @@ struct TopKDecodeFloor {
 
     int32_t* stats_ptr = nullptr;
     if (stats.has_value()) {
-      TensorMatcher({B, 4}).with_dtype<int32_t>().with_device(device).verify(stats.value());
+      TensorMatcher({B, 8}).with_dtype<int32_t>().with_device(device).verify(stats.value());
       stats_ptr = static_cast<int32_t*>(stats.value().data_ptr());
     }
 
@@ -812,10 +754,10 @@ struct TopKDecodeFloor {
     RuntimeCheck(batch > 0 && batch <= kMaxRows, "batch too large for the persistent grid");
     RuntimeCheck(cap > topk, "cap must exceed topk");
 
-    // [barrier 8 | plan B*8 | counters B*8 | (pad) | cand B*cap u64
-    //  | resid B*cap | resid2 B*cap]
+    // [barrier 8 | hist B*256 | plan B*8 | counters B*8 | (pad) | cand B*cap
+    //  u64 | resid B*cap | resid2 B*cap]
     const int64_t n_head = 8;
-    const int64_t n_small = n_head + static_cast<int64_t>(batch) * (8 + 8);
+    const int64_t n_small = n_head + static_cast<int64_t>(batch) * (kRadix + 8 + 8);
     const int64_t cand_off = n_small + (n_small & 1); // 8B-align the u64 list
     const int64_t need = cand_off + 4 * static_cast<int64_t>(batch) * cap;
     RuntimeCheck(static_cast<int64_t>(W.unwrap()) >= need, "workspace too small");
@@ -830,8 +772,9 @@ struct TopKDecodeFloor {
         .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
         .out = static_cast<int32_t*>(out.data_ptr()),
         .page_table = pt_ptr,
-        .plan = ws + 8,
-        .counters = ws + 8 + static_cast<int64_t>(batch) * 8,
+        .hist = ws + 8,
+        .plan = ws + 8 + static_cast<int64_t>(batch) * kRadix,
+        .counters = ws + 8 + static_cast<int64_t>(batch) * (kRadix + 8),
         .cand = reinterpret_cast<unsigned long long*>(ws + cand_off),
         .resid = ws + cand_off + 2 * static_cast<int64_t>(batch) * cap,
         .resid2 = ws + cand_off + 3 * static_cast<int64_t>(batch) * cap,

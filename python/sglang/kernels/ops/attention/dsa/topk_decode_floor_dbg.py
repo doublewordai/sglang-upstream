@@ -1,4 +1,4 @@
-"""Byte-floor decode-time top-k for DSA indexers (see jit/csrc/dsa/topk_decode_floor.cuh).
+"""Byte-floor decode-time top-k for DSA indexers (see jit/csrc/dsa/topk_decode_floor_dbg.cuh).
 
 One persistent launch (two in-kernel grid barriers) that reads each logits row
 ONCE (plus a 2048-element sample and, on rows where the sample mispredicts the
@@ -23,13 +23,13 @@ from sglang.kernels.jit.utils import (
 
 
 @cache_once
-def _jit_topk_decode_floor_module():
+def _jit_topk_decode_floor_dbg_module():
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        "dsa_topk_decode_floor",
+        "dsa_topk_decode_floor_dbg_dbg",
         *args,
-        cuda_files=["dsa/topk_decode_floor.cuh"],
-        cuda_wrappers=[("topk_decode_floor", f"TopKDecodeFloor<{args}>::run")],
+        cuda_files=["dsa/topk_decode_floor_dbg.cuh"],
+        cuda_wrappers=[("topk_decode_floor_dbg", f"TopKDecodeFloor<{args}>::run")],
     )
 
 
@@ -45,13 +45,13 @@ def _get_workspace(batch: int, cap: int, device: torch.device) -> torch.Tensor:
     key = (batch, cap, str(device))
     ws = _WORKSPACE_CACHE.get(key)
     if ws is None:
-        n_ints = 8 + batch * (8 + 8) + 4 * batch * cap + 2
+        n_ints = 8 + batch * (256 + 8 + 8) + 4 * batch * cap + 2
         ws = torch.zeros(n_ints, dtype=torch.int32, device=device)
         _WORKSPACE_CACHE[key] = ws
     return ws
 
 
-def topk_decode_floor(
+def topk_decode_floor_dbg(
     scores: torch.Tensor,
     lengths: torch.Tensor,
     topk: int,
@@ -73,7 +73,7 @@ def topk_decode_floor(
             when given, output positions are transformed through it
             (``out = page_table[row, pos]``, ``-1`` passthrough) in the same
             launch.
-        return_stats: also return ``[B, 4]`` int32
+        return_stats: also return ``[B, 8]`` (debug: 4-6 = phase timings ns) int32
             ``{n_eq, n_eq_stored, r, flags}`` (flags: 1=fallback re-read,
             2=cap overflow, 4=inconsistent).
 
@@ -85,7 +85,7 @@ def topk_decode_floor(
     batch = scores.shape[0]
     if batch == 0:
         out = torch.empty((0, topk), dtype=torch.int32, device=scores.device)
-        return (out, torch.empty((0, 4), dtype=torch.int32, device=scores.device)) if return_stats else out
+        return (out, torch.empty((0, 8), dtype=torch.int32, device=scores.device)) if return_stats else out
     if cap is None:
         cap = min(_DEFAULT_CAP, max(topk + 1, scores.shape[1]))
     if lengths.dtype != torch.int32 or lengths.stride(0) != 1:
@@ -96,11 +96,11 @@ def topk_decode_floor(
 
     out = torch.empty((batch, topk), dtype=torch.int32, device=scores.device)
     stats = (
-        torch.zeros((batch, 4), dtype=torch.int32, device=scores.device)
+        torch.zeros((batch, 8), dtype=torch.int32, device=scores.device)
         if return_stats
         else None
     )
     ws = _get_workspace(batch, cap, scores.device)
-    module = _jit_topk_decode_floor_module()
-    module.topk_decode_floor(scores, lengths, out, page_table, ws, cap, stats)
+    module = _jit_topk_decode_floor_dbg_module()
+    module.topk_decode_floor_dbg(scores, lengths, out, page_table, ws, cap, stats)
     return (out, stats) if return_stats else out
