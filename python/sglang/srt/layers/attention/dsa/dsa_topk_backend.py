@@ -63,6 +63,32 @@ class DSATopKBackend(Enum):
         )
 
     @staticmethod
+    def _should_use_decode_ballot(
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor],
+    ) -> bool:
+        """Gate the warp-ballot one-read decode top-k
+        (SGLANG_DSA_TOPK_DECODE_BALLOT).
+
+        Same shape domain as the fg kernel; takes precedence over floor and fg
+        when set (one full read + a ~0.8% windowed sample instead of two full
+        reads; per-element work is a compare + warp ballot; miss rows fall
+        back device-side to the fg 2-pass chain).
+        """
+        return (
+            envs.SGLANG_DSA_TOPK_DECODE_BALLOT.get()
+            and row_starts is None
+            and score.dim() == 2
+            and score.stride(1) == 1
+            and 0 < topk <= 2048
+            and 0 < score.shape[0] <= 64
+            and score.dtype in (torch.float32, torch.bfloat16)
+            and score.is_cuda
+        )
+
+    @staticmethod
     def _should_use_decode_floor(
         score: torch.Tensor,
         lengths: torch.Tensor,
@@ -96,6 +122,13 @@ class DSATopKBackend(Enum):
         warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
+            if self._should_use_decode_ballot(score, lengths, topk, row_starts):
+                from sglang.kernels.ops.attention.dsa.topk_ballot import (
+                    topk_ballot,
+                )
+
+                return topk_ballot(score, lengths, topk)
+
             if self._should_use_decode_floor(score, lengths, topk, row_starts):
                 from sglang.kernels.ops.attention.dsa.topk_decode_floor import (
                     topk_decode_floor,
@@ -217,6 +250,30 @@ class DSATopKBackend(Enum):
             prefill_bs = (
                 cu_seqlens_q_topk.shape[0] - 1 if cu_seqlens_q_topk is not None else None
             )
+            if (
+                envs.SGLANG_DSA_TOPK_PREFILL_BALLOT.get()
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and 0 < topk <= 2048
+                and prefill_bs is not None
+                and prefill_bs <= logits.shape[0]
+                and (row_starts is not None or prefill_bs != logits.shape[0])
+                and logits.dtype == torch.float32
+                and logits.dim() == 2
+                and logits.stride(1) == 1
+            ):
+                from sglang.kernels.ops.attention.dsa.topk_ballot import (
+                    topk_transform_prefill_ballot,
+                )
+
+                return topk_transform_prefill_ballot(
+                    score=logits,
+                    lengths=lengths,
+                    page_table_size_1=page_table_size_1,
+                    cu_seqlens_q=cu_seqlens_q_topk,
+                    topk=topk,
+                    row_starts=row_starts,
+                )
+
             if (
                 envs.SGLANG_DSA_TOPK_PREFILL_1PASS.get()
                 and topk_transform_method == TopkTransformMethod.PAGED
