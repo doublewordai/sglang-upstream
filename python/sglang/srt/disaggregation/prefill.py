@@ -1263,7 +1263,6 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
         )
         for req in batch.reqs:
-            req.pdho_prepped = None
             try:
                 if req.disagg_kv_sender is None or req.pending_bootstrap:
                     cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="nosender" if req.disagg_kv_sender is None else "pending")
@@ -1312,7 +1311,7 @@ class SchedulerDisaggregationPrefillMixin:
                     end=end,
                     last=1 if last_chunk else 0,
                 )
-                req.pdho_prepped = {
+                stash = {
                     "start": start,
                     "end": end,
                     "last": last_chunk,
@@ -1322,6 +1321,18 @@ class SchedulerDisaggregationPrefillMixin:
                     # the post-insert dedup reconcile
                     "fresh": row_raw.cpu().numpy().astype(np.int64),
                 }
+                # Deque: the stash staged at fwd k's launch is consumed at fwd
+                # k's OWN result processing (one loop iteration later), which
+                # runs after fwd k's copy_done sync -- so the KV is written.
+                # A single slot would be consumed one result too early (at fwd
+                # k-1's result, while fwd k still runs -> read/write race).
+                q = getattr(req, "pdho_prepped_q", None)
+                if q is None:
+                    q = deque()
+                    req.pdho_prepped_q = q
+                q.append(stash)
+                while len(q) > 4:
+                    q.popleft()
             except Exception as e:  # noqa: BLE001
                 req.pdho_prepped = None
                 logger.warning("pdho prestage failed for %s: %s", req.rid, e)
@@ -1329,8 +1340,8 @@ class SchedulerDisaggregationPrefillMixin:
     def _pdho_early_send(self: Scheduler, req: Req, next_token_id) -> bool:
         """Issue the pre-staged chunk send with no GPU access. Returns False
         when the caller must fall back to send_kv_chunk."""
-        prepped = getattr(req, "pdho_prepped", None)
-        req.pdho_prepped = None  # one-shot: consume or discard
+        q = getattr(req, "pdho_prepped_q", None)
+        prepped = q.popleft() if q else None
         if prepped is None or not self._pdho_early_send_eligible():
             cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="nostash" if prepped is None else "ineligible")
             return False
