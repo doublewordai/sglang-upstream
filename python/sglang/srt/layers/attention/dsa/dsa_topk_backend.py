@@ -76,11 +76,19 @@ class DSATopKBackend(Enum):
                     topk_decode_fg,
                 )
 
+                # The warm start trades one full-row read for verify/refine
+                # machinery (~10 us of fixed kernel overhead); measured it only
+                # pays off from ~batch*stride >= 16M elements (1.06-1.34x vs
+                # the plain FG path beyond that, 0.71-0.76x below it).
+                warm = (
+                    envs.SGLANG_DSA_TOPK_WARMSTART.get()
+                    and score.shape[0] * score.shape[1] >= 16_000_000
+                )
                 return topk_decode_fg(
                     score,
                     lengths,
                     topk,
-                    warmstart=envs.SGLANG_DSA_TOPK_WARMSTART.get(),
+                    warmstart=warm,
                     delta=envs.SGLANG_DSA_TOPK_WARMSTART_DELTA.get(),
                     warm_key=warm_key or 0,
                 )
