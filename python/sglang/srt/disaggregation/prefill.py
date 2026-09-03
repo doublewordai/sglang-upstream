@@ -1224,8 +1224,12 @@ class SchedulerDisaggregationPrefillMixin:
     # ---- pd-handover-latency lane: early chunk KV send (SGLANG_PDHO_EARLY_SEND=1)
     def _pdho_early_send_eligible(self) -> bool:
         if getattr(self, "_pdho_eligible", None) is None:
+            # Early KV send at the chunk's own result processing (from
+            # CPU-staged payloads) is the DEFAULT path: it removes the ~96ms
+            # batch handover stall measured at b>=2. SGLANG_PDHO_EARLY_SEND=0
+            # opts out (A/B testing); staging mode keeps the classic path.
             ok = (
-                os.environ.get("SGLANG_PDHO_EARLY_SEND", "0") == "1"
+                os.environ.get("SGLANG_PDHO_EARLY_SEND", "1") == "1"
                 and not self.enable_staging
             )
             state_types = None
