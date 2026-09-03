@@ -2554,6 +2554,23 @@ _ALL_RANKS_SNAPSHOT_AGE_FAMILY = (
     "sglang:load_snapshot_age_seconds",
     "Age of the rank's newest load snapshot (scheduler liveness tripwire: a rank whose age keeps growing has stopped publishing -- hung scheduler or dead zmq path -- while its budget values silently freeze at the last snapshot).",
 )
+_ALL_RANKS_PDHO_FAMILIES = (
+    (
+        "sglang:pdho_inflight_handover_tokens",
+        "Device KV held by finished prompts awaiting the PD KV transfer (prefill arm; unreclaimable until the transfer completes — the mass the back-pressure bound limits; admission-cost view: per-request held tokens summed).",
+        "pdho_inflight_handover_tokens",
+    ),
+    (
+        "sglang:pdho_inflight_bound_tokens",
+        "Active back-pressure bound on in-flight handover tokens (SGLANG_PDHO_INFLIGHT_FRACTION x device pool; 0 = off).",
+        "pdho_inflight_bound_tokens",
+    ),
+    (
+        "sglang:pdho_backpressure_blocks",
+        "Cumulative prefill admission blocks by the in-flight-handover back-pressure (new cold work queued, never dropped).",
+        "pdho_backpressure_blocks",
+    ),
+)
 
 
 class AllRanksLoadSnapshotCollector:
@@ -2706,6 +2723,16 @@ class AllRanksLoadSnapshotCollector:
                     self._label_values(s), max(0.0, now - s.timestamp)
                 )
             yield family
+            # device-pool-degrade: the pdho control-state gauges (new
+            # families, no mmdb counterpart, so no takeover gating needed —
+            # same class as the snapshot-age tripwire above).
+            for name, doc, field in _ALL_RANKS_PDHO_FAMILIES:
+                family = GaugeMetricFamily(name, doc, labels=labelnames)
+                for s in snapshots:
+                    family.add_metric(
+                        self._label_values(s), int(getattr(s, field, 0) or 0)
+                    )
+                yield family
 
         mp = self._mp.collect() if self._mp is not None else iter(())
         if not (take_pool or take_queue or take_prealloc):
