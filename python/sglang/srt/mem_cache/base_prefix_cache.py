@@ -451,20 +451,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         protected vs merely full) is the whole point — see the 2026-09-03
         13:28Z incident (full_available_size=0 + full_evictable_size_=0).
         """
+        return self.device_pool_reclaimable_tokens() < self._device_pool_page()
+
+    def _device_pool_page(self) -> int:
         allocator = self.token_to_kv_pool_allocator
-        page = int(getattr(allocator, "page_size", 1) or 1)
+        return int(getattr(allocator, "page_size", 1) or 1)
+
+    def device_pool_reclaimable_tokens(self) -> int:
+        """available + evictable: what a device-pool allocation can still
+        take, eviction included. The FULL sub-pool's figure when the allocator
+        is hybrid SWA — that is the pool the paged extend allocator raises on
+        (the 13:28Z message was full_available_size + full_evictable_size).
+        The SWA sub-pool is checked separately by device_pool_exhausted via
+        the page floor; the admission floor bounds the FULL mass.
+        """
+        allocator = self.token_to_kv_pool_allocator
         if hasattr(allocator, "full_available_size"):
-            # Hybrid SWA allocator: each sub-pool must be able to start a page.
             full_evictable = getattr(self, "full_evictable_size", None)
-            if (
-                allocator.full_available_size()
-                + (full_evictable() if full_evictable is not None else 0)
-                < page
-            ):
-                return True
-            swa_evictable = getattr(self, "swa_evictable_size", None)
-            if hasattr(allocator, "swa_available_size") and swa_evictable is not None:
-                if allocator.swa_available_size() + swa_evictable() < page:
-                    return True
-            return False
-        return allocator.available_size() + self.evictable_size() < page
+            return allocator.full_available_size() + (
+                full_evictable() if full_evictable is not None else 0
+            )
+        return allocator.available_size() + self.evictable_size()

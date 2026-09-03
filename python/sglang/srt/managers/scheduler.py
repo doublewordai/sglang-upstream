@@ -3025,6 +3025,26 @@ class Scheduler(
             return 0
         return int(frac * self.max_total_num_tokens)
 
+    def _pdho_reserve_tokens(self) -> int:
+        """The ADMISSION FLOOR (device-pool-degrade, the enforced margin):
+        refuse NEW cold admissions while the device pool's reclaimable mass
+        (available + evictable) is below this many tokens, so the
+        UN-REFUSABLE in-flight chunked continuation can always complete.
+
+        Sizing (from prefill-oom-1328 row 11, the falsifier): the un-enforced
+        margin between the old head's survived displayed-1.00 (<~9k tokens
+        reclaimable = exactly one chunk) and production's exact-zero crash
+        with an 8192-token continuation pending was a few thousand tokens.
+        The reserve must cover one continuation's worst demand:
+        chunked_prefill_size + page over-estimate per mid-chunk request.
+        Suggested value for prod (chunk 8192, page 64):
+        8192 + 2*64 + 8192 slack = 16512 tokens (~0.9% of the 1.82M pool).
+        Default 0 = off (experiment-gated; the delta-vs-lock accounting fix —
+        prefill-oom-1328's, default-on — stops the overshoot; this floor
+        makes the margin exist regardless, and fires EARLY: at admission,
+        before the point of no return)."""
+        return int(envs.SGLANG_PDHO_RESERVE_TOKENS.get())
+
     def _pdho_backpressure_state(self) -> tuple:
         """device-pool-degrade ladder step 2.5: the in-flight-handover bound.
 
@@ -3833,6 +3853,19 @@ class Scheduler(
             self._note_pdho_backpressure_block(
                 pdho_holders, sum(h["tokens"] for h in pdho_holders)
             )
+        # Ladder step 2.6: the ADMISSION FLOOR — the enforced margin. Below
+        # the reserve, refuse new cold work so the un-refusable in-flight
+        # chunked continuation always has room to complete. Checked live in
+        # the walk too: each admitted warm request LOCKS its matched prefix
+        # and shrinks evictable immediately (the delta-vs-lock defect —
+        # prefill-oom-1328's charge fix is the arithmetic; this floor is the
+        # margin).
+        pdho_reserve = self._pdho_reserve_tokens()
+        pdho_below_floor = (
+            pdho_reserve > 0
+            and self.tree_cache.device_pool_reclaimable_tokens() < pdho_reserve
+        )
+        if pdho_blocked or pdho_below_floor:
             if self.chunked_req is None:
                 # No batch_is_full here: the arm re-evaluates the bound fresh
                 # next pass (batch_is_full can stick on PD prefill arms whose
@@ -3958,6 +3991,15 @@ class Scheduler(
                 # Back-pressure: no NEW admissions this pass (the chunked req,
                 # if any, was added above and continues). No batch_is_full:
                 # the bound is re-evaluated fresh next pass.
+                break
+            if (
+                pdho_reserve > 0
+                and self.tree_cache.device_pool_reclaimable_tokens()
+                < pdho_reserve
+            ):
+                # Admission floor: the enforced margin for the un-refusable
+                # continuation (checked live — admissions lock prefixes and
+                # shrink evictable mid-walk).
                 break
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
@@ -5328,6 +5370,12 @@ class Scheduler(
                     ),
                     "inflight_bound_tokens": int(
                         self._pdho_inflight_bound_tokens()
+                    ),
+                    "admission_reserve_tokens": int(
+                        self._pdho_reserve_tokens()
+                    ),
+                    "reclaimable_tokens": int(
+                        self.tree_cache.device_pool_reclaimable_tokens()
                     ),
                     "backpressure_blocks": int(
                         getattr(self, "pdho_backpressure_blocks", 0)

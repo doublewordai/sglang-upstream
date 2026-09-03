@@ -735,6 +735,16 @@ class Envs:
     # until the in-flight set drains. Default 0.0 = off (experiment-gated;
     # threshold calibrated from prefill-oom-1328's per-category page data).
     SGLANG_PDHO_INFLIGHT_FRACTION = EnvFloat(0.0)
+    # The companion ADMISSION FLOOR: refuse NEW cold admissions while the
+    # device pool's reclaimable mass (available + evictable) is below this
+    # many tokens. This is the enforced margin the 13:28Z outage ran without:
+    # the un-refusable chunked continuation (chunked_prefill_size + page
+    # over-estimate) must always fit. Sized from prefill-oom-1328 row 11: the
+    # surviving margin was <~9k tokens (one chunk); the crash was exact zero
+    # with an 8192-token continuation pending. Suggested value:
+    # chunked_prefill_size + 2*page + 100% chunk slack (prod: 8192+128+8192).
+    # Default 0 = off.
+    SGLANG_PDHO_RESERVE_TOKENS = EnvInt(0)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
@@ -1380,10 +1390,6 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
-    # Frontend (tokenizer manager) periodic full-gc interval in seconds.
-    # Bounds the pymalloc arenas pinned by per-request cyclic garbage; <=0
-    # disables the periodic collection.
-    SGLANG_FRONTEND_GC_INTERVAL_S = EnvInt(600)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
