@@ -197,6 +197,15 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
 
     timestamp: float = 0.0
     dp_rank: int = 0
+    # Rank coordinates of the publishing scheduler, so a single-node reader
+    # can reconstruct the exact Prometheus label set the scheduler-side
+    # collector uses ({tp_rank, pp_rank, moe_ep_rank, dp_rank}); node_rank
+    # lets the master distinguish remote-node ranks (no local mmdb gauges)
+    # from node-local ones (already exported through the multiprocess dir).
+    tp_rank: int = 0
+    pp_rank: int = 0
+    moe_ep_rank: int = 0
+    node_rank: int = 0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
     num_waiting_uncached_tokens: int = 0
@@ -217,6 +226,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     host_pool_pinned_tokens: int = 0
     host_pool_evictable_tokens: int = 0
     host_pool_wait_events: int = 0
+    # Age of the OLDEST prealloc currently blocked on a full host pool
+    # (seconds; 0.0 when nothing waits). The signal that distinguishes a
+    # busy rank from a STUCK one (supervisor's DP2 incident 09-03: 130 s
+    # wait_age at evictable=0 was invisible in every exported metric).
+    host_pool_wait_age_s: float = 0.0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
@@ -554,7 +568,14 @@ class ZmqShmLoadSnapshotReader:
         if is_zmq_endpoint_ipv6(endpoint):
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
-        self._socket.setsockopt(_zmq.CONFLATE, 1)
+        # NOTE: deliberately NOT setting CONFLATE here. This socket receives
+        # from one PUSH writer PER DP rank (often across nodes); conflate on
+        # the receiving side keeps only the single most recent message
+        # overall, so one drain would see 1 of N ranks (measured: 16 senders
+        # -> 1/16 ranks per drain, 0/16 once idle; without conflate 16/16 in
+        # one drain). Writers keep their own CONFLATE=1, which correctly
+        # bounds each sender to one in-flight message; the drain below reads
+        # until EAGAIN, so the queue depth stays bounded by the HWM anyway.
         self._socket.bind(endpoint)
 
         self._endpoint = endpoint
