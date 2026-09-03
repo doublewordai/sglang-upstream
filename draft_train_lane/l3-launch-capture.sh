@@ -72,7 +72,11 @@ LB_PORT=57200
 BOOTSTRAP_PORT=57300
 
 # --- Node allocation ----------------------------------------------------------
-if [[ -n "${HOLDER:-}" ]]; then
+# NODES_OVERRIDE: explicit comma list (e.g. split-holder capture: 4 nodes from
+# holder H + 4 from holder E). First 4 = prefill, rest = decode.
+if [[ -n "${NODES_OVERRIDE:-}" ]]; then
+    NODES=$NODES_OVERRIDE
+elif [[ -n "${HOLDER:-}" ]]; then
     NODES=$(scontrol show hostnames "$(squeue -j "$HOLDER" -h -o %N)" | head -$TOTAL_NODES | paste -sd,)
 else
     NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -$TOTAL_NODES | paste -sd,)

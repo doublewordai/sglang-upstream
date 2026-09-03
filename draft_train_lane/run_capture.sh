@@ -36,7 +36,7 @@ rm -rf "$CAP"; mkdir -p "$CAP"
 
 # 1. boot the capture rig
 SGLANG_DRAFT_CAPTURE_DIR=$CAP SGLANG_DRAFT_CAPTURE_TAG=prefill \
-  HOLDER=$HOLDER SMOKE=${SMOKE:-0} SMOKE_NODE=${SMOKE_NODE:-} MODEL=${MODEL:-} \
+  HOLDER=$HOLDER SMOKE=${SMOKE:-0} SMOKE_NODE=${SMOKE_NODE:-} MODEL=${MODEL:-} NODES_OVERRIDE=${NODES_OVERRIDE:-} \
   nohup bash $LANE/l3-launch-capture.sh > $LOGS/capjob-boot.out 2>&1 &
 BOOT=$!
 for i in $(seq 1 300); do
