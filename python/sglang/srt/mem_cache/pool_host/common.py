@@ -171,8 +171,29 @@ def alloc_with_host_register(
 
     hugepage_mode = bool((envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip())
     attempts = 8 if hugepage_mode else 1
+    # Placement ladder: attempt 0 kernel-chosen; then fixed hints descending
+    # through the low VA region where registrations empirically succeed
+    # (at/below the CUDA device arena); far-below fallbacks last.
+    ladder = [
+        None,
+        0x400E00000000,
+        0x400A00000000,
+        0x40060000000,
+        0x400400000000,
+        0x300000000000,
+        0x200000000000,
+        0x10000000000,
+    ]
     for i in range(attempts):
-        buffer = allocator.allocate(dims, dtype=dtype, device=device)
+        hint = ladder[i % len(ladder)]
+        if hint is not None:
+            os.environ["SGLANG_HUGEPAGE_MMAP_HINT"] = hex(hint)
+        else:
+            os.environ.pop("SGLANG_HUGEPAGE_MMAP_HINT", None)
+        try:
+            buffer = allocator.allocate(dims, dtype=dtype, device=device)
+        finally:
+            os.environ.pop("SGLANG_HUGEPAGE_MMAP_HINT", None)
         if not pin_memory:
             return buffer
         try:

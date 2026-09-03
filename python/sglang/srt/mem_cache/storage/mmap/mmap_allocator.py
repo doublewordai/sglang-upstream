@@ -84,18 +84,40 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     munmap fires automatically via weakref.finalize when the array is
     garbage-collected (i.e. when the tensor that wraps it is freed).
     """
-    ptr = _libc.mmap(
-        None,
-        alloc_bytes,
-        mmap.PROT_READ | mmap.PROT_WRITE,
+    # Optional placement hint (v16-memory-plan): cudaHostRegister on hugepage
+    # pools is placement-sensitive (rc=1 when the mapping lands inside a
+    # CUDA-driver VA reservation); the register-retry loop in pool_host/common
+    # sets this to walk the pool through candidate addresses.
+    hint = os.environ.get("SGLANG_HUGEPAGE_MMAP_HINT", "")
+    addr = ctypes.c_void_p(int(hint, 16)) if hint else None
+    flags = (
         mmap.MAP_SHARED
         | mmap.MAP_ANONYMOUS
         | _MAP_POPULATE
         | _MAP_NORESERVE
-        | extra_flags,
-        -1,
-        0,
+        | extra_flags
     )
+    ptr = None
+    if addr is not None:
+        noreplace = getattr(mmap, "MAP_FIXED_NOREPLACE", 0x100000)
+        ptr = _libc.mmap(
+            addr, alloc_bytes, mmap.PROT_READ | mmap.PROT_WRITE, flags | noreplace, -1, 0
+        )
+        if ptr is None or ptr == _MAP_FAILED:
+            if ctypes.get_errno() == 17:  # EEXIST: hint occupied
+                ptr = None
+            else:
+                errno = ctypes.get_errno()
+                raise OSError(errno, os.strerror(errno))
+    if ptr is None:
+        ptr = _libc.mmap(
+            None,
+            alloc_bytes,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            flags,
+            -1,
+            0,
+        )
     if ptr is None or ptr == _MAP_FAILED:
         errno = ctypes.get_errno()
         raise OSError(errno, os.strerror(errno))
