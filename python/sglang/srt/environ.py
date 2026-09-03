@@ -463,7 +463,7 @@ class Envs:
     # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
     # copies; affects the HiCache H2D load path (page_first host pools) and
     # the layer_first D2H backup path (hisparse staging backup).
-    SGLANG_HICACHE_BULK_COPY = EnvBool(False)
+    SGLANG_HICACHE_BULK_COPY = EnvBool(True)
     # D2H bulk backup via warp-coalesced SM stores instead of the copy engine
     # (the CE D2H path is capped at ~170 GB/s over C2C on GH200; coalesced SM
     # stores sustain ~383 GB/s into the same pinned pool). Replaces the
