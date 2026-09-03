@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import contextlib
+
+from sglang.srt.boot_timeline import mark
 import inspect
 import logging
 import time
@@ -299,6 +301,7 @@ class ModelRunner:
         draft_model_idx: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
     ):
+        mark("model_runner_init_begin")
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         # Set on target by `_resolve_memory_pool_config`; passed in for draft
@@ -401,6 +404,7 @@ class ModelRunner:
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
+        mark("dist_init_begin")
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
@@ -1062,6 +1066,7 @@ class ModelRunner:
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
+        mark("dist_init_end")
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(
@@ -1074,6 +1079,7 @@ class ModelRunner:
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        mark("load_model_begin")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
@@ -1116,6 +1122,7 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             load_format=draft_load_format,
         )
+        mark("load_config_done")
 
         with self._load_format_scope(draft_load_format):
             loaded = load_model_with_memory_saver(
@@ -1130,6 +1137,7 @@ class ModelRunner:
         self.loader = loaded.loader
         self.model = loaded.model
         self.startup_weight_load = loaded.startup_weight_load
+        mark("weights_loaded_and_postprocessed")
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
@@ -1169,6 +1177,7 @@ class ModelRunner:
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         self.weight_load_time = time.perf_counter() - tic_total
+        mark("load_model_end")
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
