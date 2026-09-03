@@ -15,6 +15,8 @@
 
 import dataclasses
 import faulthandler
+
+from sglang.srt.boot_timeline import mark
 import logging
 import os
 import signal
@@ -576,6 +578,19 @@ class Scheduler(
 
         self.maybe_init_session_migration()
 
+        # decode-cpu-path: freeze the boot-time object graph once init is done
+        # (the /freeze_gc endpoint exists but nothing calls it in production;
+        # a frozen heap removes gen-2 collection scans from the decode path).
+        if envs.SGLANG_AUTO_FREEZE_GC.get():
+            import gc as _gc
+
+            _gc.collect()
+            freeze_gc("Scheduler (post-init, auto)")
+        if envs.SGLANG_DCP_GC_LOG.get():
+            from sglang.srt.utils.common import configure_gc_warning
+
+            configure_gc_warning(0.001)
+
         # warm-local-prefill (lane warm-local-prefill): decode-rank local
         # extends of warm-turn appends. Requests whose rid carries the
         # "WLP-" marker (set by the bench client / future router hook) take
@@ -1006,6 +1021,7 @@ class Scheduler(
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
+        mark("init_memory_pools_begin")
         self.init_target_memory_pool()
         # Lands the retraction backend on the disagg bag before the draft
         # worker's HiCache plan reads it.
@@ -1019,6 +1035,7 @@ class Scheduler(
             )
             self.draft_worker.init_hicache_draft_plan()
 
+        mark("init_memory_pools_end")
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
@@ -1027,10 +1044,12 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        mark("init_cuda_graphs_begin")
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+        mark("init_cuda_graphs_end")
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -1930,6 +1949,11 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # decode-cpu-path: stage the next decode step's eager-backup
+            # inputs while this forward executes (off the launch path).
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.precompute_eager_backup(batch)
 
             # Update last_batch
             self.last_batch = batch

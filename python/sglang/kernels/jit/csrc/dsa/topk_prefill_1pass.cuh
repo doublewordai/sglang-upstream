@@ -390,7 +390,13 @@ struct PrefillTopKParams {
   const int32_t* __restrict__ row_starts;      // [B] or nullptr
   const int32_t* __restrict__ lengths;         // [B]
   const int32_t* __restrict__ src_page_table;  // [prefill_bs, src_stride]
-  const int32_t* __restrict__ cu_seqlens_q;    // [prefill_bs + 1]
+  const int32_t* __restrict__ cu_seqlens_q;    // [prefill_bs + 1] or nullptr
+  // lane/pagetable-gather (SGLANG_DSA_PAGETABLE_HOIST): per-row page-table
+  // row map [B] or nullptr. When set, row i reads src_page_table
+  // [row_to_page[i]] directly and cu_seqlens_q is ignored — the caller skips
+  // materializing the [rows, L] copy of the table (identity semantics: the
+  // copy's row i WAS src_page_table[row_to_page[i]]).
+  const int32_t* __restrict__ row_to_page;     // [B] or nullptr
   int32_t* __restrict__ dst;                   // [B, topk]
   int32_t* __restrict__ stats;                 // [B, 2] or nullptr {count, fallback}
   int64_t input_stride;
@@ -406,10 +412,20 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_transform_prefill_1pass_ke
   const uint32_t bid = blockIdx.x;
   const uint32_t tx = threadIdx.x;
 
-  // Resolve the source page-table row for this block (production semantics:
-  // the unique seq s with cu_seqlens_q[s] <= bid < cu_seqlens_q[s+1]).
+  // Resolve the source page-table row for this block. Two modes:
+  //  - row_to_page != nullptr (SGLANG_DSA_PAGETABLE_HOIST): direct per-row
+  //    map, src_row = src_page_table[row_to_page[bid]]. No [B, L] gathered
+  //    copy of the table exists; every block reads the shared per-step table
+  //    rows (bs*L*4 bytes, L2-resident at serving shapes).
+  //  - production semantics: the unique seq s with cu_seqlens_q[s] <= bid <
+  //    cu_seqlens_q[s+1].
   __shared__ const int32_t* s_src;
-  if (p.prefill_bs <= kBlockSize) {
+  if (p.row_to_page != nullptr) {
+    if (tx == 0) {
+      s_src = p.src_page_table +
+              static_cast<int64_t>(p.row_to_page[bid]) * p.src_stride;
+    }
+  } else if (p.prefill_bs <= kBlockSize) {
     if (tx < p.prefill_bs) {
       if (bid >= (uint32_t)p.cu_seqlens_q[tx] && bid < (uint32_t)p.cu_seqlens_q[tx + 1]) {
         s_src = p.src_page_table + static_cast<int64_t>(tx) * p.src_stride;
@@ -541,9 +557,10 @@ struct TopKPrefill1PassKernel {
       const tvm::ffi::TensorView lengths,
       const tvm::ffi::TensorView dst,
       const tvm::ffi::TensorView src_page_table,
-      const tvm::ffi::TensorView cu_seqlens_q,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> cu_seqlens_q,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> stats) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> stats,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_to_page) {
     using namespace host;
     auto B = SymbolicSize{"num_rows"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -573,10 +590,23 @@ struct TopKPrefill1PassKernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(src_page_table);
-    TensorMatcher({BSp1})
-        .with_dtype<int32_t>()
-        .with_device(device_)
-        .verify(cu_seqlens_q);
+
+    const int32_t* cu_seqlens_ptr = nullptr;
+    if (cu_seqlens_q.has_value()) {
+      TensorMatcher({BSp1})
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(cu_seqlens_q.value());
+      cu_seqlens_ptr = static_cast<const int32_t*>(cu_seqlens_q.value().data_ptr());
+    }
+
+    // lane/pagetable-gather: optional per-row page-table row map. Exactly one
+    // of cu_seqlens_q / row_to_page must be present.
+    const int32_t* row_to_page_ptr = nullptr;
+    if (row_to_page.has_value()) {
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_to_page.value());
+      row_to_page_ptr = static_cast<const int32_t*>(row_to_page.value().data_ptr());
+    }
 
     const int32_t* row_starts_ptr = nullptr;
     if (row_starts.has_value()) {
@@ -593,7 +623,12 @@ struct TopKPrefill1PassKernel {
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
     RuntimeCheck(BS.unwrap() >= 1, "prefill_bs must be >= 1");
     RuntimeCheck(BS.unwrap() <= B.unwrap(), "prefill_bs must be <= num_rows");
-    RuntimeCheck(BSp1.unwrap() == BS.unwrap() + 1, "invalid cu_seqlens_q shape");
+    RuntimeCheck(
+        cu_seqlens_ptr != nullptr || row_to_page_ptr != nullptr,
+        "one of cu_seqlens_q / row_to_page must be provided");
+    if (cu_seqlens_ptr != nullptr) {
+      RuntimeCheck(BSp1.unwrap() == BS.unwrap() + 1, "invalid cu_seqlens_q shape");
+    }
     static_assert(sizeof(PrefillSmem) % 128 == 0);
 
     // Opt into > 48 KB dynamic shared memory once per process.
@@ -611,7 +646,8 @@ struct TopKPrefill1PassKernel {
         .row_starts = row_starts_ptr,
         .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
         .src_page_table = static_cast<const int32_t*>(src_page_table.data_ptr()),
-        .cu_seqlens_q = static_cast<const int32_t*>(cu_seqlens_q.data_ptr()),
+        .cu_seqlens_q = cu_seqlens_ptr,
+        .row_to_page = row_to_page_ptr,
         .dst = static_cast<int32_t*>(dst.data_ptr()),
         .stats = stats_ptr,
         .input_stride = S.unwrap(),

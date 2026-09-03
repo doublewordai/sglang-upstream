@@ -9,6 +9,8 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.srt.boot_timeline import maybe_copy_weight_view_before_h2d
+
 from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding as fused_vocab_parallel_embedding,
 )
@@ -454,7 +456,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # If the parameter is a gguf weight, then load it directly.
         if getattr(param, "is_gguf_weight_type", None):
-            param.data.copy_(loaded_weight)
+            param.data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
             param.weight_type = loaded_weight.item()
             return
         elif isinstance(param, UninitializedParameter):
@@ -473,7 +475,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             ):
                 loaded_weight = loaded_weight.reshape(1)
             assert param.data.shape == loaded_weight.shape
-            param.data.copy_(loaded_weight)
+            param.data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
             return
 
         # Shard indexes for loading the weight
