@@ -2836,6 +2836,8 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._reject_on_host_pool_exhausted(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -2895,6 +2897,33 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
+        return True
+
+    def _reject_on_host_pool_exhausted(self, recv_req: Req) -> bool:
+        """prefill-pool-degrade ladder step 3: when the hicache host tier is
+        exhausted (evict + skip cannot keep up), reject the admit with a
+        503 the router can retry instead of accepting work that cannot be
+        retained."""
+        tree_cache = self.tree_cache
+        host_pool_exhausted = getattr(tree_cache, "host_pool_exhausted", None)
+        if host_pool_exhausted is None or not host_pool_exhausted():
+            return False
+        message = (
+            "The prefill host KV pool (hicache) is exhausted; "
+            "request rejected for retry."
+        )
+        logger.warning("Rejecting %s: %s", recv_req.rid, message)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
