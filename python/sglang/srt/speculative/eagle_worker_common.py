@@ -327,6 +327,8 @@ def build_eagle_verify_input(
     num_draft_tokens: int,
     tree_mask_mode: TreeMaskMode,
     device: str,
+    ragged_layout=None,
+    draft_confidences: Optional[torch.Tensor] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -385,6 +387,18 @@ def build_eagle_verify_input(
         fill_prefix_mask=fill_mask,
     )
 
+    if ragged_layout is not None:
+        # Truncate each request's chain at verify_len: the node at
+        # verify_len-1 gets no children, so the greedy/sampling accept kernels
+        # stop exactly there (unverified nodes do not exist this round). For
+        # verify_len == num_draft_tokens this writes the chain end (-1) again.
+        verify_lens_64 = ragged_layout.verify_lens.to(torch.int64)
+        rows = torch.arange(
+            verify_lens_64.shape[0], device=verify_lens_64.device
+        )
+        last_col = (verify_lens_64 - 1).clamp(min=0)
+        retrieve_next_token[rows, last_col] = -1
+
     return EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,
@@ -400,6 +414,8 @@ def build_eagle_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
         draft_probs=draft_probs,
+        ragged_verify_layout=ragged_layout,
+        draft_confidences=draft_confidences,
     )
 
 
@@ -456,6 +472,29 @@ def _compact_accept_to_front(
     out = x.clone()
     out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
     return out
+
+
+def maybe_commit_verify_tokens(
+    batch: ScheduleBatch,
+    batch_result: "GenerationBatchResult",
+    target_worker: "TpModelWorker",
+) -> None:
+    """pd/mtp-hisparse: back up the accepted tokens' KV to host rows before the
+    reserved buffer slots are reused by the next verify step.
+
+    Called AFTER the draft-extend launch: the backup needs accept_lens on the
+    host (a blocking D2H on this round's verify output); here it overlaps the
+    draft-extend GPU work rather than idling the GPU between the verify and
+    draft-extend graph replays."""
+    coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+    if coord is not None and not batch.forward_mode.is_idle():
+        coord.commit_verify_tokens(
+            batch.seq_lens,
+            batch_result.accept_lens,
+            batch.req_pool_indices,
+            batch.seq_lens_cpu,
+            getattr(batch, "req_pool_indices_cpu", None),
+        )
 
 
 def run_eagle_verify(
@@ -566,6 +605,37 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
+    ragged_layout = getattr(verify_input, "ragged_verify_layout", None)
+    if ragged_layout is not None and not batch.forward_mode.is_idle():
+        # Compact -> strided [bs * num_draft_tokens] with 0.0 fill beyond each
+        # request's verify window: the accept kernels and draft-extend keep
+        # consuming the uniform strided layout (links truncated at verify_len,
+        # so filled rows are never accepted).
+        from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+            ScatterCompactToStrided,
+        )
+
+        # Restore the full strided out_cache_loc for the draft-extend (the
+        # verify forward used only the compact subset; pad rows write beyond
+        # the committed seq_len, exactly like the uniform path).
+        strided_locs = getattr(verify_input, "strided_out_cache_loc", None)
+        if strided_locs is not None:
+            batch.out_cache_loc = strided_locs.reshape(-1)
+
+        logits_output.next_token_logits = ScatterCompactToStrided.execute(
+            compact=logits_output.next_token_logits,
+            layout=ragged_layout,
+            fill_value=0.0,
+            verify_num_draft_tokens=num_draft_tokens,
+        )
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = ScatterCompactToStrided.execute(
+                compact=logits_output.hidden_states,
+                layout=ragged_layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=num_draft_tokens,
+            )
+
     # Generate vocab mask for constrained decoding
     grammar_mask = None
     if batch.has_grammar:
@@ -585,18 +655,21 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
-    new_seq_lens = batch.seq_lens + accept_lens
-    # pd/mtp-hisparse: back up the accepted tokens' KV to host rows before the
-    # reserved buffer slots are reused by the next verify step.
+    # pd/mtp-hisparse: fence the sample output NOW (the queue still holds only
+    # the verify forward + sample; the draft-extend launch comes later in the
+    # caller). The hisparse commit's pinned D2H gates on this event so its CPU
+    # read is NOT stream-ordered behind the draft-extend kernels.
     coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
-    if coord is not None and not batch.forward_mode.is_idle():
-        coord.commit_verify_tokens(
-            batch.seq_lens,
-            accept_lens,
-            batch.req_pool_indices,
-            batch.seq_lens_cpu,
-            getattr(batch, "req_pool_indices_cpu", None),
-        )
+    if coord is not None:
+        coord.record_verify_sample_done()
+    new_seq_lens = batch.seq_lens + accept_lens
+    # pd/mtp-hisparse: the accepted tokens' KV backup moved AFTER the
+    # draft-extend launch (maybe_commit_verify_tokens, called by the workers)
+    # so its blocking accept_lens D2H overlaps draft-extend GPU work instead of
+    # stalling the scheduler thread between the verify and draft-extend
+    # launches. Ordering is unchanged: the backup is enqueued on
+    # decode_backup_stream and the next round's map_verify_locs_to_buffer gates
+    # the verify KV writes on wait_for_pending_backup().
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

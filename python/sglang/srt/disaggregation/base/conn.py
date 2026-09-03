@@ -84,6 +84,15 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # PP + speculative decoding: [start, end) indices of the spec aux
+    # components (output_topk_p, output_topk_index, output_hidden_states,
+    # output_dsa_topk_indices) within the aux buffer list, and whether this
+    # sender may transfer them. Only the LAST prefill PP stage has the draft
+    # hidden states, so earlier stages skip these components: all PP stages
+    # RDMA-write the same decode-side metadata row, and a stale zero write
+    # from an earlier stage must never race the last stage's good write.
+    aux_spec_buf_range: Optional[tuple] = None
+    aux_send_spec_bufs: bool = True
 
 
 class KVPoll:

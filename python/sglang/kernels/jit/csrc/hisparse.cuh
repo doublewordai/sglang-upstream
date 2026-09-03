@@ -934,4 +934,98 @@ void copy_cache_planned(
       item_size_bytes);
 }
 
+// Wide-grid, plan-driven swap-in copy: same miss plan and the same per-row copy
+// routine (copy_miss_item) as the fused kernel's tail loop and
+// copy_cache_planned, but one warp per planned miss row and a grid that spans
+// the whole GPU instead of one block per request / a small fixed grid. The
+// C2C link to the pinned host pool needs hundreds of concurrent row reads in
+// flight to cover its latency; at one request the fused kernel's 30 warps
+// sustain ~7.5 GB/s where a full grid sustains ~60+ GB/s (measured,
+// lanes/gather).
+//
+// Warp w covers (request r = w / num_top_k, miss m = w % num_top_k). The grid
+// is sized for the captured batch's worst case (bs * num_top_k rows); warps
+// past a request's live miss count, or past num_real_reqs, exit after one
+// cached counter read, so partial-miss batches and CUDA-graph padding cost
+// almost nothing.
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_wide_kernel(
+    const int64_t* __restrict__ miss_src_locs,
+    const int32_t* __restrict__ miss_dst_locs,
+    const int32_t* __restrict__ miss_counts,
+    const int32_t* __restrict__ num_real_reqs,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    int32_t num_top_k,
+    int64_t plan_stride,
+    int64_t item_size_bytes) {
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int warp_global = blockIdx.x * NUM_WARPS + threadIdx.x / WARP_SIZE;
+  const int total_warps = gridDim.x * NUM_WARPS;
+  const int real = num_real_reqs[0];
+  const int64_t total_rows = static_cast<int64_t>(real) * num_top_k;
+
+  for (int64_t w = warp_global; w < total_rows; w += total_warps) {
+    const int64_t r = w / num_top_k;
+    const int64_t m = w - r * num_top_k;
+    if (m >= miss_counts[r]) continue;
+    const int64_t row = r * plan_stride + m;
+    copy_miss_item<IsMLA, IsDsv4Layout>(
+        lane_id,
+        host_cache_k,
+        host_cache_v,
+        device_buffer_k,
+        device_buffer_v,
+        miss_src_locs[row],
+        static_cast<int64_t>(miss_dst_locs[row]),
+        item_size_bytes);
+  }
+}
+
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout>
+void copy_cache_planned_wide(
+    tvm::ffi::TensorView miss_src_locs,
+    tvm::ffi::TensorView miss_dst_locs,
+    tvm::ffi::TensorView miss_counts,
+    tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    int64_t num_blocks,
+    int64_t item_size_bytes) {
+  using namespace host;
+  const int64_t plan_stride = miss_src_locs.strides()[0];
+  if (miss_dst_locs.strides()[0] != plan_stride) {
+    throw std::runtime_error("copy_cache_planned_wide: miss_src/miss_dst row strides differ");
+  }
+  const int64_t num_reqs = miss_src_locs.shape()[0];
+  const int64_t num_top_k = miss_src_locs.shape()[1];
+  const int64_t rows = num_reqs * num_top_k;
+  if (rows == 0) {
+    return;
+  }
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  // More blocks than one warp per worst-case row cannot help; clamp.
+  const int64_t max_blocks = (rows + NUM_WARPS - 1) / NUM_WARPS;
+  const int64_t grid = num_blocks < max_blocks ? num_blocks : max_blocks;
+  const auto device = LaunchKernel::resolve_device(miss_src_locs.device());
+  LaunchKernel(grid, BLOCK_SIZE, device)(
+      copy_cache_planned_wide_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout>,
+      static_cast<const int64_t*>(miss_src_locs.data_ptr()),
+      static_cast<const int32_t*>(miss_dst_locs.data_ptr()),
+      static_cast<const int32_t*>(miss_counts.data_ptr()),
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      host_cache_k.data_ptr(),
+      (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+      device_buffer_k.data_ptr(),
+      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+      static_cast<int32_t>(num_top_k),
+      plan_stride,
+      item_size_bytes);
+}
+
 }  // namespace sglang
