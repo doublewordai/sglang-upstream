@@ -86,6 +86,28 @@ def _jit_copy_planned_module(
 
 
 @functools.cache
+def _jit_copy_planned_wide_module(
+    block_size: int,
+    is_mla: bool,
+    is_dsv4_layout: bool,
+) -> Module:
+    template_args = make_cpp_args(block_size, is_mla, is_dsv4_layout)
+    return load_jit(
+        "sparse_copy_planned_wide",
+        block_size,
+        is_mla,
+        is_dsv4_layout,
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "copy_cache_planned_wide",
+                f"copy_cache_planned_wide<{template_args}>",
+            )
+        ],
+    )
+
+
+@functools.cache
 def _jit_dsv4_transfer_module(block_size: int) -> Module:
     template_args = make_cpp_args(block_size)
     return load_jit(
@@ -281,6 +303,46 @@ def copy_cache_planned_mla(
     module = _jit_copy_planned_module(block_size, True, is_dsv4_layout, skip_io)
     empty = torch.empty(0)
     module.copy_cache_planned(
+        miss_src,
+        miss_dst,
+        miss_count,
+        num_real_reqs,
+        host_cache,
+        empty,
+        device_buffer,
+        empty,
+        num_blocks,
+        item_size_bytes,
+    )
+
+
+def copy_cache_planned_wide_mla(
+    *,
+    miss_src: torch.Tensor,
+    miss_dst: torch.Tensor,
+    miss_count: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    item_size_bytes: int,
+    num_blocks: int = 264,
+    block_size: int = 256,
+    is_dsv4_layout: bool = False,
+) -> None:
+    """Replay a recorded miss plan with a full-GPU-grid gather (warp per row).
+
+    Same plan and the same per-row copy routine as copy_cache_planned_mla /
+    the fused swap-in kernel's tail loop; the grid spans the whole GPU
+    (num_blocks, clamped to one warp per worst-case row) so enough row reads
+    are in flight to cover the host-pool C2C latency at small batch. Warps
+    past a request's live miss count or past num_real_reqs exit immediately,
+    so partial-miss batches and CUDA-graph padding cost almost nothing.
+    """
+    assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
+    assert miss_count.dtype == torch.int32
+    module = _jit_copy_planned_wide_module(block_size, True, is_dsv4_layout)
+    empty = torch.empty(0)
+    module.copy_cache_planned_wide(
         miss_src,
         miss_dst,
         miss_count,

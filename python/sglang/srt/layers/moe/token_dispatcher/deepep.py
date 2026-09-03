@@ -55,9 +55,24 @@ try:
             sglang_per_token_group_quant_fp8,
         )
 
+    import deep_ep  # lane deepep-v2: bind the module name for the V2 path below
+
     use_deepep = True
 except ImportError:
     use_deepep = False
+
+# Lane deepep-v2: opt-in DeepEP V2 (ElasticBuffer) path for NORMAL dispatch mode.
+# V2 computes the dispatch layout internally (no get_dispatch_layout call), uses an
+# EPHandle, and sizes its unified buffer from MoE shape parameters. The V1 path is
+# kept fully intact; SGLANG_DEEPEP_V2=1 + a deep_ep build exposing ElasticBuffer
+# selects the V2 path. Only normal mode is migrated (the prefill arm's mode).
+_deepep_v2 = (
+    use_deepep
+    and not _is_npu
+    and not _use_zbal
+    and get_bool_env_var("SGLANG_DEEPEP_V2")
+    and hasattr(deep_ep, "ElasticBuffer")
+)
 
 from enum import Enum, IntEnum, auto
 
@@ -192,9 +207,28 @@ class DeepEPBuffer:
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                v2_num_topk=None,
+                v2_use_fp8=None,
+                v2_num_sms=None,
             )
             buffers["deepep_ep_state"] = state
         return state
+
+    @classmethod
+    def set_v2_params(cls, num_topk: int, use_fp8: bool):
+        """Record the MoE shape parameters needed to size a V2 ElasticBuffer.
+        Called from the dispatcher __init__ (before the first _get_buffer call)."""
+        state = cls._state()
+        if state.v2_num_topk is None:
+            state.v2_num_topk = num_topk
+            state.v2_use_fp8 = use_fp8
+
+    @classmethod
+    def get_v2_num_sms(cls, num_experts: int, num_topk: int, buffer) -> int:
+        state = cls._state()
+        if state.v2_num_sms is None:
+            state.v2_num_sms = buffer.get_theoretical_num_sms(num_experts, num_topk)
+        return state.v2_num_sms
 
     @classmethod
     def get_deepep_buffer(
@@ -213,6 +247,43 @@ class DeepEPBuffer:
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
+
+        # ---- Lane deepep-v2: V2 ElasticBuffer (normal mode only) ----
+        if _deepep_v2:
+            assert deepep_mode == DeepEPMode.NORMAL, (
+                "SGLANG_DEEPEP_V2=1 only supports --deepep-mode normal "
+                "(the prefill arm's mode); low-latency/auto stay on the V1 path"
+            )
+            from sglang.srt.environ import envs as _envs
+
+            # NOTE (lane deepep-v2): the V2 buffer's NCCL comm requires symmetric
+            # memory (cuMem). sglang's engine entrypoint sets NCCL_CUMEM_ENABLE=0
+            # by default and NCCL latches this param at the first comm init, so the
+            # launch env must export NCCL_CUMEM_ENABLE=1 (engine.py leaves a
+            # pre-set value untouched) BEFORE any communicator is created.
+
+            v2_num_max_tokens = _envs.SGLANG_DEEPEP_V2_NUM_MAX_TOKENS_PER_RANK.get()
+            num_topk = state.v2_num_topk if state.v2_num_topk is not None else 0
+            use_fp8 = bool(state.v2_use_fp8)
+            state.buffer = deep_ep.ElasticBuffer(
+                group,
+                num_max_tokens_per_rank=v2_num_max_tokens,
+                hidden=hidden_size,
+                num_topk=num_topk,
+                use_fp8_dispatch=use_fp8,
+            )
+            # V2 computes the SM count analytically; cache it for the hot path.
+            state.v2_num_sms = state.buffer.get_theoretical_num_sms(
+                num_experts, num_topk
+            )
+            if torch.distributed.get_rank() == 0:
+                logger.info(
+                    f"DeepEP V2 ElasticBuffer created: "
+                    f"num_max_tokens_per_rank={v2_num_max_tokens}, topk={num_topk}, "
+                    f"fp8={use_fp8}, num_sms={state.v2_num_sms}, "
+                    f"num_bytes={state.buffer.num_bytes}"
+                )
+            return state.buffer
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -404,6 +475,10 @@ class _DeepEPDispatcherImplBase:
 
         self.set_deepep_dispatcher_dtype()
 
+        if _deepep_v2:
+            # Record MoE shape params for V2 ElasticBuffer sizing (idempotent).
+            DeepEPBuffer.set_v2_params(self.router_topk, self.use_fp8)
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -533,7 +608,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-        previous_event = Buffer.capture() if self.async_finish else None
+        if _deepep_v2:
+            previous_event = deep_ep.ElasticBuffer.capture() if self.async_finish else None
+        else:
+            previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
@@ -567,6 +645,48 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
+
+        if _deepep_v2:
+            # ---- Lane deepep-v2: V2 computes the layout internally ----
+            _deepep_precompile_tp_barrier()
+            (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                self.handle,
+                event,
+            ) = buffer.dispatch(
+                x,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                num_experts=self.num_experts,
+                num_max_tokens_per_rank=buffer.num_max_tokens_per_rank,
+                expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+                num_sms=DeepEPBuffer.get_v2_num_sms(
+                    self.num_experts, self.router_topk, buffer
+                ),
+                previous_event=previous_event,
+                async_with_compute_stream=self.async_finish,
+                allocate_on_comm_stream=previous_event is not None,
+            )
+            num_recv_tokens_per_expert = self.handle.num_recv_tokens_per_expert_list
+            # NOTE: V2 does not expose V1's layout tensors; the EPLB recorder's
+            # layout-dependent stats are unavailable on this path (recording is
+            # disabled by default; only used with EPLB).
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+                num_recv_tokens_per_expert,
+                num_tokens_per_rank=None,
+                num_tokens_per_rdma_rank=None,
+                num_tokens_per_expert=None,
+            )
+            return (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                event,
+            )
+
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -640,7 +760,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
 
-        previous_event = Buffer.capture() if self.async_finish else None
+        if _deepep_v2:
+            previous_event = (
+                deep_ep.ElasticBuffer.capture() if self.async_finish else None
+            )
+        else:
+            previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
     def combine_b(self, output, previous_event):
@@ -653,6 +778,19 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        if _deepep_v2:
+            # ---- Lane deepep-v2 ----
+            combined_x, _, event = buffer.combine(
+                x,
+                self.handle,
+                num_sms=DeepEPBuffer.get_v2_num_sms(
+                    self.num_experts, self.router_topk, buffer
+                ),
+                previous_event=previous_event,
+                async_with_compute_stream=self.async_finish,
+                allocate_on_comm_stream=previous_event is not None,
+            )
+            return combined_x, event
         combined_x, _, event = buffer.combine(
             x,
             self.handle,

@@ -70,6 +70,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.managers.delta_tokenizer import DeltaTokenizerCache
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -1340,9 +1341,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
+                if self.tokenizer_manager.delta_tokenizer is not None:
+                    prompt_ids = self.tokenizer_manager.delta_tokenizer.encode(
+                        rendered_prompt,
+                        DeltaTokenizerCache.session_key(openai_compatible_messages),
+                        **encode_kwargs,
+                    )
+                else:
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                        rendered_prompt, **encode_kwargs
+                    )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
