@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -696,6 +697,47 @@ def eagle_sample(
     next_token_logits = logits_output.next_token_logits
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
+
+    # Fused greedy verify (lane fused-sampling): per-request penalties +
+    # argmax over the [bs * draft_token_num, V] window + tree walk + bonus
+    # in two Triton kernels, bit-exact vs the reference chain below
+    # (repeat_interleave penalties -> argmax -> verify_tree_greedy ->
+    # fill_bonus).  Runs BEFORE the eager penalty application so the acc_*
+    # [bs, V] tensors are folded into the kernel (broadcast over the draft
+    # rows) instead of repeat_interleave + add kernels.  Grammar masks and
+    # logit_bias still use the reference path below.
+    if (
+        sampling_info.is_all_greedy
+        and _is_cuda
+        and envs.SGLANG_FUSED_SAMPLING.get()
+        and SIMULATE_ACC_LEN <= 0
+        and sampling_info.logit_bias is None
+        and grammar_mask is None
+    ):
+        from sglang.srt.layers.fused_sampling import fused_verify_greedy
+
+        _candidates = verify_input.draft_token.reshape(
+            bs, verify_input.draft_token_num
+        )
+        (
+            predicts,
+            accept_index,
+            num_correct_drafts,
+            _bonus,
+        ) = fused_verify_greedy(
+            next_token_logits,
+            sampling_info.acc_additive_penalties,
+            sampling_info.acc_scaling_penalties,
+            _candidates,
+            verify_input.retrieve_index,
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+            ndt=verify_input.draft_token_num,
+            nst=verify_input.max_tree_depth,
+        )
+        # eagle_sample's contract: accept_lens = num_correct_drafts + 1
+        # (the trailing/bonus token), matching the reference tail return.
+        return predicts, num_correct_drafts + 1, accept_index
 
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
