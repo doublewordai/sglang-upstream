@@ -39,6 +39,22 @@ try:
 except OSError:
     _libc = None
 
+
+class _IOVec(ctypes.Structure):
+    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
+
+
+if _libc is not None and hasattr(_libc, "process_vm_readv"):
+    _libc.process_vm_readv.restype = ctypes.c_ssize_t
+    _libc.process_vm_readv.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(_IOVec),
+        ctypes.c_ulong,
+        ctypes.POINTER(_IOVec),
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+
 # MAP_POPULATE is in Python's mmap module only since 3.11.
 _MAP_POPULATE = getattr(mmap, "MAP_POPULATE", 0x08000)
 # MAP_HUGETLB and MAP_HUGE_* are Linux-specific and not in Python's mmap module.
@@ -440,24 +456,97 @@ def _node_free_bytes(node: int) -> "int | None":
     return None
 
 
-def verify_host_pool_populated(
-    ptr: int, n_bytes: int, what: str = "host pool", tol: int = 2 * 1024 * 1024
-) -> None:
-    """Abort when a MAP_POPULATE'd host pool is not fully resident.
+def _gup_fault_range(ptr: int, n_bytes: int, page_size: int) -> int:
+    """Fault [ptr, ptr+n_bytes) via GUP reads (process_vm_readv on self).
 
-    Measured on Isambard GH200 (kernel 6.4; hugetlb-pin follow-up, 2026-09-03):
-    under numactl --membind (MPOL_BIND) a hugetlb surplus fault fails once the
-    bound NUMA node runs out of free memory. MAP_POPULATE silently ignores
-    those faults, mmap() succeeds with a PARTIALLY-populated mapping, and the
-    loss only surfaces later: cudaHostRegister returns cudaErrorInvalidValue
-    on the chunk containing the population frontier (its GUP cannot fault the
-    missing pages), and a plain first touch of them would SIGBUS. staging-2
-    arm C8e died exactly like this: 4 decode ranks/node x 86.9 GiB pools,
-    frontiers 21-78 GiB, whole-pool + 16 GiB-chunk registers rc=1.
+    Returns the number of bytes that could be faulted (n_bytes when the whole
+    range faults; -1 when probing is unavailable and callers should fall back
+    to the residency verdict alone).
+
+    GUP is the exact fault path cudaHostRegister uses, so a page that faults
+    here is registerable and one that does not is the true frontier. This is
+    needed because MAP_POPULATE on a MAP_NORESERVE hugetlb mapping prefaults a
+    state-dependent PREFIX only (measured on Isambard's 6.4 64 KiB-page
+    kernel, 2026-09-03: 1 GiB of a healthy 9 GiB pool in one state, all of it
+    in another, ~8.95 of 9.0 on green g4c) -- a residency shortfall must be
+    demand-fault-probed before the pool is declared unusable.
+    """
+    if _libc is None or not hasattr(_libc, "process_vm_readv"):
+        return -1
+    batch = 1024  # UIO_MAXIOV
+    local_buf = ctypes.create_string_buffer(batch)
+    liov = (_IOVec * batch)()
+    for i in range(batch):
+        liov[i].iov_base = ctypes.addressof(local_buf) + i
+        liov[i].iov_len = 1
+    off = 0
+    while off < n_bytes:
+        n_pages = min(batch, (n_bytes - off + page_size - 1) // page_size)
+        riov = (_IOVec * n_pages)()
+        for i in range(n_pages):
+            riov[i].iov_base = ptr + off + i * page_size
+            riov[i].iov_len = 1
+        rc = _libc.process_vm_readv(
+            os.getpid(), liov, n_pages, riov, n_pages, 0
+        )
+        if rc < 0:
+            err = ctypes.get_errno()
+            if err == errno.EFAULT:
+                return off  # first page of the batch is the frontier
+            return -1  # unexpected error: cannot probe
+        if rc < n_pages:
+            return off + rc * page_size  # partial: stopped mid-batch
+        off += n_pages * page_size
+    return n_bytes
+
+
+def verify_host_pool_populated(
+    ptr: int,
+    n_bytes: int,
+    what: str = "host pool",
+    tol: int = 2 * 1024 * 1024,
+    fault_page_size: int = 0,
+) -> None:
+    """Abort when a MAP_POPULATE'd host pool cannot be fully faulted.
+
+    Two-layer check, from the measured failure model on Isambard GH200
+    (kernel 6.4; hugetlb-pin follow-up, 2026-09-03):
+
+    1. Residency: /proc/self/numa_maps must show the whole mapping resident.
+       Under numactl --membind (MPOL_BIND) a hugetlb surplus fault fails once
+       the bound NUMA node runs out of 2 MiB-allocatable memory, and
+       MAP_POPULATE silently ignores those faults (mmap() succeeds with a
+       partially-populated mapping).
+    2. Fault-probe (hugetlb pools, fault_page_size > 0): a residency shortfall
+       is NOT yet a verdict -- MAP_POPULATE prefaults a state-dependent
+       prefix and the remainder is often faultable on demand (measured: green
+       g4/g4c boots died on ~0.05 GiB shortfalls; the rig faulted the missing
+       8 GiB of a healthy 9 GiB pool by hand). So demand-fault the range via
+       GUP -- the same path cudaHostRegister pins with -- and only abort when
+       GUP itself stops. Real exhaustion (staging arm C8e: 4 x 86.9 GiB
+       pools per ~119.6 GiB node, registers rc=1 at the frontier) still
+       aborts here in seconds with the numbers.
     """
     populated = populated_bytes_in_range(ptr, n_bytes)
     if populated is None or populated >= n_bytes - tol:
         return
+    frontier = None
+    if fault_page_size:
+        frontier = _gup_fault_range(ptr, n_bytes, fault_page_size)
+        if frontier == n_bytes:
+            # MAP_POPULATE prefaulted a prefix; GUP faulting completed the
+            # pool. Re-count so the log line reflects reality.
+            repop = populated_bytes_in_range(ptr, n_bytes)
+            if repop is None or repop >= n_bytes - tol:
+                logger.info(
+                    "%s: MAP_POPULATE prefaulted only %.1f of %.1f GiB; "
+                    "GUP faulting completed the pool -- continuing.",
+                    what,
+                    populated / 2**30,
+                    n_bytes / 2**30,
+                )
+                return
+            populated = repop
     byt, policies = _numa_pages_by_node(ptr, n_bytes)
     pol = ",".join(policies) if policies else "?"
     free_str = ""
@@ -465,12 +554,18 @@ def verify_host_pool_populated(
         fb = _node_free_bytes(n)
         if fb is not None:
             free_str += f" N{n} MemFree={fb / 2**30:.1f}GiB"
+    front_str = (
+        f" GUP faulting stopped at {frontier / 2**30:.1f} GiB;"
+        if frontier is not None and frontier >= 0
+        else ""
+    )
     raise HostPoolPopulationError(
         f"{what}: only {populated / 2**30:.1f} of {n_bytes / 2**30:.1f} GiB "
         f"could be faulted in (mempolicy={pol};{free_str or ' no per-node free info'})."
-        " The mapping is unusable from here: cudaHostRegister of it fails with"
-        " cudaErrorInvalidValue at this population frontier and touching the"
-        " missing pages would SIGBUS. Free node memory, relax the membind"
+        f"{front_str}"
+        " cudaHostRegister pins through the same GUP path, so registration of"
+        " the range past that frontier fails (cudaErrorInvalidValue; staging"
+        " arm C8e measured exactly this). Free node memory, relax the membind"
         " policy, or shrink the pool (hisparse host_to_device_ratio /"
         " max_total_tokens)."
     )
@@ -640,7 +735,16 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
                 # with the real cause -- see verify_host_pool_populated).
                 log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
                 verify_host_pool_populated(
-                    tensor.data_ptr(), alloc_bytes, "hugetlb host pool", tol=page_size
+                    tensor.data_ptr(),
+                    alloc_bytes,
+                    "hugetlb host pool",
+                    # numa_maps lags/undercounts population (KB usually, up
+                    # to ~200 MiB under concurrent 4-rank population), so a
+                    # one-page tolerance fires on healthy pools (green g4c:
+                    # "only 9.0 of 9.0"). 1 GiB of an 80-96 GiB pool, plus
+                    # the GUP fault-probe below, keeps the verdict honest.
+                    tol=max(page_size, 1 << 30),
+                    fault_page_size=page_size,
                 )
                 return tensor
             except OSError as e:
