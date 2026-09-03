@@ -1257,8 +1257,10 @@ class SchedulerDisaggregationPrefillMixin:
             req.pdho_prepped = None
             try:
                 if req.disagg_kv_sender is None or req.pending_bootstrap:
+                    cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="nosender" if req.disagg_kv_sender is None else "pending")
                     continue
                 if req.extend_range is None:
+                    cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="noextend")
                     continue
                 start = req.start_send_idx
                 end = min(req.extend_range.end, len(req.origin_input_ids))
@@ -1277,6 +1279,7 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = None
                 if last_chunk and state_types:
                     if req.metadata_buffer_index is None or req.metadata_buffer_index < 0:
+                        cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="noaux", last=1)
                         continue  # aux not ready -> classic path
                     row_full = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, :end
@@ -1291,6 +1294,14 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         for st in state_types
                     ]
+                cold_trace(
+                    "pf_prestage",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    start=start,
+                    end=end,
+                    last=1 if last_chunk else 0,
+                )
                 req.pdho_prepped = {
                     "start": start,
                     "end": end,
@@ -1311,12 +1322,16 @@ class SchedulerDisaggregationPrefillMixin:
         prepped = getattr(req, "pdho_prepped", None)
         req.pdho_prepped = None  # one-shot: consume or discard
         if prepped is None or not self._pdho_early_send_eligible():
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="nostash" if prepped is None else "ineligible")
             return False
         if req.pending_bootstrap or req.disagg_kv_sender is None:
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="pending")
             return False
         if prepped["start"] != req.start_send_idx:
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="stale", want=prepped["start"], have=req.start_send_idx)
             return False  # stale stash (requeue/retry moved the window)
         if prepped["last"] and next_token_id is None:
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="notoken")
             return False
         sender = req.disagg_kv_sender
         if prepped["last"]:
