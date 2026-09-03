@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, List
 
 import numpy as np
+import os
 import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
@@ -133,15 +134,19 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
     Uses power-of-2 sizes plus intermediate points to cover the shape space
     that fused_moe, attention extend, and other Triton kernels may encounter.
+    Under chunked PD prefill every scheduled batch is one chunk, so capping the
+    max size at the chunk size (SGLANG_WARMUP_PREFILL_SHAPES_MAX) is sufficient
+    and keeps the warmup KV footprint small.
     """
     page_size = 64
+    max_size = int(os.environ.get("SGLANG_WARMUP_PREFILL_SHAPES_MAX", "32768"))
     sizes = set()
     base = 64
-    while base <= 32768:
+    while base <= max_size:
         sizes.add(base)
         mid = base * 3 // 2
         mid = (mid + page_size - 1) // page_size * page_size
-        if mid <= 32768:
+        if mid <= max_size:
             sizes.add(mid)
         base *= 2
     sizes = sorted(sizes)
