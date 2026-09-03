@@ -877,6 +877,7 @@ class SessionMigrationAgent:
 
             # 5. Import as host-only radix nodes.
             man_tokens = push_resp["tokens"]
+            t_ins0 = time.perf_counter()
             matched, imported = self.exec.run(
                 lambda: import_session(
                     self.tree_cache,
@@ -887,6 +888,7 @@ class SessionMigrationAgent:
                 ),
                 timeout=timeout,
             )
+            t_insert = time.perf_counter() - t_ins0
             # The matched prefix keeps the target's own rows; free what we
             # pre-allocated for it (insert_host used slots[matched:]).
             if matched > 0:
@@ -919,7 +921,8 @@ class SessionMigrationAgent:
                 "t_xfer_s": xfer_s,
                 "t_export_s": push_resp.get("t_export_s"),
                 "t_verify_s": round(t_verify, 6),
-                "t_insert_s": None,
+                "t_insert_s": round(t_insert, 6),
+                "t_holder_checksum_s": push_resp.get("t_checksum_s"),
                 "gbps": round((nbytes / 1e9) / xfer_s, 3) if xfer_s else None,
                 "verified": verified,
             }
