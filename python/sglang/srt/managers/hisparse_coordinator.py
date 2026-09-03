@@ -360,8 +360,16 @@ class HiSparseCoordinator:
             )
             # Separate event set from the decode path: decode and verify graphs
             # are distinct captures, and a shared event would couple them.
+            # One event per (skip-slot, draft position): the anchor forks the
+            # prefetch stream after EVERY position's kernel (position p's plan
+            # is complete then), so position p's copies overlap the anchor's
+            # remaining position kernels instead of waiting for the group's
+            # last plan (scout-hardware h2d-phase-overlap: the two host->device
+            # phases are independent per position; only plan(p) -> copy(p) is a
+            # real dependency).
             self._prefetch_events_v = [
-                device_module.Event() for _ in range(max_group_size)
+                [device_module.Event() for _ in range(max_group_size)]
+                for _ in range(n_pos)
             ]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
@@ -1460,10 +1468,11 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         num_newest > 1 is an MTP target-verify position p = num_newest-1: the
-        anchor records one plan per position and, once the last position's plan
-        is recorded, issues one multi-position IO group per skip layer on the
-        prefetch stream; skip layers wait for the group and reuse the anchor's
-        stashed per-position slot tables (lockstep layout).
+        anchor records one plan per position and forks the prefetch stream
+        after every position's kernel, so position p's copies overlap the
+        anchor's remaining position kernels; skip layers wait per (position,
+        slot) event and reuse the anchor's stashed per-position slot tables
+        (lockstep layout).
         """
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
@@ -1542,7 +1551,9 @@ class HiSparseCoordinator:
         p = num_newest - 1
         if self._is_shared_index_layer[layer_id]:
             slot = self._prefetch_slot[layer_id]
-            self._prefetch_events_v[slot].wait(device_module.current_stream())
+            # Each position's call waits its own copy event; the layer's
+            # attention runs after the last call, hence after all of them.
+            self._prefetch_events_v[p][slot].wait(device_module.current_stream())
             return self._verify_slot_table[p][:num_reqs]
 
         group = self._prefetch_groups.get(layer_id)
@@ -1558,17 +1569,16 @@ class HiSparseCoordinator:
         # Stash this position's slot table before the next position's kernel
         # overwrites top_k_device_locs_buffer (skip layers replay it).
         self._verify_slot_table[p][:num_reqs].copy_(anchor_locs)
-        if group and num_newest == self.num_draft_tokens:
-            # All positions' plans are recorded: fork once and issue one
-            # multi-position IO group per skip layer. The per-position copies
-            # are independent (a token missed by position p is a hit for every
-            # other position, so each planned row belongs to exactly one plan).
+        if group:
+            # Fork after every position: position p's plan is complete, its
+            # copies can overlap the anchor's remaining position kernels. The
+            # per-position plans are disjoint (a token missed by position p is
+            # a hit for every later position), so the copies are independent.
             self.prefetch_stream.wait_stream(device_module.current_stream())
             with device_module.stream(self.prefetch_stream):
                 for skip_layer in group:
-                    for q in range(self.num_draft_tokens):
-                        self._run_copy_only_kernel(num_reqs, skip_layer, plan_slot=q)
-                    self._prefetch_events_v[self._prefetch_slot[skip_layer]].record(
+                    self._run_copy_only_kernel(num_reqs, skip_layer, plan_slot=p)
+                    self._prefetch_events_v[p][self._prefetch_slot[skip_layer]].record(
                         self.prefetch_stream
                     )
         return anchor_locs
