@@ -131,6 +131,11 @@ class HiSparseRadixCache(RadixCache):
         safe_len = coord.flush_pending_to_host(req, kv_len_to_handle)
         rows_all = coord.host_rows_snapshot(req)
         host_len = int(rows_all.numel())
+        missing_rows = (rows_all < 0).nonzero()
+        if missing_rows.numel() > 0:
+            # Defense-in-depth (store-degradation-rollback): never
+            # let an unfilled row enter the retained range.
+            host_len = min(host_len, int(missing_rows[0]))
         adopted = int(coord.req_adopted_len[idx])
         prot = req.cache_protected_len
 
@@ -145,18 +150,55 @@ class HiSparseRadixCache(RadixCache):
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
+        if key_len > host_len:
+            # Store-degradation-rollback: the host mirror is shorter
+            # than the page-aligned radix key (the finish-flush could
+            # not grow it). Roll the save watermark back to the
+            # mirrored head instead of dying: insert/retain only
+            # [0:host_len) — a later turn of the session re-prefills
+            # the tail.
+            clamped = (host_len // self.page_size) * self.page_size
+            logger.warning(
+                "HiSparse retention: host mirror short for %s "
+                "(key_len=%d host_len=%d adopted=%d) — retaining "
+                "%d-token head only",
+                req.rid,
+                key_len,
+                host_len,
+                adopted,
+                clamped,
+            )
+            radix_key = radix_key[:clamped]
+            key_len = clamped
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
-        assert (
-            key_len <= host_len
-        ), f"host mirror shorter than the insert range: {key_len=} {host_len=}"
         # The adopted prefix is mirrored by construction (adopt_prefix seeds
         # the host table with the tree's rows), so the key can never end
         # inside the locked prefix; freeing [key_len:] below would otherwise
         # free logical indices the tree still serves.
-        assert key_len >= prot, (
-            f"radix key shorter than the protected prefix: {key_len=} {prot=} "
-            f"{safe_len=} {adopted=}"
-        )
+        if key_len < prot:
+            # Store-degradation-rollback: the (possibly clamped) key
+            # ends inside the locked prefix. Skipping the insert is
+            # the only safe rollback — the frees below would
+            # otherwise release tree-owned rows. Free only this
+            # request's own indices and host rows, warn, keep the
+            # engine alive; a later turn re-prefills.
+            logger.warning(
+                "HiSparse retention: radix key (%d) shorter than "
+                "protected prefix (%d) for %s — skipping retention "
+                "insert",
+                key_len,
+                prot,
+                req.rid,
+            )
+            if host_len > adopted:
+                coord.free_unretained_rows(rows_all[adopted:])
+            coord.release_for_retention(req)
+            self.token_to_kv_pool_allocator.free_segments(
+                [(full_kv[prot:], prot)]
+            )
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+            return
 
         # 2. Insert; freed_end = length already present in the tree.
         if is_insert:
