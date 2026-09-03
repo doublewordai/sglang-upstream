@@ -631,6 +631,9 @@ class Envs:
     # full-GPU-grid kernel copies the recorded miss plan (warp per row).
     # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
     SGLANG_HISPARSE_WIDE_GATHER = EnvBool(True)
+    # mk-batch-curve: size the narrow copy_cache_planned fallback grid by bytes
+    # (one CTA per 64 KiB of worst-case miss bytes, capped at the SM count)
+    SGLANG_HISPARSE_RIGHTSIZE_COPY_GRID = EnvBool(False)
 
     # HiSparse IO streams (write-staging / decode-backup / shared-index
     # prefetch / the swap-in gather) bound to a CUDA green context holding this

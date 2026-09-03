@@ -200,6 +200,7 @@ class HiSparseCoordinator:
         self._wide_gather = (
             envs.SGLANG_HISPARSE_WIDE_GATHER.get() and not self.is_dsv4_hisparse
         )
+        self._rightsize_copy_grid = envs.SGLANG_HISPARSE_RIGHTSIZE_COPY_GRID.get()
         self._sm_count = torch.cuda.get_device_properties(
             device
         ).multi_processor_count
@@ -1978,6 +1979,16 @@ class HiSparseCoordinator:
         if self._wide_gather and not self.skip_io:
             self._run_wide_copy_kernel(num_reqs, skip_layer)
             return
+        num_blocks = self._prefetch_copy_blocks
+        if self._rightsize_copy_grid:
+            # Size the grid by bytes: one CTA per 64 KiB of worst-case miss
+            # bytes, capped at the SM count.  The kernel warp-strides the
+            # flattened (request, miss) space, so any grid is byte-identical;
+            # the fixed 4-CTA grid measured 43.5 GB/s vs 141 GB/s right-sized
+            # at b=16 x 2048-row plans on the mk-batch-curve rig (GH200,
+            # 2026-09-03), byte-identical outputs verified.
+            worst_bytes = num_reqs * self.top_k * self.item_size_bytes
+            num_blocks = min((worst_bytes + 65535) // 65536, self._sm_count)
         copy_cache_planned_mla(
             miss_src=miss_src,
             miss_dst=miss_dst,
@@ -1986,7 +1997,7 @@ class HiSparseCoordinator:
             host_cache=self.mem_pool_host.kv_buffer[skip_layer],
             device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
             item_size_bytes=self.item_size_bytes,
-            num_blocks=self._prefetch_copy_blocks,
+            num_blocks=num_blocks,
             is_dsv4_layout=self.is_dsv4_hisparse,
             skip_io=self.skip_io,
         )
