@@ -624,6 +624,20 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # draft-prefetch lane probe: per verify step, stash the draft seed top-k,
+    # the target's per-layer/per-position top-k, the per-layer resident tables,
+    # per-(layer,position) swap-in CUDA-event timings and miss counts, then
+    # append one JSON line per step to SGLANG_DPF_PROBE_OUT. Works with the
+    # eager and CUDA-graph verify paths; spec (target_verify) only.
+    SGLANG_DPF_PROBE = EnvBool(False)
+    SGLANG_DPF_PROBE_OUT = EnvStr("")
+    SGLANG_DPF_PROBE_REQS = EnvInt(2)
+    SGLANG_DPF_PROBE_RAW_STEPS = EnvInt(0)
+    # draft-prefetch: after the draft step, prefetch (draft seed top-k -
+    # resident) rows into each layer's device buffer on the coordinator's
+    # side stream, ordered by layer; the verify swap-ins wait per layer.
+    # Exact by construction (cache fill only).
+    SGLANG_DPF_PREFETCH = EnvBool(False)
     # Diagnostic: log HiSparse verify-step miss counts (per draft position,
     # last anchor group's plans) every N verify steps; 0 = off.
     SGLANG_HISPARSE_MISS_LOG = EnvInt(0)

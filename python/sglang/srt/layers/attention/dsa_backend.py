@@ -2395,6 +2395,17 @@ class DeepseekSparseAttnBackend(
                 )
                 n = self.speculative_num_draft_tokens
                 topk_pos = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                if (
+                    getattr(self.hisparse_coordinator, "dpf_prefetch_enabled", False)
+                    and layer.layer_id == 0
+                ):
+                    # Fork the draft-seed prefetch before the first real
+                    # swap-in of the step (no-op after the first position).
+                    self.hisparse_coordinator.begin_draft_prefetch(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        topk_pos.shape[0] // n,
+                    )
                 ragged_layout = self._resolve_ragged_verify_layout(forward_batch)
                 if ragged_layout is not None:
                     page_table_1 = self._hisparse_ragged_verify_page_table(
@@ -2409,33 +2420,65 @@ class DeepseekSparseAttnBackend(
                     tk = topk_pos.view(bs, n, -1)
                     out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
                     outv = out.view(bs, n, -1)
+                    probe = getattr(self.hisparse_coordinator, "dpf_probe", None)
+                    if probe is not None:
+                        probe.on_verify_layer(
+                            layer.layer_id,
+                            tk,
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens,
+                            bs,
+                            n,
+                        )
                     for p in range(n):
+                        if (
+                            self.hisparse_coordinator.dpf_prefetch_enabled
+                            and self.hisparse_coordinator._dprefetch_forked
+                        ):
+                            # Join this layer's seed prefetch (recorded at the
+                            # layer-0 fork earlier in this same step/capture)
+                            # before the real swap-in reads the buffer.
+                            self.hisparse_coordinator.wait_layer_prefetch(
+                                layer.layer_id
+                            )
+                        ev = (
+                            probe.events_for(layer.layer_id, p)
+                            if probe is not None
+                            else None
+                        )
+                        if ev is not None:
+                            ev[0].record()
                         pt = self.hisparse_coordinator.swap_in_selected_pages(
                             forward_batch.req_pool_indices,
                             forward_batch.seq_lens + (p + 1),
                             tk[:, p].contiguous(),
                             layer.layer_id,
                             num_newest=p + 1,
+                            probe_plan=probe.plan() if probe is not None else None,
                         )
+                        if ev is not None:
+                            ev[1].record()
+                        if probe is not None:
+                            probe.after_swap_in(layer.layer_id, p)
                         outv[:, p].copy_(pt)
-                if (
-                    envs.SGLANG_MTP_DEBUG.get()
-                    and layer.layer_id == 0
-                    and not getattr(self, "_mtp_dbg_fe_logged", False)
-                ):
-                    self._mtp_dbg_fe_logged = True
-                    logger.warning(
-                        "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
-                        "row0[:12] %s | seq_lens %s out_cache_loc %s",
-                        tuple(page_table_1.shape),
-                        page_table_1[0, :12].tolist()
-                        if page_table_1.dim() == 2
-                        else page_table_1.view(-1)[:12].tolist(),
-                        forward_batch.seq_lens[:4].tolist(),
-                        forward_batch.out_cache_loc[:8].tolist()
-                        if forward_batch.out_cache_loc is not None
-                        else None,
-                    )
+                    if (
+                        envs.SGLANG_MTP_DEBUG.get()
+                        and layer.layer_id == 0
+                        and not getattr(self, "_mtp_dbg_fe_logged", False)
+                    ):
+                        self._mtp_dbg_fe_logged = True
+                        logger.warning(
+                            "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
+                            "row0[:12] %s | seq_lens %s out_cache_loc %s",
+                            tuple(page_table_1.shape),
+                            page_table_1[0, :12].tolist()
+                            if page_table_1.dim() == 2
+                            else page_table_1.view(-1)[:12].tolist(),
+                            forward_batch.seq_lens[:4].tolist(),
+                            forward_batch.out_cache_loc[:8].tolist()
+                            if forward_batch.out_cache_loc is not None
+                            else None,
+                        )
             else:
                 has_retained_prefix = bool(
                     forward_batch.extend_prefix_lens_cpu
