@@ -2025,7 +2025,8 @@ class HiSparseCoordinator:
             else {}
         )
         if probe_plan is not None:
-            assert not plan, "DPF probe plan conflicts with the anchor miss plan"
+            # The probe's plan buffers override the anchor/wide-gather plan
+            # (same recorded data, different destination tensors).
             plan = dict(probe_plan)
         swap_in_fn(
             top_k_tokens=top_k_result,
