@@ -354,8 +354,13 @@ class HiSparseCoordinator:
         pattern as the shared-index prefetch fork). req_pool_indices/seq_lens
         must be the same tensors the real swap-ins use so replays see current
         values."""
-        if not self.dpf_prefetch_enabled or self._dprefetch_forked:
+        if not self.dpf_prefetch_enabled:
             return
+        # NOTE: no `_dprefetch_forked` early-return here — every verify
+        # forward must fork (the warmup AND capture forwards each record
+        # their own events; skipping the capture-time fork makes the
+        # in-capture event waits join eager-warmup events -> capture
+        # invalidation). `_dprefetch_forked` stays as the p-loop gate only.
         self._dprefetch_forked = True
         # Match the real swap-in's position-0 window: seq_lens + 1 with
         # num_newest=1 binds the window [S, S+1) to the reserved page; the
