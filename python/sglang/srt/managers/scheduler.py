@@ -3072,13 +3072,13 @@ class Scheduler(
         bound = self._pdho_inflight_bound_tokens()
         if (
             self.disaggregation_mode != DisaggregationMode.PREFILL
-            or not hasattr(self, "disagg_prefill_inflight_queue")
+            or not self._disagg_prefill_inflight_reqs()
         ):
             return False, []
         holders = []
         total = 0
         now = time.perf_counter()
-        for req in self.disagg_prefill_inflight_queue:
+        for req in self._disagg_prefill_inflight_reqs():
             toks = self._req_held_kv_tokens(req)
             if toks <= 0:
                 continue
@@ -3101,6 +3101,15 @@ class Scheduler(
             return False, holders
         holders.sort(key=lambda h: h["tokens"], reverse=True)
         return True, holders
+
+    def _disagg_prefill_inflight_reqs(self) -> List["Req"]:
+        """The in-flight handover queue as a list. None on non-prefill
+        schedulers (set to None in __init__, only prefill disagg rebinds it to
+        a list) — getattr/hasattr both see the attribute, so guard the value.
+        Bound10: iterating it unguarded crashed the DECODE scheduler 7s after
+        ready via get_internal_state (router /get_server_info probe)."""
+        q = getattr(self, "disagg_prefill_inflight_queue", None)
+        return q if q else []
 
     def _pdho_inflight_state(self) -> tuple:
         """(in-flight handover tokens, bound tokens, cumulative blocks) for
@@ -5363,9 +5372,7 @@ class Scheduler(
                     "inflight_handover_tokens": int(
                         sum(
                             self._req_held_kv_tokens(r)
-                            for r in getattr(
-                                self, "disagg_prefill_inflight_queue", []
-                            )
+                            for r in self._disagg_prefill_inflight_reqs()
                         )
                     ),
                     "inflight_bound_tokens": int(
@@ -5375,7 +5382,11 @@ class Scheduler(
                         self._pdho_reserve_tokens()
                     ),
                     "reclaimable_tokens": int(
-                        self.tree_cache.device_pool_reclaimable_tokens()
+                        getattr(
+                            self.tree_cache,
+                            "device_pool_reclaimable_tokens",
+                            lambda: 0,
+                        )()
                     ),
                     "backpressure_blocks": int(
                         getattr(self, "pdho_backpressure_blocks", 0)
