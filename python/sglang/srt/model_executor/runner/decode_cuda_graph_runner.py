@@ -1482,6 +1482,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
+                    ragged_verify_layout=(
+                        self._capture_ragged_verify_layout(num_tokens)
+                        if self.ragged_verify_mode
+                        else None
+                    ),
                 )
                 # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
                 spec_info.hidden_states = torch.zeros(
