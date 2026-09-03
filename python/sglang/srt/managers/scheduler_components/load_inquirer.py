@@ -185,6 +185,42 @@ class SchedulerLoadInquirer:
                     except (AttributeError, TypeError) as e:
                         logger.debug(f"HiCache host pool metrics not available: {e}")
 
+        # Device token-pool lock breakdown (prefill-oom-1328): same taxonomy
+        # as the [pool-locks] log line and the attributed OOM message, so the
+        # master /metrics sees per-rank WHO holds the device pool. Only the
+        # prefill arm is wired here; decode holders (park/migration) join the
+        # same fields when their lanes wire them.
+        (
+            dev_free,
+            dev_evictable,
+            dev_locked_transfer,
+            dev_locked_forward,
+            dev_locked_admission,
+            dev_locked_store_acks,
+            dev_locked_migration,
+            dev_oldest_transfer_age_s,
+            dev_oldest_admission_age_s,
+        ) = (-1, -1, -1, -1, -1, -1, -1, -1.0, -1.0)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            try:
+                from sglang.srt.managers.scheduler_components.pool_lock_breakdown import (
+                    LoadInquirerAdapter,
+                    compute_pool_lock_breakdown,
+                )
+
+                b = compute_pool_lock_breakdown(LoadInquirerAdapter(self))
+                dev_free = b.get("free", -1)
+                dev_evictable = b.get("evictable", -1)
+                dev_locked_transfer = b["transfer"].tokens
+                dev_locked_forward = b["forward"].tokens
+                dev_locked_admission = b["admission"].tokens
+                dev_locked_store_acks = b["store"].n
+                dev_locked_migration = b["migration"].tokens
+                dev_oldest_transfer_age_s = b["transfer"].oldest_age_s
+                dev_oldest_admission_age_s = b["admission"].oldest_age_s
+            except Exception as e:
+                logger.debug(f"device pool lock breakdown not available: {e}")
+
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
@@ -284,6 +320,15 @@ class SchedulerLoadInquirer:
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
             host_pool_free_tokens=host_pool_free_tokens,
+            device_token_pool_free_tokens=dev_free,
+            device_token_pool_evictable_tokens=dev_evictable,
+            device_token_pool_locked_transfer_tokens=dev_locked_transfer,
+            device_token_pool_locked_forward_tokens=dev_locked_forward,
+            device_token_pool_locked_admission_tokens=dev_locked_admission,
+            device_token_pool_locked_store_acks=dev_locked_store_acks,
+            device_token_pool_locked_migration_tokens=dev_locked_migration,
+            device_token_pool_oldest_transfer_age_s=dev_oldest_transfer_age_s,
+            device_token_pool_oldest_admission_age_s=dev_oldest_admission_age_s,
             host_pool_total_tokens=host_pool_total_tokens,
             host_pool_pinned_tokens=host_pool_pinned_tokens,
             host_pool_evictable_tokens=host_pool_evictable_tokens,

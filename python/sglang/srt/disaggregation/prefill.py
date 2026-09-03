@@ -33,6 +33,9 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
+from sglang.srt.managers.scheduler_components.pool_lock_breakdown import (
+    maybe_log_pool_locks,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
@@ -704,6 +707,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.tree_cache.check_hicache_events()
 
         self.process_pending_chunked_abort()
+
+        # prefill-oom-1328: per-category lock accounting (cadence-gated; also
+        # wires the attributed-failure hook onto the tree cache).
+        maybe_log_pool_locks(self)
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
