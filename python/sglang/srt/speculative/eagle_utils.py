@@ -628,6 +628,7 @@ def _eagle_prepare_ragged_verify(
     from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
         CompactRowIndex,
     )
+    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
     bs = len(batch.req_pool_indices)
     device = batch.device

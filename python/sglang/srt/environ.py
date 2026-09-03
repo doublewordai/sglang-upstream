@@ -1150,6 +1150,8 @@ class Envs:
     # graphs) and a warning is logged.
     SGLANG_EAGLE_SPS_TABLE = EnvStr("")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Lane debug: log ragged verify page-table shapes/values (one line per call).
+    SGLANG_RAGGED_DEBUG = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

@@ -2652,6 +2652,20 @@ class DeepseekSparseAttnBackend(
         gather_idx = torch.where(
             valid, safe_req * n + within, torch.zeros_like(within)
         )
+        if envs.SGLANG_RAGGED_DEBUG.get():
+            logger.error(
+                "RAGGED-DBG pt: slots=%d n=%d T=%d width=%d rows(out)=%d "
+                "vl=%s idxmax=%d within_max=%d req_id_max=%d",
+                slots,
+                n,
+                T,
+                width,
+                out.shape[0],
+                verify_lens.tolist(),
+                int(gather_idx.max()),
+                int(within.max()) if within.numel() else -1,
+                int(safe_req.max()) if safe_req.numel() else -1,
+            )
         return out.view(slots * n, -1)[gather_idx]
 
     def forward_decode(
