@@ -561,18 +561,18 @@ class TestResolveSpecGate(unittest.TestCase):
             is_speculative=kw.get("is_speculative", True),
         )
 
-    def test_spec_off_by_default(self):
+    def test_spec_default_on(self):
         import os
 
         os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
-        self.assertIsNone(self._resolve(self._config()))
+        self.assertTrue(any(self._resolve(self._config())))
 
-    def test_spec_flag_enables(self):
+    def test_spec_flag_zero_fallback(self):
         import os
 
-        os.environ["SGLANG_HISPARSE_SPEC_PREFETCH"] = "1"
+        os.environ["SGLANG_HISPARSE_SPEC_PREFETCH"] = "0"
         try:
-            self.assertTrue(any(self._resolve(self._config())))
+            self.assertIsNone(self._resolve(self._config()))
         finally:
             os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
 

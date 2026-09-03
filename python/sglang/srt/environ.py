@@ -294,6 +294,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # fast-boot: stage safetensors mmap views into anon CPU storage before H2D
+    # (removes the 2-6x file-page re-read of pageable H2D; byte-identical).
+    SGLANG_WEIGHT_LOAD_STAGE_VIEWS = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -625,11 +628,13 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
 
-    # Opt-in for the MTP verify path multi-position shared-index prefetch
-    # (union swap-in per skip layer). Default False: speculative decoding
-    # keeps the synchronous per-position swap-in; the decode path stays
-    # default-on (upstream behavior).
-    SGLANG_HISPARSE_SPEC_PREFETCH = EnvBool(False)
+    # MTP verify path's multi-position shared-index prefetch (union swap-in
+    # per skip layer). Default True (merge policy 2026-09-03: exact and
+    # measured-positive lands as the default path): the per-position fork
+    # measures 2.6-3.2x vs the synchronous per-position swap-in and is
+    # bit-identical. Set 0 to restore the synchronous fallback (speculation
+    # itself is default-off in prod, so this only affects spec runs).
+    SGLANG_HISPARSE_SPEC_PREFETCH = EnvBool(True)
     # Debug: verify each step swap-in selection contains distinct token
     # positions (kernel miss-compaction invariant; see hisparse_coordinator).
     SGLANG_DEBUG_HISPARSE_CHECK_TOPK = EnvBool(False)
@@ -777,6 +782,12 @@ class Envs:
     # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
     # hugetlb mmap failure, THP coverage below ~98%).
     SGLANG_HUGEPAGE_STRICT = EnvBool(False)
+    # Pools smaller than this many bytes stay on base pages even when
+    # SGLANG_HUGEPAGE_SIZE is set (v16-memory-plan sizing: only the large
+    # decode hisparse host pool is hugetlb-backed; hicache/shadow pools on
+    # base pages). The register-size fix makes small hugetlb pools pin fine,
+    # so this is tunable; default keeps the v16 behavior (32 GiB).
+    SGLANG_HUGEPAGE_MIN_BYTES = EnvInt(32 * (1 << 30))
     # Disable transparent hugepages for the whole engine process tree at init
     # (prctl PR_SET_THP_DISABLE, inherited by children). Stops khugepaged/
     # kcompactd churn on non-pool host allocations while the pools themselves
@@ -1534,6 +1545,13 @@ class Envs:
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
     SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    # lane/pagetable-gather: in the chunked-mqa PAGED prefill top-k path,
+    # pass the per-step page table to the 1-pass kernel whole plus a per-row
+    # table-row map (row_to_page) instead of materializing
+    # page_table_1[batch_idx] as a [rows, L] int32 copy per row-chunk per
+    # topk layer (~31 GB/layer of HBM writes at L~950k, 5x redundant across
+    # the step). Identity-exact; requires SGLANG_DSA_TOPK_PREFILL_1PASS=1.
+    SGLANG_DSA_PAGETABLE_HOIST = EnvBool(False)
     # lane/streamindex-topk: key-chunked scorer + partition-merge candidate
     # maintenance for the prefill indexer top-k; the [q, L] logits tensor
     # never exists (exact top-2048, tie-consistent at the boundary).
@@ -1606,6 +1624,13 @@ class Envs:
     # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
     # than the production kernel; kept for development/A-B, default OFF.
     SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-fused persistent Triton kernel: single launch,
+    # in-kernel split+combine (no second launch / combine kernel), grid
+    # capped at co-resident capacity so it is deadlock-free at any batch.
+    # Numerics: prod-class vs the fp32 oracle (0.17-0.21% of RMS), NOT
+    # bit-exact vs FlashMLA (different dequant path and split order).
+    SGLANG_DSA_DECODE_FUSED_PERSISTENT = EnvBool(False)
     # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
     # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
     # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV

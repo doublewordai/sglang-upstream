@@ -527,6 +527,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
         alloc_bytes = math.ceil(n_bytes / page_size) * page_size
         array = _alloc_thp(n_bytes, alloc_bytes, strict)
         tensor = torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
+        tensor._sglang_mmap_alloc_bytes = alloc_bytes
         log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
         return tensor
 
@@ -563,6 +564,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
                 tensor = torch.frombuffer(
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
+                tensor._sglang_mmap_alloc_bytes = alloc_bytes
                 log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
                 return tensor
             except OSError as e:
@@ -580,6 +582,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
     mm = _alloc_plain(alloc_bytes)
     tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    tensor._sglang_mmap_alloc_bytes = alloc_bytes
     log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
     return tensor
 

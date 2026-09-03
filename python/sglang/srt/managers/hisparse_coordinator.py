@@ -84,14 +84,15 @@ def resolve_shared_index_layers(
         return None
     if is_speculative and not envs.SGLANG_HISPARSE_SPEC_PREFETCH.get():
         # The MTP verify path's multi-position prefetch (one IO group per skip
-        # layer over the union of the draft positions' selections) is opt-in:
-        # default remains the pre-lane synchronous per-position swap-in so
-        # integration behavior is unchanged until the flag is set. The decode
-        # path (num_draft_tokens == 1) keeps the default-on upstream behavior.
+        # layer over the union of the draft positions' selections) is the
+        # DEFAULT (exact + measured-positive, 2.6-3.2x vs synchronous); this
+        # branch is the documented synchronous fallback, taken when
+        # SGLANG_HISPARSE_SPEC_PREFETCH=0. The decode path (num_draft_tokens
+        # == 1) is unaffected.
         logger.info(
-            "HiSparse shared-index prefetch under speculative decoding is "
-            "off by default; set SGLANG_HISPARSE_SPEC_PREFETCH=1 to enable "
-            "the multi-position verify prefetch. Using synchronous swap-in."
+            "HiSparse shared-index prefetch under speculative decoding "
+            "disabled via SGLANG_HISPARSE_SPEC_PREFETCH=0; using "
+            "synchronous swap-in."
         )
         return None
     if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
@@ -579,6 +580,10 @@ class HiSparseCoordinator:
         # position has its own selection set and newest-token window). The
         # anchor records position p's plan into slot p; the skip layers replay
         # all positions' plans as one IO group on the prefetch stream.
+        # [mtp-speed 2026-09-03] restored verbatim from lane/hisparse-prefetch-spec:
+        # the merge into integration-0902 kept the _verify_swap_in users but
+        # dropped this allocation — spec boots died at decode graph capture with
+        # TypeError: 'NoneType' object is not subscriptable (line ~2099).
         if self.num_draft_tokens > 1:
             n_pos = self.num_draft_tokens
             self._miss_src_v = torch.zeros(
@@ -608,9 +613,13 @@ class HiSparseCoordinator:
             # prefetch stream after EVERY position's kernel (position p's plan
             # is complete then), so position p's copies overlap the anchor's
             # remaining position kernels instead of waiting for the group's
-            # last plan (scout-hardware h2d-phase-overlap: the two host->device
-            # phases are independent per position; only plan(p) -> copy(p) is a
-            # real dependency).
+            # last plan (h2d-phase-overlap: the two host->device phases are
+            # independent per position; only plan(p) -> copy(p) is a real
+            # dependency). NOTE: this tree's _verify_swap_in uses the nested
+            # [p][slot] indexing with the per-position fork (the measured
+            # variant, -1.3..-7.6 ms/step vs the flat group-fork); mtp-speed's
+            # flat shape exists for trees whose _verify_swap_in group-forks.
+            # Do not mix shapes (mtp-speed b7797f3bd3).
             self._prefetch_events_v = [
                 [device_module.Event() for _ in range(max_group_size)]
                 for _ in range(n_pos)
