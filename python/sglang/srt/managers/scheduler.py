@@ -3868,9 +3868,13 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
-        if cold_trace_enabled() and self.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in can_run_list:
-                cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
+        if cold_trace_enabled():
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                for req in can_run_list:
+                    cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
+            else:
+                for req in can_run_list:
+                    cold_trace("sched_forward", rid=req.rid, pc=time.perf_counter())
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
