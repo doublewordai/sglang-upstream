@@ -1249,6 +1249,13 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+        # [lane attn-streams] Static FlashMLA schedule cache (long-context decode:
+        # every dsa_cache_seqlens entry equals dsa_index_topk, so the schedule is
+        # a per-bs constant) and the set of batch sizes whose paged-mqa schedule
+        # refresh was captured in-graph. See SGLANG_DSA_IN_GRAPH_METADATA.
+        self._flashmla_const_cache: Dict = {}
+        self._paged_mqa_in_graph: set = set()
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -1658,7 +1665,15 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        # [lane attn-streams] Skip when the refresh was captured in-graph (the
+        # captured refresh runs on every replay and reads the same static lens).
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and bs in self._paged_mqa_in_graph
+            and forward_mode.is_decode_or_idle()
+        ):
+            pass
+        elif is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -1863,7 +1878,14 @@ class DeepseekSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        # [lane attn-streams] Skip when the refresh was captured in-graph.
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and bs in self._paged_mqa_in_graph
+            and forward_mode.is_decode_or_idle()
+        ):
+            pass
+        elif is_cuda():
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
             else:
@@ -2017,10 +2039,62 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if forward_batch.forward_mode.is_target_verify():
+                # pd/mtp-hisparse: TARGET_VERIFY dispatches to forward_extend
+                # (base AttentionBackend.forward routes every non-decode mode
+                # here), so the verify page table must be built HERE, not in
+                # forward_decode. The generic translate below cannot be used:
+                # full_to_hisparse_device_index_mapping is write-steering
+                # state (alloc_device_buffer clears it at admission; only the
+                # current step's new tokens are ever set), so it would point
+                # the whole committed history at device row 0.
+                # Instead run one swap-in per draft position p (query rows
+                # p, n+p, 2n+p, ...): position p's causal range is
+                # [0, seq_len + p + 1) and its window of p+1 tokens written
+                # this step resolves via num_newest=p+1 (1:1 slots below
+                # device_buffer_size, reserved page above). Results are
+                # interleaved back to row order.
+                assert topk_indices is not None, (
+                    "hisparse target-verify requires the indexer's topk "
+                    "positions"
+                )
+                n = self.speculative_num_draft_tokens
+                topk_pos = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                bs = topk_pos.shape[0] // n
+                tk = topk_pos.view(bs, n, -1)
+                out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
+                outv = out.view(bs, n, -1)
+                for p in range(n):
+                    pt = self.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens + (p + 1),
+                        tk[:, p].contiguous(),
+                        layer.layer_id,
+                        num_newest=p + 1,
+                    )
+                    outv[:, p].copy_(pt)
+                if (
+                    envs.SGLANG_MTP_DEBUG.get()
+                    and layer.layer_id == 0
+                    and not getattr(self, "_mtp_dbg_fe_logged", False)
+                ):
+                    self._mtp_dbg_fe_logged = True
+                    logger.warning(
+                        "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
+                        "row0[:12] %s | seq_lens %s out_cache_loc %s",
+                        tuple(out.shape),
+                        out[0, :12].tolist(),
+                        forward_batch.seq_lens[:4].tolist(),
+                        forward_batch.out_cache_loc[:8].tolist(),
+                    )
+                page_table_1 = out
+            else:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = (
+                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        page_table_1
+                    ).to(torch.int32)
+                )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2268,32 +2342,15 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
-            if forward_batch.forward_mode.is_target_verify():
-                # pd/mtp-hisparse: one swap-in per draft position p (query rows
-                # p, n+p, 2n+p, ...); position p sees the window of p+1 tokens
-                # written this step. Results are interleaved back to row order.
-                n = self.speculative_num_draft_tokens
-                bs = topk_indices.shape[0] // n
-                tk = topk_indices.view(bs, n, -1)
-                out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
-                outv = out.view(bs, n, -1)
-                for p in range(n):
-                    pt = self.hisparse_coordinator.swap_in_selected_pages(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens + (p + 1),
-                        tk[:, p].contiguous(),
-                        layer.layer_id,
-                        num_newest=p + 1,
-                    )
-                    outv[:, p].copy_(pt)
-                page_table_1 = out
-            else:
-                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    topk_indices,
-                    layer.layer_id,
-                )
+            # NOTE: TARGET_VERIFY never reaches forward_decode (base
+            # AttentionBackend.forward routes it to forward_extend); the
+            # hisparse verify page table is built in forward_extend.
+            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                topk_indices,
+                layer.layer_id,
+            )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
@@ -3387,7 +3444,24 @@ class DeepseekSparseAttnBackend(
                     if total_kv_tokens < total_q_tokens * 512:
                         self.dsa_prefill_impl = "flashmla_sparse"
                         return
-                self.dsa_prefill_impl = "flashmla_kv"
+                    self.dsa_prefill_impl = "flashmla_kv"
+                elif (
+                    # lane/sparse-attn: opt-in native-fp8 Q8KV8 sparse prefill
+                    # on SM90 (see SGLANG_DSA_PREFILL_Q8KV8_AUTO in environ.py).
+                    # Only for plain EXTEND batches: the Q8KV8 dispatch lives in
+                    # the RAGGED branch of forward_extend, which is selected
+                    # exactly for ForwardMode.EXTEND; MIXED / target-verify /
+                    # draft-extend batches keep the flashmla_kv path.
+                    envs.SGLANG_DSA_PREFILL_Q8KV8_AUTO.get()
+                    and not is_blackwell()
+                    and forward_batch is not None
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and self.hisparse_coordinator is None
+                    and not is_dsa_enable_prefill_cp()
+                ):
+                    self.dsa_prefill_impl = "flashmla_sparse_q8"
+                else:
+                    self.dsa_prefill_impl = "flashmla_kv"
             else:
                 # bf16 kv cache
                 self.dsa_prefill_impl = "flashmla_sparse"
@@ -3419,7 +3493,13 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                # pd/mtp-hisparse: the verify page table is built by the
+                # per-position swap-in from POSITIONS; the fused topk would
+                # emit logical locs (real-page-table domain) instead.
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
@@ -3432,6 +3512,57 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
             layer_id=layer_id,
         )
+
+    def _static_flashmla_for_decode(self, bs: int):
+        """[lane attn-streams] Constant FlashMLA schedule for [topk]*bs decode.
+
+        When every request's context length is >= dsa_index_topk, compute_dsa_seqlens
+        clips all rows to topk, so the schedule (and num_splits) depend only on bs.
+        The per-step recompute in the precompute path is then step-invariant and a
+        cached entry can be reused (bit-identical inputs -> bit-identical outputs).
+        """
+        entry = self._flashmla_const_cache.get(bs)
+        if entry is None:
+            lens = torch.full(
+                (bs,), self.dsa_index_topk, dtype=torch.int32, device=self.device
+            )
+            entry = self._compute_flashmla_metadata(cache_seqlens=lens, seq_len_q=1)
+            self._flashmla_const_cache[bs] = entry
+        return entry
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """[lane attn-streams] Capture the lens-dependent DeepGEMM metadata
+        refreshes inside the graph (SGLANG_DSA_IN_GRAPH_METADATA).
+
+        The fused decode metadata kernel (eager, pre-replay) fills the static
+        cache_seqlens buffer; the captured refresh below then rebuilds the
+        paged-mqa schedule / topk-v2 plan / ctx-lens mirror from it on every
+        replay, so the eager per-step refresh in _apply_cuda_graph_metadata /
+        init_forward_metadata_replay_cuda_graph_from_precomputed can be skipped.
+        """
+        if not envs.SGLANG_DSA_IN_GRAPH_METADATA.get():
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        bs = forward_batch.batch_size
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is None or metadata.paged_mqa_schedule_metadata is None:
+            return
+        lens2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+        if metadata.paged_mqa_ctx_lens_2d is None:
+            object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", lens2d)
+        else:
+            metadata.paged_mqa_ctx_lens_2d.copy_(lens2d)
+        metadata.paged_mqa_schedule_metadata.copy_(
+            deep_gemm.get_paged_mqa_logits_metadata(
+                lens2d, 64, deep_gemm.get_num_sms()
+            )
+        )
+        if metadata.topk_v2_plan is not None:
+            from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+            metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+        self._paged_mqa_in_graph.add(bs)
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata

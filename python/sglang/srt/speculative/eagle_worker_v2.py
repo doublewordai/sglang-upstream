@@ -39,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -80,6 +84,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
+    maybe_commit_verify_tokens,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -171,8 +176,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                # spec workers don't support pipeline parallelism: run the
+                # draft as a stage-local pp_size=1 runner. Under PP+spec
+                # (prefill arm) this worker exists only on the LAST stage,
+                # whose pp-group rank holds the single NextN layer.
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -278,8 +286,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+        target_model = self.target_worker.model_runner.model
+        from sglang.srt.layers.utils.common import PPMissingLayer
+
+        # PP+spec (prefill arm): the target's embed_tokens lives on the FIRST
+        # PP stage; on the LAST stage (the only one with a draft worker) it is
+        # a PPMissingLayer. The draft's own NextN model builds an
+        # embed_tokens loaded from the same checkpoint, so keep that and
+        # share only the lm_head (which lives on the last stage).
+        target_embed = getattr(target_model.model, "embed_tokens", None)
+        if isinstance(target_embed, PPMissingLayer):
+            embed = None
+            head = target_model.lm_head.weight
+        else:
+            embed, head = target_model.get_embed_and_head()
+        target_lm_head = getattr(target_model, "lm_head", None)
 
         def maybe_share_target_lm_head():
             if (
@@ -315,7 +336,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            self.draft_runner.model.set_embed_and_head(embed, head)
+            if embed is None:
+                self.draft_runner.model.set_embed_and_head(
+                    self.draft_runner.model.model.embed_tokens.weight, head
+                )
+            else:
+                self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
     def init_attention_backend(self):
@@ -1106,17 +1132,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
+            # Target prefill. Under PP this runs on the LAST stage: the
+            # incoming pp_proxy_tensors carry the previous stage's hidden
+            # states; the outgoing draft extend is stage-local.
             target_capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                capture_hidden_mode=target_capture_mode,
+                pp_proxy_tensors=pp_proxy_tensors,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
@@ -1199,6 +1233,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            # pd/mtp-hisparse: commit after the draft-extend launch (see
+            # maybe_commit_verify_tokens) so the accept_lens D2H overlaps it.
+            maybe_commit_verify_tokens(batch, batch_output, self.target_worker)
 
             return batch_output
 

@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
+    copy_cache_planned_wide_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
@@ -134,6 +135,10 @@ class HiSparseCoordinator:
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
+        # pd/mtp-hisparse: the MTP draft model's device-resident KV pool
+        # (logical-indexed). Set by the scheduler after both exist; see
+        # remap_draft_kv_from_host_rows.
+        self.draft_pool = None
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -176,6 +181,20 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
+        # Plan-then-IO split (lanes/gather): the fused swap-in kernel plans only
+        # (its hit/LRU/evict logic is unchanged -- IO was strictly after
+        # planning) and records the miss plan; a full-GPU-grid kernel then
+        # copies the planned rows (warp per row). The per-warp copy inside the
+        # fused kernel leaves the C2C link starved at small batch (one block
+        # per request). DSA/MLA linear layout only; the DSv4 page-padded path
+        # keeps the fused kernel.
+        self._wide_gather = (
+            envs.SGLANG_HISPARSE_WIDE_GATHER.get() and not self.is_dsv4_hisparse
+        )
+        self._sm_count = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
@@ -205,8 +224,57 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
 
+        self.green_ctx = None
+        self._swapin_stream = None
+        green_sms = int(envs.SGLANG_HISPARSE_GREEN_CTX_SMS.get() or 0)
+        if green_sms > 0 and not is_hip():
+            try:
+                import torch as _torch
+
+                dev_idx = (
+                    _torch.device(device).index
+                    if _torch.device(device).index is not None
+                    else _torch.cuda.current_device()
+                )
+                self.green_ctx = _torch.cuda.GreenContext.create(
+                    green_sms, dev_idx
+                )
+                logger.info(
+                    "HiSparse: green context with %d SMs for IO streams "
+                    "(backup/prefetch/swap-in)",
+                    green_sms,
+                )
+            except Exception as e:  # pragma: no cover - driver-dependent
+                logger.warning(
+                    "HiSparse: GreenContext.create(%d) failed (%r); using "
+                    "normal streams",
+                    green_sms,
+                    e,
+                )
+                self.green_ctx = None
+        self.write_staging_stream = self._make_io_stream()
+        self.decode_backup_stream = self._make_io_stream()
+        # A dedicated green stream for the swap-in gather (issued inside the
+        # captured attention flow; fork+join events are capture-safe). Normal
+        # path keeps swap-in on the caller's current stream.
+        if self.green_ctx is not None:
+            self._swapin_stream = self._make_io_stream()
+            self._swapin_on_green = bool(
+                envs.SGLANG_HISPARSE_SWAPIN_GREEN_CTX.get()
+            )
+        else:
+            self._swapin_on_green = False
+
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
+        # Pinned D2H for the spec-v2 verify hooks: pageable .cpu() reads are
+        # stream-ordered behind queued kernels (e.g. the draft-extend replay)
+        # and pay pageable-staging overhead; these copies run on a private
+        # stream gated on the verify-sample event instead.
+        self._d2h_stream = device_module.Stream()
+        self._d2h_event = device_module.Event()
+        self._d2h_pinned = None
+        self._verify_sample_done = None
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -252,6 +320,21 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
+        # Miss-plan buffers for the plan-then-IO swap-in split: the planning
+        # kernel (every layer when the wide gather is on; each group's anchor
+        # under shared-index prefetch) records (host row, device slot) per
+        # miss, and the wide-grid copy replays them. One buffer set suffices:
+        # readers are ordered after the writer on the issuing stream(s).
+        self._miss_src = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int64, device=device
+        )
+        self._miss_dst = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=device
+        )
+        self._miss_count = torch.zeros(
+            (max_num_req_slots,), dtype=torch.int32, device=device
+        )
+
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
@@ -293,20 +376,8 @@ class HiSparseCoordinator:
         # copies overlap compute with little contention.
         self._prefetch_copy_blocks = 4
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
-        self.prefetch_stream = device_module.Stream()
+        self.prefetch_stream = self._make_io_stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
-        # Plan recorded by the current anchor, replayed by its skip layers. One
-        # buffer set suffices: the last skip layer's event wait orders the next
-        # anchor's writes after this group's copies.
-        self._miss_src = torch.zeros(
-            (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
-        )
-        self._miss_dst = torch.zeros(
-            (max_num_req_slots, self.top_k), dtype=torch.int32, device=self.device
-        )
-        self._miss_count = torch.zeros(
-            (max_num_req_slots,), dtype=torch.int32, device=self.device
-        )
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
             "group(s), %d skip layer(s) of %d total.",
@@ -314,6 +385,13 @@ class HiSparseCoordinator:
             sum(self._is_shared_index_layer),
             layer_num,
         )
+
+    def _make_io_stream(self):
+        """A stream for hisparse IO, bound to the green context when the
+        SGLANG_HISPARSE_GREEN_CTX_SMS flag is set (else a normal stream)."""
+        if self.green_ctx is not None:
+            return self.green_ctx.Stream()
+        return device_module.Stream()
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -323,6 +401,8 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
+        if self._swapin_stream is not None:
+            self._swapin_stream.synchronize()
         if self.enable_prefetch:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
@@ -399,6 +479,7 @@ class HiSparseCoordinator:
           but here the buffer is empty.
         """
         self.alloc_device_buffer(req)
+        self.remap_draft_kv_from_host_rows(req)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
@@ -417,6 +498,52 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
+
+    def remap_draft_kv_from_host_rows(self, req: Req) -> None:
+        """pd/mtp-hisparse: move the transferred draft-layer KV to its logical locs.
+
+        Under hisparse the PD transfer writes EVERY layer (target latent and
+        draft) at the decode arm's *host-row* indices -- the main KV's
+        destination is the pinned host pool, and the draft pool's VRAM buffer
+        is appended to the same index list. The draft model, however, reads
+        its device-resident pool at *logical* locs (req_to_token). Move the
+        just-transferred delta rows host_rows -> logical, via a staging
+        buffer (the two index spaces alias the same pool rows).
+        """
+        if self.draft_pool is None:
+            return
+        idx = req.req_pool_idx
+        adopted = getattr(self, "req_adopted_len", None)
+        start = int(adopted[idx]) if adopted is not None else 0
+        # The transfer wrote exactly [start, host_token_len(kv_allocated_len))
+        # rows (token-granular, matching the prealloc host alloc); the page
+        # tail beyond it was never written.
+        end = min(
+            int(self.req_to_host_pool_allocated_len[idx]),
+            self.host_token_len(req.kv.kv_allocated_len),
+        )
+        if end <= start:
+            return
+        host_rows = self.req_to_host_pool[idx, start:end].to(torch.int64)
+        logical = self.req_to_token_pool.req_to_token[idx, start:end].to(torch.int64)
+        for layer_id in range(self.draft_pool.layer_num):
+            buf = self.draft_pool.get_key_buffer(layer_id)
+            # fp8/byte-typed rows have no index_copy_cuda; move them as raw
+            # bytes (the row holds nope_fp8|scales|rope_bf16 contiguously).
+            if buf.dtype != torch.uint8 and buf.element_size() == 1:
+                buf = buf.view(torch.uint8)
+            staged = buf.index_select(0, host_rows)
+            buf.index_copy_(0, logical, staged)
+        if envs.SGLANG_MTP_DEBUG.get():
+            logger.info(
+                "HiSparse: remapped draft KV rows [%d, %d) host %s -> logical %s "
+                "for %s",
+                start,
+                end,
+                host_rows[:4].tolist(),
+                logical[:4].tolist(),
+                req.rid,
+            )
 
     def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
@@ -494,7 +621,13 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
-        short_reqs_cpu = seq_lens_cpu <= self.device_buffer_size
+        # pd/mtp-hisparse: grow up to the padded buffer. An MTP verify window
+        # can cross device_buffer_size in one step (positions at/after dbs
+        # take reserved-page slots within [dbs, dbs+page)), so a request stays
+        # "growable" until it holds the full padded buffer; plain decode is
+        # unchanged (it crosses at seq_len == dbs, where new_cap already
+        # becomes padded_buffer_size).
+        short_reqs_cpu = seq_lens_cpu < self.padded_buffer_size
         needs_grow_cpu = short_reqs_cpu & (seq_lens_cpu > current_caps)
 
         if torch.any(needs_grow_cpu):
@@ -675,6 +808,45 @@ class HiSparseCoordinator:
     # like decode's eager backup of the previous token, before the next step
     # reuses the reserved slots.
     # ------------------------------------------------------------------
+    def _pinned_read(self, tensors) -> list:
+        """Async-copy small int64 GPU tensors into one pinned buffer on the
+        private D2H stream (gated on the verify-sample event when set), then
+        event-synchronize and return the pinned views. Values read here were
+        produced no later than the last event this host thread synchronized
+        on, so the wait is transfer latency, not GPU work."""
+        n = sum(t.numel() for t in tensors)
+        if self._d2h_pinned is None or self._d2h_pinned.numel() < n:
+            self._d2h_pinned = torch.empty(
+                max(n, 256), dtype=torch.int64, pin_memory=True
+            )
+        ev = self._verify_sample_done
+        if ev is not None:
+            self._d2h_stream.wait_event(ev)
+        else:
+            self._d2h_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._d2h_stream):
+            off = 0
+            for t in tensors:
+                self._d2h_pinned[off : off + t.numel()].copy_(
+                    t.to(torch.int64), non_blocking=True
+                )
+                off += t.numel()
+        self._d2h_event.record(self._d2h_stream)
+        self._d2h_event.synchronize()
+        off = 0
+        views = []
+        for t in tensors:
+            views.append(self._d2h_pinned[off : off + t.numel()])
+            off += t.numel()
+        return views
+
+    def record_verify_sample_done(self) -> None:
+        """Fence the verify sample output (called right after eagle_sample,
+        before the caller launches draft-extend)."""
+        ev = device_module.Event()
+        ev.record()
+        self._verify_sample_done = ev
+
     def _verify_slot_locs(
         self,
         seq_lens: torch.Tensor,
@@ -711,10 +883,16 @@ class HiSparseCoordinator:
             f"MTP verify needs device_buffer_size ({self.device_buffer_size}) >= "
             f"num_draft_tokens * top_k ({n} * {self.top_k})"
         )
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.cpu()
-        if req_pool_indices_cpu is None:
-            req_pool_indices_cpu = req_pool_indices.cpu()
+        bs = seq_lens.shape[0]
+        if seq_lens_cpu is None or req_pool_indices_cpu is None:
+            # Pinned async D2H on the private stream: the values are relay-
+            # published and ready, and this must not wait behind queued
+            # kernels on the forward stream.
+            pin_seq, pin_req = self._pinned_read([seq_lens, req_pool_indices])
+            if seq_lens_cpu is None:
+                seq_lens_cpu = pin_seq
+            if req_pool_indices_cpu is None:
+                req_pool_indices_cpu = pin_req
         self.wait_for_pending_backup()
         # Grow 1:1 buffers to cover the last new position; allocates the reserved
         # page for requests crossing device_buffer_size.
@@ -740,15 +918,33 @@ class HiSparseCoordinator:
         """After acceptance: back up the accepted tokens [seq_len, seq_len + accept)
         from their buffer slots to host rows (the swap-in kernel serves them from
         host once the reserved slots are reused)."""
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.cpu()
-        if req_pool_indices_cpu is None:
-            req_pool_indices_cpu = req_pool_indices.cpu()
-        accept_cpu = accept_lens.to("cpu", non_blocking=False).tolist()
+        bs = seq_lens.shape[0]
+        if seq_lens_cpu is None or req_pool_indices_cpu is None:
+            # Pinned async D2H on the private stream, gated on the
+            # verify-sample event: the read must not be stream-ordered behind
+            # the draft-extend replay queued on the forward stream.
+            pin_seq, pin_req, pin_acc = self._pinned_read(
+                [seq_lens, req_pool_indices, accept_lens]
+            )
+            if seq_lens_cpu is None:
+                seq_lens_cpu = pin_seq
+            if req_pool_indices_cpu is None:
+                req_pool_indices_cpu = pin_req
+            accept_cpu = pin_acc.tolist()
+        else:
+            accept_cpu = accept_lens.to("cpu", non_blocking=False).tolist()
+        accept_cpu = [int(a) for a in accept_cpu]
+        # Compute every slot in [seq_len, seq_len + max_accept) with ONE
+        # _verify_slot_locs launch (the old loop ran ~6 small ops per request),
+        # then flatten the per-req accepted prefixes with a mask; row-major
+        # flatten matches the host-row allocation order below.
+        max_accept = max(1, max(accept_cpu, default=1))
+        slot_locs = self._verify_slot_locs(seq_lens, req_pool_indices, max_accept)
+        col = torch.arange(max_accept, device=seq_lens.device).view(1, -1)
+        accept_gpu = accept_lens.to(torch.int64).view(-1, 1)
+        device_locs = slot_locs[col < accept_gpu].to(torch.int64)
         host_locs_list = []
-        device_locs_list = []
         for i, a in enumerate(accept_cpu):
-            a = int(a)
             if a <= 0:
                 continue
             req_idx = int(req_pool_indices_cpu[i])
@@ -761,15 +957,9 @@ class HiSparseCoordinator:
                 a,
             )
             host_locs_list.append(host_locs)
-            device_locs_list.append(
-                self._verify_slot_locs(
-                    seq_lens[i : i + 1], req_pool_indices[i : i + 1], a
-                ).reshape(-1)
-            )
         if not host_locs_list:
             return
         host_locs = torch.cat(host_locs_list)
-        device_locs = torch.cat(device_locs_list).to(torch.int64)
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
@@ -785,6 +975,63 @@ class HiSparseCoordinator:
             self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
+            device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
+    def _fast_backup_eligible(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> bool:
+        """Steady-state conditions for the GPU-side backup fast path.
+
+        True when no first-step skip is pending (each request's first decode step
+        after staging must take the generic path once) and every request's host
+        pool already covers this step's position (no page growth needed). Both
+        checks read CPU state only -- no device sync.
+        """
+        page_size = self.mem_pool_host.page_size
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            if self._skip_first_backup[req_idx]:
+                return False
+            page_end = (
+                (int(seq_lens_cpu[i]) - 1 + page_size - 1) // page_size * page_size
+            )
+            if page_end > int(self.req_to_host_pool_allocated_len[req_idx]):
+                return False
+        return True
+
+    def _fast_backup_previous_token(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """GPU-side steady-state backup of the previous token (compress_ratio == 1).
+
+        backup_indices == the whole batch, so backup_req_indices/prev positions
+        are plain arithmetic and both loc vectors are single gathers. The launch
+        block mirrors the generic path exactly (same stream waits and events).
+        """
+        prev_pos = seq_lens - 1 - 1  # (seq_len - 1) // 1 - 1
+        buffer_slot = prev_pos.clamp(max=self.device_buffer_size)
+        host_locs = self.req_to_host_pool[req_pool_indices, prev_pos]
+        device_locs = self.req_to_device_buffer[req_pool_indices, buffer_slot]
+
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            self._backup_done_event.record()
+            host_locs.record_stream(self.decode_backup_stream)
             device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
 
@@ -807,6 +1054,20 @@ class HiSparseCoordinator:
         - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
           token was produced this step.
         """
+        # [lane attn-streams] Steady-state fast path (SGLANG_HISPARSE_FAST_BACKUP,
+        # compress_ratio == 1): every request backs up its previous token, so the
+        # index list is the whole batch and both loc vectors are two gathers --
+        # no python-list -> pageable-H2D round-trip (measured ~2.2 ms host/step on
+        # GH200) and no per-request python loop. Falls back to the generic path on
+        # first-step skips or host-page growth.
+        if (
+            envs.SGLANG_HISPARSE_FAST_BACKUP.get()
+            and self.compress_ratio == 1
+            and self._fast_backup_eligible(seq_lens_cpu, req_pool_indices_cpu)
+        ):
+            self._fast_backup_previous_token(seq_lens, req_pool_indices)
+            return
+
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.
@@ -1196,6 +1457,21 @@ class HiSparseCoordinator:
             req.rid,
         )
 
+    def unadopt_prefix(self, req: Req) -> None:
+        """Roll back adopt_prefix: clear this request's host-row table.
+
+        The rows themselves stay owned by the radix side table
+        (``logical_to_host_row``); only the per-request view is dropped, so a
+        retried pre-allocation re-adopts them cleanly. Used when host-pool
+        exhaustion aborts a partially-completed pre-allocation.
+        """
+        idx = req.req_pool_idx
+        n = int(self.req_adopted_len[idx])
+        if n > 0:
+            self.req_to_host_pool[idx, :n] = -1
+        self.req_to_host_pool_allocated_len[idx] = 0
+        self.req_adopted_len[idx] = 0
+
     def release_for_retention(self, req: Req) -> None:
         """request_finished minus the host-row free: device buffer slots,
         mapping rows and per-request tables are released; host bytes survive
@@ -1245,12 +1521,17 @@ class HiSparseCoordinator:
         record_plan: bool = False,
         num_newest: int = 1,
     ) -> torch.Tensor:
-        """Run the full plan+IO swap-in kernel for one layer; return its slot table.
+        """Run the swap-in kernel for one layer; return its slot table.
 
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         num_newest: the tokens [seq_len - num_newest, seq_len) were written this
         step and resolve to the reserved page (MTP target-verify; 1 = decode).
+
+        With the wide gather enabled the fused kernel runs in plan-only mode
+        (skip_io; hit/LRU/evict decisions and the recorded plan are identical --
+        the elided IO was strictly after planning) and the planned rows are
+        then copied by a full-GPU-grid kernel.
         """
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
@@ -1262,13 +1543,14 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
+        plan_only = self._wide_gather
         plan = (
             dict(
                 miss_src=self._miss_src[:num_reqs],
                 miss_dst=self._miss_dst[:num_reqs],
                 miss_count=self._miss_count[:num_reqs],
             )
-            if record_plan
+            if record_plan or plan_only
             else {}
         )
         swap_in_fn(
@@ -1288,15 +1570,44 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
-            skip_io=self.skip_io,
+            skip_io=self.skip_io or plan_only,
             **plan,
             **({} if self.is_dsv4_hisparse else {"num_newest": num_newest}),
         )
+        if plan_only and not self.skip_io:
+            self._run_wide_copy_kernel(num_reqs, layer_id)
         return top_k_indices
+
+    def _wide_copy_blocks(self, num_reqs: int) -> int:
+        """Grid for the wide plan-driven copy: one warp per worst-case row
+        (num_reqs * top_k rows / warps per block), capped at 4 blocks per SM
+        (the measured sweet spot for a per-layer random gather; more blocks
+        cannot help once every SM has rows in flight)."""
+        warps_per_block = 256 // 32
+        wanted = (num_reqs * self.top_k + warps_per_block - 1) // warps_per_block
+        return min(wanted, 4 * self._sm_count)
+
+    def _run_wide_copy_kernel(self, num_reqs: int, layer_id: int) -> None:
+        """Copy this layer's recorded miss plan host->device with a
+        full-GPU-grid gather (warp per planned row; see lanes/gather for why
+        the C2C link needs the whole grid at small batch)."""
+        copy_cache_planned_wide_mla(
+            miss_src=self._miss_src[:num_reqs],
+            miss_dst=self._miss_dst[:num_reqs],
+            miss_count=self._miss_count[:num_reqs],
+            num_real_reqs=self.num_real_reqs,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            item_size_bytes=self.item_size_bytes,
+            num_blocks=self._wide_copy_blocks(num_reqs),
+        )
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
         (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        if self._wide_gather and not self.skip_io:
+            self._run_wide_copy_kernel(num_reqs, skip_layer)
+            return
         copy_cache_planned_mla(
             miss_src=self._miss_src[:num_reqs],
             miss_dst=self._miss_dst[:num_reqs],
@@ -1310,6 +1621,41 @@ class HiSparseCoordinator:
             skip_io=self.skip_io,
         )
 
+    def _maybe_green_swap_in(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        record_plan: bool = False,
+        num_newest: int = 1,
+    ) -> torch.Tensor:
+        """Swap-in on the green-context stream when the flag is set (fork+join
+        with events; capture-safe inside CUDA graphs), else on the current
+        stream. Same kernels/args/order either way, so outputs are identical."""
+        if self._swapin_stream is None or not self._swapin_on_green:
+            return self._run_swap_in_kernel(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                layer_id,
+                record_plan=record_plan,
+                num_newest=num_newest,
+            )
+        cur = device_module.current_stream()
+        self._swapin_stream.wait_stream(cur)
+        with device_module.stream(self._swapin_stream):
+            out = self._run_swap_in_kernel(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                layer_id,
+                record_plan=record_plan,
+                num_newest=num_newest,
+            )
+        cur.wait_stream(self._swapin_stream)
+        return out
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -1320,13 +1666,14 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
-        With prefetch enabled, anchors swap in synchronously (recording the miss
-        plan) and prefetch their skip layers' copies; skip layers just wait.
-        num_newest > 1 is an MTP target-verify position (prefetch is off under
-        speculative decoding, so it always takes the direct path).
+        With prefetch enabled, anchors plan (and, unless the wide gather is
+        on, copy) synchronously, recording the miss plan, and prefetch their
+        skip layers' copies; skip layers just wait. num_newest > 1 is an MTP
+        target-verify position (prefetch is off under speculative decoding, so
+        it always takes the direct path).
         """
         if not self.enable_prefetch or num_newest != 1:
-            return self._run_swap_in_kernel(
+            return self._maybe_green_swap_in(
                 req_pool_indices,
                 compressed_seq_lens,
                 top_k_result,
@@ -1345,7 +1692,7 @@ class HiSparseCoordinator:
         # Anchor: swap in synchronously (recording the plan), then prefetch the
         # skip layers' copies on the side stream.
         group = self._prefetch_groups.get(layer_id)
-        anchor_locs = self._run_swap_in_kernel(
+        anchor_locs = self._maybe_green_swap_in(
             req_pool_indices,
             compressed_seq_lens,
             top_k_result,

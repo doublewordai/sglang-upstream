@@ -1027,6 +1027,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            # pd/mtp-hisparse: commit after the draft-extend launch (see
+            # maybe_commit_verify_tokens) so the accept_lens D2H overlaps it.
+            maybe_commit_verify_tokens(batch, batch_output, self.target_worker)
             return batch_output
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
