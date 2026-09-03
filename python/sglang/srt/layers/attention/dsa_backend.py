@@ -2654,7 +2654,9 @@ class DeepseekSparseAttnBackend(
         gather_idx = torch.where(
             valid, safe_req * n + within, torch.zeros_like(within)
         )
-        if envs.SGLANG_RAGGED_DEBUG.get():
+        if envs.SGLANG_RAGGED_DEBUG.get() and not (
+            torch.cuda.is_current_stream_capturing()
+        ):
             logger.error(
                 "RAGGED-DBG pt: slots=%d n=%d T=%d width=%d rows(out)=%d "
                 "vl=%s idxmax=%d within_max=%d req_id_max=%d",

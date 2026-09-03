@@ -1144,6 +1144,10 @@ class Envs:
     # EAGLE adaptive verify (lane/adaptive-spec): per-request verify lengths from
     # draft confidence + an SPS cost table. Requires SGLANG_RAGGED_VERIFY_MODE=compact.
     SGLANG_EAGLE_ADAPTIVE_VERIFY = EnvBool(False)
+    # Lane M3: force every request's verify_len (grid timing measurement).
+    SGLANG_EAGLE_FORCE_VERIFY_LEN = EnvInt(0)
+    # Lane M3: append per-step verify timing rows to this jsonl path.
+    SGLANG_EAGLE_VERIFY_TIMING = EnvStr("")
     # Path to an SPS cost table JSON (SpsCostTable or SpsAdditiveCostTable format,
     # see dspark_sps.py) for the EAGLE adaptive verify budget scheduler. Without
     # it the schedule degenerates to verify-all (full width through the ragged

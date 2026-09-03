@@ -97,6 +97,14 @@ class EagleAdaptiveVerifyScheduler:
     def schedule_verify_lens(self, *, confidence: torch.Tensor) -> torch.Tensor:
         """confidence [bs, num_steps] (P_draft of each drafted token) →
         verify_lens [bs] int32 in [1, num_draft_tokens]."""
+        forced = envs.SGLANG_EAGLE_FORCE_VERIFY_LEN.get()
+        if forced:
+            return torch.full(
+                (confidence.shape[0],),
+                int(forced),
+                dtype=torch.int32,
+                device=confidence.device,
+            )
         if self.sps_table is None:
             return torch.full(
                 (confidence.shape[0],),

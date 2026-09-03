@@ -188,6 +188,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
         self._init_adaptive_verify()
+        self._verify_timing_events = (None, None)
+        self._verify_timing_pending = None
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
@@ -1627,6 +1629,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        if envs.SGLANG_EAGLE_VERIFY_TIMING.get():
+            return self._verify_with_timing(batch, grammar_barrier)
+        return self._verify_impl(batch, grammar_barrier)
+
+    def _verify_impl(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1641,6 +1648,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
         )
+
+    def _verify_with_timing(self, batch: ScheduleBatch, grammar_barrier=None):
+        """M3 measurement harness: per-step verify wall time (CUDA events on
+        the forward stream) + (bs, verify_lens, num_tokens) to a jsonl file.
+        The previous step's numbers are flushed here; the verify_lens clone is
+        read back one step late so the measured step itself stays sync-free.
+        """
+        import json as _json
+
+        ev0, ev1 = self._verify_timing_events
+        pending = self._verify_timing_pending
+        if pending is not None and ev0 is not None:
+            if ev0.query() and ev1.query():
+                vl = pending["verify_lens"].tolist()
+                row = {
+                    "ts": time.time(),
+                    "bs": pending["bs"],
+                    "num_tokens": int(sum(vl)),
+                    "verify_lens": vl,
+                    "verify_ms": ev0.elapsed_time(ev1),
+                }
+                try:
+                    with open(
+                        envs.SGLANG_EAGLE_VERIFY_TIMING.get(), "a"
+                    ) as f:
+                        f.write(_json.dumps(row) + "\n")
+                except OSError as e:
+                    logger.warning("verify timing write failed: %s", e)
+        spec = batch.spec_info
+        layout = getattr(spec, "ragged_verify_layout", None)
+        vl_clone = (
+            layout.verify_lens.to(torch.int64).clone()
+            if layout is not None
+            else torch.full(
+                (int(spec.bs),),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        )
+        ev0 = self.device_module.Event(enable_timing=True)
+        ev1 = self.device_module.Event(enable_timing=True)
+        ev0.record()
+        out = self._verify_impl(batch, grammar_barrier)
+        ev1.record()
+        self._verify_timing_events = (ev0, ev1)
+        self._verify_timing_pending = {"bs": int(spec.bs), "verify_lens": vl_clone}
+        return out
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
