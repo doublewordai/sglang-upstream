@@ -112,6 +112,7 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+import sglang.srt.mem_cache.handover  # noqa: F401  (registers hiradix_dsa backend)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
