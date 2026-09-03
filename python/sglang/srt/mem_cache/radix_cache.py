@@ -151,6 +151,10 @@ class RadixKey:
         if page_size == 1:
             return self
         aligned_len = len(self) // page_size * page_size
+        if aligned_len == len(self):
+            # Already aligned: skip the O(n) slice copy. The limit (if any) keeps
+            # honoring the same logical length, so semantics are unchanged.
+            return self
         return self[:aligned_len]
 
     def maybe_to_bigram_view(
@@ -210,6 +214,62 @@ class RadixKey:
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         matched_tokens = min(matched_tokens, len(self), len(other))
+        if page_size == 1:
+            return matched_tokens
+        return (matched_tokens // page_size) * page_size
+
+    def child_key_at(self, offset: int, page_size: int = 1):
+        """Equivalent to ``self[offset:].child_key(page_size)`` without copying the tail.
+
+        Used by the offset-based tree walks so that a long in-flight chunked-prefill
+        key does not get re-sliced (O(remaining) copy) at every tree node.
+        """
+        if self.is_bigram or self.cache_salt is not None:
+            return self[offset:].child_key(page_size)
+        n = self._raw_len()
+        t = self.token_ids
+        if page_size == 1:
+            plain = t[offset]
+        else:
+            end = offset + page_size
+            if end > n:
+                end = n
+            plain = tuple(t[offset:end])
+        return plain if self.extra_key is None else (self.extra_key, plain)
+
+    def match_at(self, other: "RadixKey", other_offset: int, page_size: int = 1) -> int:
+        """Equivalent to ``self.match(other[other_offset:], page_size)`` without copying.
+
+        Compares ``self`` against the suffix of ``other`` starting at ``other_offset``.
+        """
+        if other_offset == 0:
+            return self.match(other, page_size)
+        if self.is_bigram or other.is_bigram:
+            return self.match(other[other_offset:], page_size)
+        self._check_compatible(other)
+        t0, t1 = self.token_ids, other.token_ids
+        assert type(t0) is type(t1), (type(t0), type(t1))
+        n1 = other._raw_len() - other_offset
+        n = min(len(t0), n1)
+
+        matched_tokens = n
+        lo = 0
+        step = 1
+        while lo < n:
+            hi = lo + step if lo + step < n else n
+            if t0[lo:hi] != t1[other_offset + lo : other_offset + hi]:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if t0[lo:mid] == t1[other_offset + lo : other_offset + mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                matched_tokens = lo
+                break
+            lo = hi
+            step *= 2
+
+        matched_tokens = min(matched_tokens, len(self), n1)
         if page_size == 1:
             return matched_tokens
         return (matched_tokens // page_size) * page_size
@@ -676,6 +736,36 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+        # Offset-based walk: identical semantics to _match_prefix_helper_ref but
+        # never slices the (possibly ~1M-token) key, so the walk is O(matched)
+        # instead of O(matched * nodes).
+        access_time = time.monotonic()
+        node.last_access_time = access_time
+
+        value = []
+        offset = 0
+        remaining = len(key)
+        while remaining > 0:
+            child_key = key.child_key_at(offset, self.page_size)
+            if child_key not in node.children.keys():
+                break
+            child = node.children[child_key]
+            child.last_access_time = access_time
+            prefix_len = child.key.match_at(key, offset, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                value.append(new_node.value)
+                node = new_node
+                break
+            else:
+                value.append(child.value)
+                node = child
+                offset += prefix_len
+                remaining -= prefix_len
+
+        return value, node
+
+    def _match_prefix_helper_ref(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
@@ -735,6 +825,67 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         node.hit_count += 1
 
     def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+    ):
+        # Offset-based walk: identical semantics to _insert_helper_ref but never
+        # slices the key during the descent (value slices are tensor views).
+        # Convert None priority to 0
+        if priority is None:
+            priority = 0
+        access_time = time.monotonic()
+        node.last_access_time = access_time
+        # Update priority along the path (take max to propagate higher priority)
+        node.priority = max(node.priority, priority)
+        remaining = len(key)
+        if remaining == 0:
+            return 0, node
+
+        child_key = None
+        offset = 0
+        total_prefix_length = 0
+        while remaining > 0:
+            child_key = key.child_key_at(offset, self.page_size)
+            if child_key not in node.children.keys():
+                break
+            child = node.children[child_key]
+            child.last_access_time = access_time
+            prefix_len = child.key.match_at(key, offset, page_size=self.page_size)
+            total_prefix_length += prefix_len
+            offset += prefix_len
+            remaining -= prefix_len
+
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                new_node.priority = max(new_node.priority, priority)
+                self._inc_hit_count(new_node, chunked)
+                node = new_node
+            else:
+                child.priority = max(child.priority, priority)
+                self._inc_hit_count(child, chunked)
+                node = child
+
+        if remaining > 0:
+            tail_key = key[offset:]
+            new_node = TreeNode(priority=priority)
+            new_node.parent = node
+            new_node.key = tail_key
+            new_node.value = value[offset:].clone()
+            self._inc_hit_count(new_node, chunked)
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(tail_key)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
+            # Hash will be computed lazily during event emission
+            self._record_store_event(new_node)
+            node = new_node
+        return total_prefix_length, node
+
+    def _insert_helper_ref(
         self,
         node: TreeNode,
         key: RadixKey,

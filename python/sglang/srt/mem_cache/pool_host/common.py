@@ -143,6 +143,9 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
         )
 
 
+_REGISTER_RETRY_SPACERS: list = []
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,
@@ -153,11 +156,87 @@ def alloc_with_host_register(
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    cudaHostRegister on hugepage-backed pools fails intermittently with
+    cudaErrorInvalidValue depending on where the kernel placed the mapping
+    (v16-memory-plan rig: identical boots fail/pass; a fixed VA fails
+    deterministically). When a hugepage mode is active, retry the whole
+    alloc+register with a small VA spacer between attempts so the kernel
+    hands out a different placement each try.
     """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
-        _cuda_host_register(buffer)
-    return buffer
+    import gc
+    import mmap as _mmap
+
+    from sglang.srt.environ import envs
+
+    import math
+
+    _n_bytes = int(math.prod(dims)) * torch.empty([], dtype=dtype).element_size()
+    # Size gate (v16-memory-plan): cudaHostRegister on SMALL hugetlb pools
+    # (< ~32 GiB) fails deterministically at every placement tested (3.33 GB
+    # indexer pool x8 addresses, 8.19 GB x19); only the large decode host pool
+    # registers reliably. Small pools stay on base pages.
+    _SMALL_HUGEPAGE_LIMIT = 32 * (1 << 30)
+    hugepage_mode = (
+        bool((envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip())
+        and _n_bytes >= _SMALL_HUGEPAGE_LIMIT
+    )
+    if not hugepage_mode and (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip():
+        _saved = os.environ.get("SGLANG_HUGEPAGE_SIZE")
+        os.environ.pop("SGLANG_HUGEPAGE_SIZE", None)
+        try:
+            buffer = allocator.allocate(dims, dtype=dtype, device=device)
+            if pin_memory:
+                _cuda_host_register(buffer)
+            return buffer
+        finally:
+            os.environ["SGLANG_HUGEPAGE_SIZE"] = _saved
+    attempts = 8 if hugepage_mode else 1
+    # Placement ladder: attempt 0 kernel-chosen; then fixed hints descending
+    # through the low VA region where registrations empirically succeed
+    # (at/below the CUDA device arena); far-below fallbacks last.
+    ladder = [
+        None,
+        0x400E00000000,
+        0x400A00000000,
+        0x400600000000,
+        0x400400000000,
+        0x300000000000,
+        0x200000000000,
+        0x10000000000,
+    ]
+    for i in range(attempts):
+        hint = ladder[i % len(ladder)]
+        if hint is not None:
+            os.environ["SGLANG_HUGEPAGE_MMAP_HINT"] = hex(hint)
+        else:
+            os.environ.pop("SGLANG_HUGEPAGE_MMAP_HINT", None)
+        try:
+            buffer = allocator.allocate(dims, dtype=dtype, device=device)
+        finally:
+            os.environ.pop("SGLANG_HUGEPAGE_MMAP_HINT", None)
+        if not pin_memory:
+            return buffer
+        try:
+            _cuda_host_register(buffer)
+            return buffer
+        except RuntimeError as e:
+            if i == attempts - 1:
+                raise
+            logger.warning(
+                "cudaHostRegister failed on hugepage pool (attempt %d/%d): %s; "
+                "retrying with a VA spacer",
+                i + 1,
+                attempts,
+                str(e)[:120],
+            )
+            del buffer
+            gc.collect()
+            # Shift the kernel's mmap placement: a small anonymous mapping
+            # takes the top of the freed hole, so the next pool mapping
+            # lands at a different address.
+            _REGISTER_RETRY_SPACERS.append(_mmap.mmap(-1, (2 + i * 4) * 1024 * 1024))
+    raise RuntimeError("unreachable")
 
 
 def alloc_with_pin_memory(
