@@ -327,6 +327,11 @@ SGL_DEVICE void stream_window(const float* __restrict__ row, const uint32_t leng
 // Kernel
 // ---------------------------------------------------------------------------
 
+#ifdef DBG_STATS
+#define STATS_STRIDE 64
+#else
+#define STATS_STRIDE 4
+#endif
 struct PrefillFusedParams {
   const float* __restrict__ input;             // [B, input_stride]
   const int32_t* __restrict__ row_starts;      // [B] or nullptr
@@ -384,10 +389,10 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
       out[i] = (int32_t)i < length_i32 ? src_row[i] : -1;
     }
     if (p.stats != nullptr && tx == 0) {
-      p.stats[bid * 4 + 0] = length_i32;
-      p.stats[bid * 4 + 1] = length_i32;
-      p.stats[bid * 4 + 2] = 0;
-      p.stats[bid * 4 + 3] = 0;
+      p.stats[STATS_STRIDE * bid + 0] = length_i32;
+      p.stats[STATS_STRIDE * bid + 1] = length_i32;
+      p.stats[STATS_STRIDE * bid + 2] = 0;
+      p.stats[STATS_STRIDE * bid + 3] = 0;
     }
     return;
   }
@@ -437,6 +442,36 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
     }
     __syncthreads();
     const int tc = s->tbin;
+#ifdef DBG_STATS
+    if (tx < 24) {
+      p.stats[STATS_STRIDE * bid + 4] = tc;
+      // 5: tsub, 6: j, 7: n_s, 8: length, 9: v_s bits
+      // 10..17: suffix scan[0][0..7] (PRE-sub-pass: still the coarse suffix sums)
+      // 18..33: coarse[0][0..15] (sub-hist re-zero target: pre-zeroing values)
+      // 34..49: keys[0..15], 50..63: keys[8176..8189]
+      // 10..25: suffix[tc-2..tc+13]; 26..41: suffix[176..191] (healthy crossing region)
+      // 42..57: per-warp counts at bin tc (coarse[w][tc], w=0..15)
+      for (int k = 0; k < 16; ++k) {
+        const int idx = tc - 2 + k;
+        p.stats[STATS_STRIDE * bid + 10 + k] = (idx >= 0 && idx <= 256) ? s->scan[0][idx] : -1;
+      }
+      for (int k = 0; k < 16; ++k) p.stats[STATS_STRIDE * bid + 26 + k] = s->scan[0][176 + k];
+      if (tx < 16) {
+        // warps 0..15 counts at bin tc; slot 58 = sum of all 32 (recomputed)
+        p.stats[STATS_STRIDE * bid + 42 + tx] = s->u.sample.coarse[tx][tc];
+        if (tx == 0) {
+          int sum = 0;
+          for (int w = 0; w < 32; ++w) sum += s->u.sample.coarse[w][tc];
+          p.stats[STATS_STRIDE * bid + 58] = sum;
+        }
+      }
+      if (tx == 0) {
+        p.stats[STATS_STRIDE * bid + 6] = (int)j;
+        p.stats[STATS_STRIDE * bid + 7] = (int)n_s;
+        p.stats[STATS_STRIDE * bid + 8] = (int)length;
+      }
+    }
+#endif
     if (tc <= 0) {
       v_s = -FLT_MAX;  // threshold below everything: capture all
     } else {
@@ -463,6 +498,12 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
       const uint32_t K_s =
           (static_cast<uint32_t>(tc) << 8) | static_cast<uint32_t>(max(s->tsub, 0));
       v_s = (K_s > 0) ? key16_to_value(static_cast<uint16_t>(K_s - 1)) : -FLT_MAX;
+#ifdef DBG_STATS
+      if (tx == 0) {
+        p.stats[STATS_STRIDE * bid + 5] = s->tsub;
+        p.stats[STATS_STRIDE * bid + 9] = __float_as_int(v_s);
+      }
+#endif
     }
     __syncthreads(); // sample structs done; collect reuses the union
   }
@@ -488,10 +529,10 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
     // ---- Phase 3a: exact in-smem select over the full candidate set ----
     handle_tie(s->u.collect.cand, s->out_indices, 0, count, topk, &s->tie);
     if (p.stats != nullptr && tx == 0) {
-      p.stats[bid * 4 + 0] = static_cast<int32_t>(count);
-      p.stats[bid * 4 + 1] = static_cast<int32_t>(min(count, p.cap));
-      p.stats[bid * 4 + 2] = 0;
-      p.stats[bid * 4 + 3] = 0;
+      p.stats[STATS_STRIDE * bid + 0] = static_cast<int32_t>(count);
+      p.stats[STATS_STRIDE * bid + 1] = static_cast<int32_t>(min(count, p.cap));
+      p.stats[STATS_STRIDE * bid + 2] = 0;
+      p.stats[STATS_STRIDE * bid + 3] = 0;
     }
   } else {
     // ---- Phase 3b: fg-class fallback (reads 2-3, +1 only on tie overflow) ----
@@ -582,10 +623,10 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
                    (uint32_t)rem2, &s->tie);
     }
     if (p.stats != nullptr && tx == 0) {
-      p.stats[bid * 4 + 0] = static_cast<int32_t>(count);
-      p.stats[bid * 4 + 1] = static_cast<int32_t>(min(count, p.cap));
-      p.stats[bid * 4 + 2] = static_cast<int32_t>(remain);
-      p.stats[bid * 4 + 3] = 1 | (count > p.cap ? 2 : 4);
+      p.stats[STATS_STRIDE * bid + 0] = static_cast<int32_t>(count);
+      p.stats[STATS_STRIDE * bid + 1] = static_cast<int32_t>(min(count, p.cap));
+      p.stats[STATS_STRIDE * bid + 2] = static_cast<int32_t>(remain);
+      p.stats[STATS_STRIDE * bid + 3] = 1 | (count > p.cap ? 2 : 4);
     }
   }
   __syncthreads();
@@ -643,7 +684,11 @@ struct TopKBallotPrefill {
     }
     int32_t* stats_ptr = nullptr;
     if (stats.has_value()) {
+#ifdef DBG_STATS
+      TensorMatcher({B, 64}).with_dtype<int32_t>().with_device(device_).verify(stats.value());
+#else
       TensorMatcher({B, 4}).with_dtype<int32_t>().with_device(device_).verify(stats.value());
+#endif
       stats_ptr = static_cast<int32_t*>(stats.value().data_ptr());
     }
 

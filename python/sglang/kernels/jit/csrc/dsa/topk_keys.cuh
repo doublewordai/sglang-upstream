@@ -122,6 +122,13 @@ SGL_DEVICE void suffix_scan_256_ip(int* __restrict__ hist, int* __restrict__ scr
     hist[tid] = scratch[272] - excl;
     if (tid == 0) hist[256] = 0;
   }
+  // The final writes above are read by OTHER threads immediately after this
+  // function returns (the crossing tests hist[tx] && hist[tx+1]). Without this
+  // barrier a crossing thread can read a stale hist[tx+1] (its writer in the
+  // same or another warp has not retired the store) and select a wrong bin —
+  // observed as ~1% of prefill rows degenerating to capture-all (the
+  // "unrooted race"; caught with a -DDBG_STATS smem dump 2026-09-03 20:10Z).
+  __syncthreads();
 }
 
 } // namespace
