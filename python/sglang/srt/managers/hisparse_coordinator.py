@@ -1509,9 +1509,16 @@ class HiSparseCoordinator:
 
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
-        num_newest > 1 is an MTP target-verify position (prefetch is off under
-        speculative decoding, so it always takes the direct path).
+        num_newest > 1 is an MTP target-verify position (it takes the direct
+        path below).
         """
+        if self.dpf_prefetch_enabled:
+            # Order EVERY swap-in (the verify path early-returns below, so
+            # this must run before that return) after this layer's seed
+            # prefetch. The per-layer events are recorded every step (no-op
+            # prefetch kernels still run and record), so this never stalls
+            # when the prefetch is gated off for a step.
+            self._dprefetch_events[layer_id].wait(device_module.current_stream())
         if not self.enable_prefetch or num_newest != 1:
             return self._run_swap_in_kernel(
                 req_pool_indices,
@@ -1523,12 +1530,6 @@ class HiSparseCoordinator:
             )
 
         num_reqs = req_pool_indices.size(0)
-        if self.dpf_prefetch_enabled:
-            # Order the real swap-in after this layer's seed prefetch. The
-            # events are always recorded (no-op prefetch kernels still run
-            # and record), so this never stalls when the prefetch is gated
-            # off for a step.
-            self._dprefetch_events[layer_id].wait(device_module.current_stream())
         if self._is_shared_index_layer[layer_id]:
             # Skip layer: wait for its prefetched copy; the anchor's slot table
             # applies (shared index + lockstep buffers).
