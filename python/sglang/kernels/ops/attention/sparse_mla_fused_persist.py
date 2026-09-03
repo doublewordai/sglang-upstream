@@ -62,6 +62,7 @@ def _sdf_fwd(
     ORDER: tl.constexpr,
     PDT: tl.constexpr,  # partial acc dtype: 0 fp32, 1 bf16
     DEQ: tl.constexpr,  # 0 bf16-dequant dots (contest), 1 native-fp8 group dots
+    NSTAGES: tl.constexpr,  # explicit pipelining stages for the inner block loop
 ):
     pid = tl.program_id(0)
     SPLIT: tl.constexpr = TOPK // P
@@ -103,23 +104,30 @@ def _sdf_fwd(
                 eviction_policy="evict_last",
             )
         else:
-            # native-fp8 path: per-row fp8 quant of the nope latent (rope stays bf16)
+            # DEQ 1/2: group-wise q loads
             offs_g = tl.arange(0, 128)
-            qg0 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 0 * 128 + offs_g[None, :], eviction_policy="evict_last").to(tl.float32)
-            qg1 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 1 * 128 + offs_g[None, :], eviction_policy="evict_last").to(tl.float32)
-            qg2 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 2 * 128 + offs_g[None, :], eviction_policy="evict_last").to(tl.float32)
-            qg3 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 3 * 128 + offs_g[None, :], eviction_policy="evict_last").to(tl.float32)
+            qn0 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 0 * 128 + offs_g[None, :], eviction_policy="evict_last")
+            qn1 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 1 * 128 + offs_g[None, :], eviction_policy="evict_last")
+            qn2 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 2 * 128 + offs_g[None, :], eviction_policy="evict_last")
+            qn3 = tl.load(Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + 3 * 128 + offs_g[None, :], eviction_policy="evict_last")
             qp = tl.load(
                 Q_ptr + t * stride_qt + offs_hh[:, None] * (NOPE + ROPE) + NOPE + offs_pe[None, :],
                 eviction_policy="evict_last",
             )
-            aq = tl.maximum(tl.max(tl.abs(qg0), 1), tl.maximum(tl.max(tl.abs(qg1), 1),
-                         tl.maximum(tl.max(tl.abs(qg2), 1), tl.max(tl.abs(qg3), 1))))
-            s_q = tl.maximum(aq, 1e-30) / 448.0
-            q8_0 = (qg0 / s_q[:, None]).to(tl.float8e4nv)
-            q8_1 = (qg1 / s_q[:, None]).to(tl.float8e4nv)
-            q8_2 = (qg2 / s_q[:, None]).to(tl.float8e4nv)
-            q8_3 = (qg3 / s_q[:, None]).to(tl.float8e4nv)
+            if DEQ == 1:
+                # native-fp8 path: per-row fp8 quant of the nope latent (rope stays bf16)
+                qg0 = qn0.to(tl.float32)
+                qg1 = qn1.to(tl.float32)
+                qg2 = qn2.to(tl.float32)
+                qg3 = qn3.to(tl.float32)
+                aq = tl.maximum(tl.max(tl.abs(qg0), 1), tl.maximum(tl.max(tl.abs(qg1), 1),
+                             tl.maximum(tl.max(tl.abs(qg2), 1), tl.max(tl.abs(qg3), 1))))
+                s_q = tl.maximum(aq, 1e-30) / 448.0
+                q8_0 = (qg0 / s_q[:, None]).to(tl.float8e4nv)
+                q8_1 = (qg1 / s_q[:, None]).to(tl.float8e4nv)
+                q8_2 = (qg2 / s_q[:, None]).to(tl.float8e4nv)
+                q8_3 = (qg3 / s_q[:, None]).to(tl.float8e4nv)
+            # DEQ == 2 keeps qn0..3 in bf16 (group dots, exact-dequant KV)
 
         # ---- split phase: stride partition {s, s+P, ...} of the 2048 indices ----
         m_i = tl.full([Hc], NEG_INF, dtype=tl.float32)
@@ -137,7 +145,7 @@ def _sdf_fwd(
         num_valid = tl.sum((idx_scan >= 0).to(tl.int32), axis=0)
         max_bn = ((num_valid + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
 
-        for bn in range(0, max_bn, BLOCK_N):
+        for bn in tl.range(0, max_bn, BLOCK_N, num_stages=NSTAGES):
             pos = s + (bn + offs_n) * P
             idx = tl.load(Idx_ptr + t * stride_it + pos)
             # a split owns stride-partition positions {s + i*P, i < SPLIT}; when
@@ -171,7 +179,7 @@ def _sdf_fwd(
                 logits = tl.dot(qn, tl.trans(kc))
                 logits = tl.dot(qp, tl.trans(kp), acc=logits)
                 logits = logits * sm_scale_log2e
-            else:
+            elif DEQ == 1:
                 kp = tl.load(
                     PoolR_ptr + safe[:, None] * ROW_BF16 + ROPE_OFF_BF16 + offs_pe[None, :],
                     mask=valid[:, None], other=0.0, eviction_policy="evict_first",
@@ -191,6 +199,32 @@ def _sdf_fwd(
                 nope += tl.dot(q8_2, tl.trans(k2)) * sc2[None, :]
                 nope += tl.dot(q8_3, tl.trans(k3)) * sc3[None, :]
                 logits = (tl.dot(qp, tl.trans(kp)) + nope * s_q[:, None]) * sm_scale_log2e
+            else:
+                # DEQ == 2: group-wise exact dequant to bf16 - register-lean
+                # (the [BLOCK_N, 512] fp32 intermediate of DEQ=0 becomes 4
+                # transient [BLOCK_N, 128] ones), bf16 group dots both sides
+                kp = tl.load(
+                    PoolR_ptr + safe[:, None] * ROW_BF16 + ROPE_OFF_BF16 + offs_pe[None, :],
+                    mask=valid[:, None], other=0.0, eviction_policy="evict_first",
+                )
+                sc0 = tl.load(PoolS_ptr + safe * ROW_F32 + SCALE_OFF_F32 + 0, mask=valid, other=0.0)
+                sc1 = tl.load(PoolS_ptr + safe * ROW_F32 + SCALE_OFF_F32 + 1, mask=valid, other=0.0)
+                sc2 = tl.load(PoolS_ptr + safe * ROW_F32 + SCALE_OFF_F32 + 2, mask=valid, other=0.0)
+                sc3 = tl.load(PoolS_ptr + safe * ROW_F32 + SCALE_OFF_F32 + 3, mask=valid, other=0.0)
+                kf0 = tl.load(Pool8_ptr + safe[:, None] * ROW + 0 * 128 + offs_g[None, :], mask=valid[:, None], other=0.0, eviction_policy="evict_first")
+                kf1 = tl.load(Pool8_ptr + safe[:, None] * ROW + 1 * 128 + offs_g[None, :], mask=valid[:, None], other=0.0, eviction_policy="evict_first")
+                kf2 = tl.load(Pool8_ptr + safe[:, None] * ROW + 2 * 128 + offs_g[None, :], mask=valid[:, None], other=0.0, eviction_policy="evict_first")
+                kf3 = tl.load(Pool8_ptr + safe[:, None] * ROW + 3 * 128 + offs_g[None, :], mask=valid[:, None], other=0.0, eviction_policy="evict_first")
+                kb0 = (kf0.to(tl.float32) * sc0[:, None]).to(tl.bfloat16)
+                kb1 = (kf1.to(tl.float32) * sc1[:, None]).to(tl.bfloat16)
+                kb2 = (kf2.to(tl.float32) * sc2[:, None]).to(tl.bfloat16)
+                kb3 = (kf3.to(tl.float32) * sc3[:, None]).to(tl.bfloat16)
+                logits = tl.dot(qp, tl.trans(kp))
+                logits = tl.dot(qn0, tl.trans(kb0), acc=logits)
+                logits = tl.dot(qn1, tl.trans(kb1), acc=logits)
+                logits = tl.dot(qn2, tl.trans(kb2), acc=logits)
+                logits = tl.dot(qn3, tl.trans(kb3), acc=logits)
+                logits = logits * sm_scale_log2e
             logits = tl.where(valid[None, :], logits, NEG_INF)
 
             m_new = tl.maximum(m_i, tl.max(logits, axis=1))
@@ -201,7 +235,7 @@ def _sdf_fwd(
             if DEQ == 0:
                 acc = acc * alpha[:, None]
                 acc = tl.dot(p.to(tl.bfloat16), kc, acc=acc)
-            else:
+            elif DEQ == 1:
                 # PV: p-tilde = p * s_v[j, g] per output group, V raw fp8 widened
                 acc0 = acc0 * alpha[:, None]
                 acc1 = acc1 * alpha[:, None]
@@ -211,6 +245,16 @@ def _sdf_fwd(
                 acc1 = tl.dot((p * sc1[None, :]).to(tl.bfloat16), k1.to(tl.bfloat16), acc=acc1)
                 acc2 = tl.dot((p * sc2[None, :]).to(tl.bfloat16), k2.to(tl.bfloat16), acc=acc2)
                 acc3 = tl.dot((p * sc3[None, :]).to(tl.bfloat16), k3.to(tl.bfloat16), acc=acc3)
+            else:
+                # DEQ == 2 PV: V already dequantized per group; plain bf16 dots
+                acc0 = acc0 * alpha[:, None]
+                acc1 = acc1 * alpha[:, None]
+                acc2 = acc2 * alpha[:, None]
+                acc3 = acc3 * alpha[:, None]
+                acc0 = tl.dot(p.to(tl.bfloat16), kb0, acc=acc0)
+                acc1 = tl.dot(p.to(tl.bfloat16), kb1, acc=acc1)
+                acc2 = tl.dot(p.to(tl.bfloat16), kb2, acc=acc2)
+                acc3 = tl.dot(p.to(tl.bfloat16), kb3, acc=acc3)
             m_i = m_new
 
         # ---- store partials ----
@@ -270,9 +314,19 @@ def _sdf_fwd(
                 )
                 # counter back to 0 for the next launch (graph replay safe)
                 tl.atomic_add(Cnt_ptr + g, -P, sem="release", scope="gpu")
-        else:
+        elif COMBINE == 1:
             # ---- spin + D-parallel combine (k == 1 only; launcher enforces) ----
             tl.atomic_add(Cnt_ptr + 2 * g, 1, sem="acq_rel", scope="gpu")
+            # volatile-load poll (cheap; N pollers do not serialize on the L2
+            # atomic unit), then ONE authoritative acquire atomic whose RESULT
+            # IS USED as a loop condition - a result-discarded fence can be
+            # optimized away, which would let the partial loads below hoist
+            # above the spin and read stale/uninitialized partials (found via
+            # first-call-only corruption with a fresh workspace; repeats with
+            # identical inputs mask it because stale == correct)
+            dv = tl.load(Cnt_ptr + 2 * g, volatile=True)
+            while dv < P:
+                dv = tl.load(Cnt_ptr + 2 * g, volatile=True)
             dv = tl.atomic_add(Cnt_ptr + 2 * g, 0, sem="acquire", scope="gpu")
             while dv < P:
                 dv = tl.atomic_add(Cnt_ptr + 2 * g, 0, sem="acquire", scope="gpu")
@@ -317,6 +371,57 @@ def _sdf_fwd(
 # ---------------------------------------------------------------------------
 # host side
 # ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _sdf_combine(
+    Pm_ptr, Pl_ptr, Pacc_ptr, Out_ptr,
+    P: tl.constexpr,
+    Hc: tl.constexpr,
+    HC: tl.constexpr,
+    B: tl.constexpr,
+    PDT: tl.constexpr,
+    DBLOCK: tl.constexpr,
+):
+    """Split-mode combine: D-parallel over (t, head-chunk, D-block), one CTA
+    per output tile; merges the P split partials (FlashKDA lesson: split the
+    combine onto its own parallelism axis instead of paying fused-kernel
+    register pressure for it)."""
+    pid = tl.program_id(0)
+    DSPLIT: tl.constexpr = 512 // DBLOCK
+    ds = pid % DSPLIT
+    hcc = (pid // DSPLIT) % HC
+    t = pid // (DSPLIT * HC)
+    g = t * HC + hcc
+    NEG_INF: tl.constexpr = float("-inf")
+
+    offs_h = tl.arange(0, Hc)
+    offs_d = ds * DBLOCK + tl.arange(0, DBLOCK)
+    m_gl = tl.full([Hc], NEG_INF, dtype=tl.float32)
+    l_gl = tl.zeros([Hc], dtype=tl.float32)
+    acc_c = tl.zeros([Hc, DBLOCK], dtype=tl.float32)
+    for si in range(0, P):
+        pb = (g * P + si) * Hc
+        m_si = tl.load(Pm_ptr + pb + offs_h)
+        l_si = tl.load(Pl_ptr + pb + offs_h)
+        if PDT == 0:
+            a_si = tl.load(Pacc_ptr + (pb + offs_h[:, None]) * 512 + offs_d[None, :])
+        else:
+            a_si = tl.load(Pacc_ptr + (pb + offs_h[:, None]) * 512 + offs_d[None, :]).to(tl.float32)
+        m_new = tl.maximum(m_gl, m_si)
+        m_ns = tl.where(m_new == NEG_INF, 0.0, m_new)
+        al = tl.where(m_gl == NEG_INF, 0.0, tl.exp2(m_gl - m_ns))
+        be = tl.where(m_si == NEG_INF, 0.0, tl.exp2(m_si - m_ns))
+        acc_c = acc_c * al[:, None] + a_si * be[:, None]
+        l_gl = l_gl * al + l_si * be
+        m_gl = m_new
+    l_safe = tl.where(l_gl == 0.0, 1.0, l_gl)
+    o = acc_c / l_safe[:, None]
+    tl.store(
+        Out_ptr + t * (64 * 512) + (hcc * Hc + offs_h)[:, None] * 512 + offs_d[None, :],
+        o.to(tl.bfloat16),
+    )
+
 
 _WS_CACHE: dict = {}
 _SM_COUNT: Optional[int] = None
@@ -366,25 +471,30 @@ def sm_count(dev=None) -> int:
 
 
 def default_cfg(b: int) -> dict:
-    """Persistent config: fill the SMs with one work item per CTA (W <= #SMs)."""
+    """Persistent config: fill the SMs with one work item per CTA (W <= #SMs).
+    Tuned on nid010161 GPU2 / L=1M cold (results.md r2-r6); DEQ=2 (group-wise
+    exact dequant, register-lean) + spin D-parallel combine + bf16 partials
+    at Hc=64."""
     if b <= 1:
         hc, p = 16, 32
     elif b <= 2:
         hc, p = 16, 16
     elif b <= 4:
-        hc, p = 16, 8
+        hc, p = 64, 16
     elif b <= 8:
-        hc, p = 16, 4
+        hc, p = 64, 16
     elif b <= 16:
-        hc, p = 32, 4
+        hc, p = 64, 8
     elif b <= 32:
         hc, p = 64, 4
     elif b <= 64:
         hc, p = 64, 2
     else:
         hc, p = 64, 1
-    return dict(Hc=hc, P=p, BLOCK_N=64, warps=8, stages=2,
-                COMBINE=0, ORDER=0 if b <= 1 else 1, PDT=0, DEQ=0)
+    ns = 4 if hc == 64 else 2
+    pdt = 1 if hc == 64 else 0
+    return dict(Hc=hc, P=p, BLOCK_N=64, warps=8, stages=2, NSTAGES=ns,
+                COMBINE=1, ORDER=0 if b <= 1 else 1, PDT=pdt, DEQ=2)
 
 
 def resolve_cfg(b: int, cfg: Optional[dict]) -> dict:
@@ -430,7 +540,10 @@ def sdf_fwd(q, pool, idx, sm_scale, out=None, cfg=None, ws=None):
     Hc, HC, P = c["Hc"], c["HC"], c["P"]
 
     W = B * HC * P
-    G = min(sm_count(dev), W)
+    cap = sm_count(dev) * c.get("CTAS_PER_SM", 1)
+    if c["COMBINE"] == 1:
+        cap = sm_count(dev)  # spin needs 1-CTA/SM co-residency (safer default)
+    G = min(cap, W)
     k = (W + G - 1) // G
     if c["COMBINE"] == 1 and k > 1:
         c["COMBINE"] = 0  # spin mode needs one item per CTA
@@ -451,9 +564,15 @@ def sdf_fwd(q, pool, idx, sm_scale, out=None, cfg=None, ws=None):
         G,
         TOPK=2048, Hc=Hc, HC=HC, P=P, B=B,
         BLOCK_N=c["BLOCK_N"], COMBINE=c["COMBINE"], ORDER=c["ORDER"], PDT=c["PDT"],
-        DEQ=c["DEQ"],
+        DEQ=c["DEQ"], NSTAGES=c["NSTAGES"],
         num_warps=c["warps"], num_stages=c["stages"],
     )
     global _LAST_KERNEL
     _LAST_KERNEL = h
+    if c["COMBINE"] == 2:
+        _sdf_combine[(B * HC * (512 // 128),)](
+            ws["pm"], ws["pl"], ws["pacc"], out,
+            P=P, Hc=Hc, HC=HC, B=B, PDT=c["PDT"], DBLOCK=128,
+            num_warps=4, num_stages=2,
+        )
     return out
