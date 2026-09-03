@@ -7017,9 +7017,9 @@ class ServerArgs:
                 # when a worst-case recv bound is set (num_worst_tokens path),
                 # so CUDA graphs stay capturable; only disable in the legacy
                 # host-sync path.
-                if not int(
-                    os.environ.get("SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS", "0") or 0
-                ):
+                if os.environ.get(
+                    "SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS", ""
+                ) == "0":  # default-on; explicit 0 = memory-constrained fallback
                     logger.warning(
                         "Cuda graph is disabled because deepep_mode=`normal`"
                     )
