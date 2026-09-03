@@ -188,8 +188,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner = self.draft_worker.model_runner
         self._init_dsa_index_share_state()
         self._init_adaptive_verify()
-        self._verify_timing_events = (None, None)
-        self._verify_timing_pending = None
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
@@ -1187,6 +1185,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+        # Lane M3: verify timing harness state (see _verify_with_timing).
+        self._verify_timing_events = (None, None)
+        self._verify_timing_pending = None
 
     @property
     def last_shared_read_runner(self):
