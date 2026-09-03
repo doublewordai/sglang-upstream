@@ -2064,6 +2064,16 @@ class DeepseekSparseAttnBackend(
                         n,
                     )
                 for p in range(n):
+                    if (
+                        self.hisparse_coordinator.dpf_prefetch_enabled
+                        and self.hisparse_coordinator._dprefetch_forked
+                    ):
+                        # Join this layer's seed prefetch (recorded at the
+                        # layer-0 fork earlier in this same step/capture)
+                        # before the real swap-in reads the buffer.
+                        self.hisparse_coordinator.wait_layer_prefetch(
+                            layer.layer_id
+                        )
                     ev = (
                         probe.events_for(layer.layer_id, p)
                         if probe is not None

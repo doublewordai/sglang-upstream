@@ -391,6 +391,14 @@ class HiSparseCoordinator:
                 )
                 self._dprefetch_events[layer_id].record(self.dpf_prefetch_stream)
 
+    def wait_layer_prefetch(self, layer_id: int) -> None:
+        """Join the layer's seed prefetch into the caller's (compute) stream.
+        Only called from the target-verify path, where begin_draft_prefetch
+        recorded the events earlier in the same host execution (and, under
+        CUDA graphs, earlier in the same capture) — so the wait is a legal
+        in-capture join and never crosses capture contexts."""
+        self._dprefetch_events[layer_id].wait(device_module.current_stream())
+
     def _init_shared_index_prefetch(
         self,
         shared_index_layers: Optional[List[bool]],
@@ -1512,13 +1520,6 @@ class HiSparseCoordinator:
         num_newest > 1 is an MTP target-verify position (it takes the direct
         path below).
         """
-        if self.dpf_prefetch_enabled:
-            # Order EVERY swap-in (the verify path early-returns below, so
-            # this must run before that return) after this layer's seed
-            # prefetch. The per-layer events are recorded every step (no-op
-            # prefetch kernels still run and record), so this never stalls
-            # when the prefetch is gated off for a step.
-            self._dprefetch_events[layer_id].wait(device_module.current_stream())
         if not self.enable_prefetch or num_newest != 1:
             return self._run_swap_in_kernel(
                 req_pool_indices,
