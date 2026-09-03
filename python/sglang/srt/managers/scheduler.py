@@ -3078,9 +3078,42 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        if self.spec_algorithm.is_none():
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+        else:
+            # Spec-v2: the prefill round already relayed the FULL draft payload
+            # (RelayPayload.from_draft_input in _relay_forward_payload); a
+            # bonus-only re-stash would clobber it -- and crash FutureMap.stash,
+            # which reads payload.topk_p under need_topk. Instead attach a
+            # resolve shell (mirroring PD-decode admission in
+            # eagle_disaggregation.py): future_indices lets the first decode
+            # round's resolve_forward_inputs gather the relayed payload
+            # (topk_p/topk_index/bonus/hidden_states/dsa seed) by
+            # req_pool_indices. Zeros are placeholders; resolve overwrites
+            # every field it gathers.
+            from sglang.srt.model_executor.forward_batch_info import (
+                CaptureHiddenMode,
+            )
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            topk = self.server_args.speculative_eagle_topk or 1
+            spec_info = EagleDraftInput(
+                topk_p=torch.zeros(
+                    (len(reqs), topk), dtype=torch.float32, device=device
+                ),
+                topk_index=torch.zeros(
+                    (len(reqs), topk), dtype=torch.int64, device=device
+                ),
+                bonus_tokens=last_tokens.to(torch.int32),
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            spec_info.future_indices = batch.req_pool_indices
+            spec_info.future_dsa_topk_indices_available = (
+                self.future_map.dsa_topk_indices_buf is not None
+            )
+            batch.spec_info = spec_info
         batch.input_ids = None
 
         if batch.return_logprob:
