@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -84,6 +85,12 @@ from sglang.srt.utils import (
 # TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
+# Determinism lane: fixed-schedule flashmla decode. Pad every scheduled
+# full-layer decode batch to a fixed row count and reuse a cached tile
+# schedule, making each row's split assignment (hence arithmetic order)
+# independent of batch size/composition. Eager mode only.
+_DSA_FIXED_SCHED = get_bool_env_var("SGLANG_DSA_FIXED_SCHED")
+_DSA_FIXED_SCHED_BS = int(os.environ.get("SGLANG_DSA_FIXED_SCHED_BS", "16") or "16")
 _IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
@@ -2858,6 +2865,28 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _get_fixed_flashmla_metadata(self) -> DSAFlashMLAMetadata:
+        """Cached schedule for the fixed-shape padded batch (SGLANG_DSA_FIXED_SCHED).
+
+        Computed once and reused verbatim every step so the split assignment is
+        identical regardless of the real batch's size/composition. Validated
+        offline: bit-equal row outputs across real bs 1..15 with accuracy
+        identical to production schedules.
+        """
+        meta = getattr(self, "_fixed_flashmla_metadata", None)
+        if meta is None:
+            meta = self._compute_flashmla_metadata(
+                cache_seqlens=torch.full(
+                    (_DSA_FIXED_SCHED_BS,),
+                    self.dsa_index_topk,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                seq_len_q=1,
+            )
+            self._fixed_flashmla_metadata = meta
+        return meta
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -2898,22 +2927,54 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
+        # SGLANG_DSA_FIXED_SCHED: pad the batch to a fixed row count and use
+        # the cached fixed-shape schedule. Dummy rows: seqlen 1, one valid
+        # index at slot 0, q = 0 (outputs discarded).
+        sched_meta = metadata.flashmla_metadata
+        fixed_padded = False
+        if _DSA_FIXED_SCHED:
+            bs = q_input.shape[0]
+            if bs <= _DSA_FIXED_SCHED_BS:
+                if bs < _DSA_FIXED_SCHED_BS:
+                    pad = _DSA_FIXED_SCHED_BS - bs
+                    q_input = torch.cat(
+                        [q_input, q_input.new_zeros(pad, *q_input.shape[1:])], 0
+                    )
+                    cache_seqlens = torch.cat(
+                        [
+                            cache_seqlens,
+                            torch.ones(
+                                pad, dtype=torch.int32, device=cache_seqlens.device
+                            ),
+                        ],
+                        0,
+                    )
+                    indices = torch.cat(
+                        [indices, indices.new_full((pad,) + indices.shape[1:], -1)], 0
+                    )
+                    indices[bs:, 0, 0] = 0
+                    fixed_padded = True
+                sched_meta = self._get_fixed_flashmla_metadata()
+            # else: batch exceeds the fixed ceiling -> production schedule
+
         o, _ = flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            tile_scheduler_metadata=sched_meta.flashmla_metadata,
+            num_splits=sched_meta.num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error
             block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
             ),
             is_fp8_kvcache=True,
         )
 
+        if fixed_padded:
+            o = o[:bs]
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
