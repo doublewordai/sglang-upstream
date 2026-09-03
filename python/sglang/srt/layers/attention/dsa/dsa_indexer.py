@@ -1794,11 +1794,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             metadata = None
 
+        # q_lora may be a (fp8, scale) prequant tuple (decode-glue-fusion);
+        # shape checks use the quantized tensor.
+        q_lora_meta = q_lora[0] if isinstance(q_lora, tuple) else q_lora
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and q_lora_meta.shape[0] > 0
+            and q_lora_meta.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
         # Determine if should skip topk based on sequence length
