@@ -43,9 +43,15 @@ void sparse_mla_fp8_decode_dispatch(
     tvm::ffi::TensorView partial_o,
     tvm::ffi::TensorView partial_ml,
     tvm::ffi::TensorView debug,
+    tvm::ffi::TensorView q_fp8,
+    tvm::ffi::TensorView q_rope,
+    tvm::ffi::TensorView q_scale,
+    tvm::ffi::TensorView counter,
+    tvm::ffi::TensorView out_fused,
     int64_t num_splits,
     int64_t topk,
     int64_t tail_sentinel,
+    int64_t fused,
     double sm_scale,
     int64_t cuda_stream) {
   SparseMlaFp8DecodeParams params;
@@ -64,6 +70,13 @@ void sparse_mla_fp8_decode_dispatch(
   params.partial_ml = static_cast<float*>(partial_ml.data_ptr());
   params.tail_sentinel = (int)tail_sentinel;
   params.debug = debug.data_ptr() != nullptr ? static_cast<float*>(debug.data_ptr()) : nullptr;
+  params.use_qprep = q_fp8.data_ptr() != nullptr;
+  params.q_fp8_out = static_cast<uint8_t*>(q_fp8.data_ptr());
+  params.q_rope_out = reinterpret_cast<cutlass::bfloat16_t*>(q_rope.data_ptr());
+  params.q_scale_out = static_cast<float*>(q_scale.data_ptr());
+  params.fused = (int)fused;
+  params.counter = fused ? static_cast<int*>(counter.data_ptr()) : nullptr;
+  params.out_fused = reinterpret_cast<cutlass::bfloat16_t*>(out_fused.data_ptr());
   sm90::decode::SparseMlaFp8DecodeKernel::run(params);
 }
 
@@ -84,6 +97,41 @@ void sparse_mla_fp8_decode_combine(
   params.partial_ml = static_cast<float*>(partial_ml.data_ptr());
   params.out = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr());
   sm90::decode::run_combine(params);
+}
+
+void sparse_mla_fp8_qprep_dispatch(
+    tvm::ffi::TensorView q,
+    tvm::ffi::TensorView q_fp8,
+    tvm::ffi::TensorView q_rope,
+    tvm::ffi::TensorView q_scale,
+    tvm::ffi::TensorView counter,
+    int64_t num_reqs,
+    double sm_scale,
+    int64_t cuda_stream) {
+  SparseMlaFp8DecodeParams params;
+  _sdk_set_device_and_stream(q.device().device_id, cuda_stream, &params.stream);
+  params.num_reqs = (int)num_reqs;
+  params.num_heads = 64;
+  params.num_splits = 1;
+  params.topk = 0;
+  params.d_v = 512;
+  params.sm_scale_log2e = (float)sm_scale * (float)M_LOG2E;
+  params.q = reinterpret_cast<const uint8_t*>(q.data_ptr());
+  params.kv = nullptr;
+  params.indices = nullptr;
+  params.seqlens = nullptr;
+  params.partial_o = nullptr;
+  params.partial_ml = nullptr;
+  params.tail_sentinel = 0;
+  params.debug = nullptr;
+  params.use_qprep = 0;
+  params.fused = 0;
+  params.counter = static_cast<int*>(counter.data_ptr());
+  params.out_fused = nullptr;
+  params.q_fp8_out = static_cast<uint8_t*>(q_fp8.data_ptr());
+  params.q_rope_out = reinterpret_cast<cutlass::bfloat16_t*>(q_rope.data_ptr());
+  params.q_scale_out = static_cast<float*>(q_scale.data_ptr());
+  sm90::decode::run_qprep(params);
 }
 
 }  // namespace sglang

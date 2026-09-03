@@ -35,6 +35,15 @@ struct SparseMlaFp8DecodeParams {
   float* __restrict__ partial_ml;        // [num_reqs, P, num_heads, 2] (m, l) in exp2 units
   int tail_sentinel;                     // 1: rows beyond seqlens are all -1 (skip blocks)
   float* __restrict__ debug;             // optional [num_reqs, 12] (nullable): E pre-pass dump
+  // q pre-quantization outputs (qprep kernel writes; main kernel may read them
+  // instead of params.q when use_qprep is set)
+  uint8_t* __restrict__ q_fp8_out;       // [num_reqs, 64, 512]
+  cutlass::bfloat16_t* __restrict__ q_rope_out;  // [num_reqs, 64, 64]
+  float* __restrict__ q_scale_out;       // [num_reqs, 64]
+  int use_qprep;                         // 1: main kernel loads pre-quantized q
+  int fused;                             // 1: in-kernel combine behind an atomic barrier
+  int* __restrict__ counter;             // [1] i32 fused barrier counter (qprep zeroes it)
+  cutlass::bfloat16_t* __restrict__ out_fused;  // [num_reqs, 64, 512] fused-mode output
 
   cudaStream_t stream;
 };
