@@ -113,8 +113,10 @@ class EagleAdaptiveVerifyScheduler:
                 device=confidence.device,
             )
         survival = torch.cumprod(confidence.to(torch.float32), dim=1)
+        # The DSpark budget planner is CPU math (torch.cat of CPU zeros with
+        # the prefix sums); keep it off the device tensors.
         decision = compute_verify_token_budget(
-            history_survival_probs=survival,
+            history_survival_probs=survival.to("cpu"),
             sps_table=self.sps_table,
             cfg=self.cfg,
         )
