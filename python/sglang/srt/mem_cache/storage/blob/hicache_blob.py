@@ -305,11 +305,14 @@ class HiCacheBlob(HiCacheStorage):
     def _obj_path(self, group_id: str) -> str:
         return os.path.join(self.file_path, group_id[:2], group_id + ".blob")
 
-    def _manifest_path(self, last_page_key: str) -> str:
+    def _manifest_path(self, first_page_key: str) -> str:
+        # One journal per CONTEXT (the chain-root page key is stable across
+        # every op and both arms of the same conversation): appends one JSON
+        # line per write op instead of one file per op.
         h = hashlib.sha1(
-            f"{self.model_tag}|mf|{self._poolset}|{last_page_key}".encode()
+            f"{self.model_tag}|mf|{self._poolset}|{first_page_key}".encode()
         ).hexdigest()[:24]
-        return os.path.join(self.file_path, h[:2], f"mf_{h}.json")
+        return os.path.join(self.file_path, h[:2], f"mf_{h}.jsonl")
 
     # ------------------------------------------------------------------
     # header packing
@@ -982,6 +985,7 @@ class HiCacheBlob(HiCacheStorage):
             np_avail = min(self.blob_pages, start + len(keys) - p0)
             groups[self._group_id(full_chain[p0], self._poolset)] = np_avail
         doc = {
+            "ts": time.time(),
             "model": self.model_tag,
             "poolset": self._poolset,
             "layer_set": f"L{getattr(self._primary_pool, 'start_layer', 0)}"
@@ -990,8 +994,16 @@ class HiCacheBlob(HiCacheStorage):
             "pages": [start, start + len(keys)],
             "groups": groups,
         }
-        with open(self._manifest_path(keys[-1]), "w") as f:
-            json.dump(doc, f)
+        line = (json.dumps(doc) + "\n").encode()
+        fd = os.open(
+            self._manifest_path(full_chain[0]),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o644,
+        )
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
 
     # ------------------------------------------------------------------
     # public API: v3 (combined per-op IO), v2, v1
