@@ -1194,6 +1194,9 @@ class Envs:
     SGLANG_EAGLE_FORCE_VERIFY_LEN = EnvInt(0)
     # Lane M3: append per-step verify timing rows to this jsonl path.
     SGLANG_EAGLE_VERIFY_TIMING = EnvStr("")
+    # Lane A/B: cap swap-in positions per layer in the ragged verify page
+    # table build (measurement only; unsafe for mixed-vl graph replays).
+    SGLANG_EAGLE_SWAPIN_MAXPOS = EnvInt(0)
     # Path to an SPS cost table JSON (SpsCostTable or SpsAdditiveCostTable format,
     # see dspark_sps.py) for the EAGLE adaptive verify budget scheduler. Without
     # it the schedule degenerates to verify-all (full width through the ragged
