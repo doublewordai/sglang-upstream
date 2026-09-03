@@ -145,6 +145,11 @@ def retraction_backup(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> None:
+    if backend == "rebootstrap":
+        # True retraction: nothing to preserve. The KV is freed and the
+        # request re-enters through a prefill recompute (PD rebootstrap),
+        # so there is no backup to take.
+        return
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return
@@ -164,6 +169,10 @@ def retraction_restore(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> None:
+    if backend == "rebootstrap":
+        # True retraction: the KV is recomputed by the prefill at re-entry,
+        # never restored from a backup.
+        return
     if backend == "cpu_tensor":
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return
@@ -179,6 +188,9 @@ def retraction_restore(
 
 
 def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+    if backend == "rebootstrap":
+        # True retraction keeps no backup, so there is nothing to discard.
+        return
     if backend == "cpu_tensor":
         req.retraction_backup = None
         return

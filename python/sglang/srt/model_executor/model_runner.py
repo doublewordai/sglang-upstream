@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import contextlib
+
+from sglang.srt.boot_timeline import mark
 import inspect
 import logging
 import time
@@ -299,6 +301,7 @@ class ModelRunner:
         draft_model_idx: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
     ):
+        mark("model_runner_init_begin")
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         # Set on target by `_resolve_memory_pool_config`; passed in for draft
@@ -401,6 +404,7 @@ class ModelRunner:
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
+        mark("dist_init_begin")
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
@@ -652,6 +656,10 @@ class ModelRunner:
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
+            allow_pp_mtp=(
+                self.server_args.pp_size > 1
+                and self.server_args.disaggregation_mode == "prefill"
+            ),
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
@@ -875,6 +883,11 @@ class ModelRunner:
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
+            num_draft_tokens=(
+                self.server_args.speculative_num_draft_tokens
+                if self.spec_algorithm.is_speculative()
+                else 1
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
@@ -1053,6 +1066,7 @@ class ModelRunner:
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
+        mark("dist_init_end")
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(
@@ -1065,6 +1079,7 @@ class ModelRunner:
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        mark("load_model_begin")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
@@ -1107,6 +1122,7 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             load_format=draft_load_format,
         )
+        mark("load_config_done")
 
         with self._load_format_scope(draft_load_format):
             loaded = load_model_with_memory_saver(
@@ -1121,6 +1137,7 @@ class ModelRunner:
         self.loader = loaded.loader
         self.model = loaded.model
         self.startup_weight_load = loaded.startup_weight_load
+        mark("weights_loaded_and_postprocessed")
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
@@ -1160,6 +1177,7 @@ class ModelRunner:
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         self.weight_load_time = time.perf_counter() - tic_total
+        mark("load_model_end")
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
@@ -1173,6 +1191,17 @@ class ModelRunner:
                 f"avail mem={after_avail_memory:.2f} GB, "
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
+
+        try:
+            from sglang.srt.utils.memory_snapshot import (
+                install_memsnap_hooks,
+                memsnap_phase,
+            )
+
+            install_memsnap_hooks(self, self.model)
+            memsnap_phase("after_weights")
+        except Exception:
+            pass
 
         report_online_quantization(model=self.model, server_args=self.server_args)
 
@@ -1520,6 +1549,13 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        try:
+            from sglang.srt.utils.memory_snapshot import memsnap_forward_begin
+
+            memsnap_forward_begin(forward_batch)
+        except Exception:
+            pass
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -1752,14 +1788,27 @@ class ModelRunner:
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        fused_sampling_ok: bool = False,
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        # Fused-sampling (lane fused-sampling): when the fused kernel will run,
+        # it applies the acc_* penalties itself; skip the eager penalty kernels
+        # and stash the tensors for the Sampler.
+        if fused_sampling_ok:
+            sampling_info._fused_pending_penalties = (
+                sampling_info.acc_additive_penalties,
+                sampling_info.acc_scaling_penalties,
+            )
+        sampling_info.apply_logits_bias(
+            logits_output.next_token_logits, skip_penalties=fused_sampling_ok
+        )
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
@@ -1782,7 +1831,32 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        # Fused-sampling eligibility; MUST be a subset of Sampler.forward's
+        # fused gate (see layers/sampler.py) so penalties are never skipped
+        # without the fused kernel consuming them.
+        _logits = logits_output.next_token_logits
+        _si = forward_batch.sampling_info
+        fused_sampling_ok = (
+            envs.SGLANG_FUSED_SAMPLING.get()
+            and _logits.is_cuda
+            and _logits.shape[0] > 0
+            and _logits.dtype == torch.float32
+            and not forward_batch.return_logprob
+            and not any(_si.return_sampling_masks or [])
+            and _si.sampling_seed is None
+            and not self.sampler.use_log_softmax_logprob
+            and (
+                _si.is_all_greedy
+                or (
+                    not _si.need_top_p_sampling
+                    and not _si.need_top_k_sampling
+                    and not _si.need_min_p_sampling
+                )
+            )
+        )
+        self._preprocess_logits(
+            logits_output, forward_batch.sampling_info, fused_sampling_ok=fused_sampling_ok
+        )
 
         # Sample the next tokens
         next_token_ids = self.sampler(

@@ -189,6 +189,35 @@ class SchedulerMetricsReporter:
             enable_metrics=self.enable_metrics
         )
 
+    def _update_hisparse_host_pool_stats(self) -> None:
+        """Expose HiSparse host-pool occupancy on SchedulerStats (gauges +
+        logs). No-op unless this is a hisparse decode arm."""
+        if self.scheduler.disaggregation_mode != DisaggregationMode.DECODE:
+            return
+        if not self.scheduler.enable_hisparse:
+            return
+        coordinator = getattr(
+            self.scheduler.tp_worker.model_runner, "hisparse_coordinator", None
+        )
+        if coordinator is None:
+            return
+        try:
+            host_pool = coordinator.mem_pool_host
+            free = int(host_pool.available_size())
+            total = int(host_pool.size)
+            self.stats.hisparse_host_pool_free_tokens = free
+            self.stats.hisparse_host_pool_total_tokens = total
+            self.stats.hisparse_host_pool_pinned_tokens = total - free
+            prealloc_q = self.scheduler.disagg_decode_prealloc_queue
+            self.stats.hisparse_host_pool_evictable_tokens = int(
+                prealloc_q.tree_cache.evictable_size()
+            )
+            self.stats.hisparse_host_pool_wait_events = int(
+                getattr(prealloc_q, "host_pool_wait_events", 0)
+            )
+        except (AttributeError, TypeError):
+            pass
+
     def _install_device_timer_on_runners(self):
         if self.forward_pass_device_timer is None:
             return
@@ -681,6 +710,7 @@ class SchedulerMetricsReporter:
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
+            self._update_hisparse_host_pool_stats()
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -900,6 +930,7 @@ class SchedulerMetricsReporter:
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
+            self._update_hisparse_host_pool_stats()
 
             # Speculative decoding
             self.stats.spec_accept_length = spec_accept_length

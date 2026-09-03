@@ -2782,6 +2782,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "blob",
                 "shm",
             ],
         ),
@@ -3198,9 +3199,13 @@ class ServerArgs:
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
+                "'rebootstrap' frees the KV entirely (true retraction) and "
+                "recomputes it on the original prefill worker when the request "
+                "re-enters (PD true-retraction rebootstrap; the default for "
+                "pools without CPU offload support, e.g. DSA/DeepSeekV4). "
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
-            choices=["cpu_tensor", "host_pool"],
+            choices=["cpu_tensor", "host_pool", "rebootstrap"],
         ),
         NS("disagg"),
     ] = None
@@ -3492,6 +3497,20 @@ class ServerArgs:
         "Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
         NS("serving"),
     ] = False
+    enable_delta_tokenizer: A[
+        bool,
+        "Cache the previous prompt/ids per session and tokenize only the appended "
+        "suffix on warm turns (exact ids; falls back to a full encode when no "
+        "special-token boundary is shared). Speeds up agent traffic that resends "
+        "the full conversation every turn.",
+        NS("serving"),
+    ] = False
+    delta_tokenizer_max_sessions: A[
+        int,
+        "[Only used if --enable-delta-tokenizer is set] LRU capacity (sessions) of "
+        "the delta tokenizer cache.",
+        NS("serving"),
+    ] = 64
     dynamic_batch_tokenizer_batch_size: A[
         int,
         "[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
@@ -9233,9 +9252,20 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            if self.speculative_algorithm is not None:
+                # PP + speculation is wired only for the PD-disaggregation
+                # PREFILL arm: earlier PP stages run plain target extends and
+                # forward hidden states as today; only the LAST stage builds
+                # the EAGLE draft worker (the draft layer consumes the
+                # target's final hidden states, which only exist there) and
+                # transfers draft KV + aux data alongside its target KV.
+                assert self.disaggregation_mode == "prefill", (
+                    "Pipeline parallelism with speculative decoding is only "
+                    "supported with --disaggregation-mode prefill"
+                )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

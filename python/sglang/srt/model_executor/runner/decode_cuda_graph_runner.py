@@ -26,6 +26,8 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+
+from sglang.srt.boot_timeline import mark
 import inspect
 import logging
 import os
@@ -995,6 +997,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        mark("graph_capture_begin")
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1094,6 +1097,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
+                mark("capture_bs", bs=bs)
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
@@ -1114,6 +1118,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                                 bs, forward, stream_idx, variant_label, dsa_variant
                             )
         _set_capture_dsa_variant(None)
+        mark("graph_capture_end")
 
     def capture_one_shape(
         self,
@@ -1132,9 +1137,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend, BreakableCudaGraphBackend
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
+        mark("cos_begin", bs=bs)
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+                bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        mark("cos_prepare_done", bs=bs)
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1217,18 +1224,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
+                mark("cos_autotune_begin", bs=bs)
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
+                mark("cos_autotune_done", bs=bs)
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                mark("cos_capture_done", bs=bs)
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1482,6 +1492,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
+                    ragged_verify_layout=(
+                        self._capture_ragged_verify_layout(num_tokens)
+                        if self.ragged_verify_mode
+                        else None
+                    ),
                 )
                 # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
                 spec_info.hidden_states = torch.zeros(

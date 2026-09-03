@@ -145,10 +145,16 @@ def capture_cuda_graphs(
         )
 
         world_group = get_world_group()
+        # [mtp-speed 2026-09-03] Draft workers measure free memory LOCALLY:
+        # under PP+spec only the LAST prefill stage captures (draft) graphs,
+        # so a world-group MIN all_reduce there deadlocks against the other
+        # stages' disaggregation bootstrap broadcast (same class as 5883e76acf,
+        # which made pre_model_load_memory local for drafts).
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
+            distributed=world_group.world_size > 1
+            and not model_runner.is_draft_worker,
             cpu_group=world_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(
@@ -395,6 +401,12 @@ def capture_prefill_graph(
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
     )
+    try:
+        from sglang.srt.utils.memory_snapshot import memsnap_phase
+
+        memsnap_phase("after_graphs_prefill")
+    except Exception:
+        pass
     return result(prefill_runner, mem_usage, capture_time)
 
 
@@ -482,6 +494,12 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )
+    try:
+        from sglang.srt.utils.memory_snapshot import memsnap_phase
+
+        memsnap_phase("after_graphs")
+    except Exception:
+        pass
     return GraphCapture(
         runner=runner,
         memory_phase=memory_phase,
