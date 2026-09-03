@@ -142,8 +142,6 @@ class DeltaTokenizerCache:
             enc = self.tokenizer(text, return_offsets_mapping=True, **encode_kwargs)
             ids = enc["input_ids"]
             ends = [e for _, e in enc["offset_mapping"]]
-        ids = enc["input_ids"]
-        ends = [e for _, e in enc["offset_mapping"]]
         if key:
             self._store(key, text, ids, ends)
         self.stats["miss"] += 1

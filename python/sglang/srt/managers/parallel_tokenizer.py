@@ -183,15 +183,12 @@ class ParallelTokenizer:
 
         self.last_path = "parallel"
         ids: List[int] = list(chain.from_iterable(e.ids for e in encodings[:k]))
-        ends: List[int] = list(
-            chain.from_iterable(
-                chunk_start + e.offsets[i][1]
-                for chunk_start, e in zip(
-                    [0] + pts, encodings[:k]
-                )
-                for i in range(len(e.ids))
-            )
-        )
+        # NB: e.offsets is a property that rebuilds its list on every access -
+        # hoist it once per chunk (indexing it per-token is O(n^2)).
+        ends: List[int] = []
+        for chunk_start, e in zip([0] + pts, encodings[:k]):
+            offs = e.offsets
+            ends.extend(chunk_start + o[1] for o in offs)
         return ids, ends
 
     def encode(self, text: str, **kwargs) -> List[int]:
