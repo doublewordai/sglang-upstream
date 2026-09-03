@@ -60,15 +60,23 @@ if [ "${SKIP_CAPTURE:-0}" != 1 ]; then
   # decode-validate needs --sent + decode records; capture is extend-only by design
 fi
 
-# ---------- 4. train on real data ----------
+# ---------- 4. train on real data (GPU step: needs the holder) ----------
 phase "train (real data)"
 NGPU=${NGPU:-3}; PORT=${TPORT:-57100}; STEPS=${STEPS:-400}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,3} \
-  ~/sglang-venv/bin/torchrun --nproc-per-node=$NGPU --master-port $PORT \
-  $LANE/train_draft.py --data "$CAP" --steps $STEPS \
-  --window 2048 --micro-bs 4 --strategy fsdp \
-  ${CHAIN_WEIGHT:+--chain-weight $CHAIN_WEIGHT} \
-  --out $LANE/runs/real > $LOGS/pipe-train.out 2>&1 \
+TRAIN_NODE=${TRAIN_NODE:-$(scontrol show hostnames "$(squeue -j "$HOLDER" -h -o %N)" | sed -n 5p)}
+echo "train node: $TRAIN_NODE"
+srun --overlap --jobid="$HOLDER" -N1 -n1 -w "$TRAIN_NODE" --gres=gpu:4 \
+  --cpus-per-task=48 --input=none bash -c "
+    export T_WITH_EP=1; source $S/runs/glm-isambard/U-uccl-send-abort/scripts/env-U.sh >/dev/null 2>&1
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONDONTWRITEBYTECODE=1
+    cd $LANE
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,3} ~/sglang-venv/bin/torchrun \
+      --nproc-per-node=$NGPU --master-port $PORT \
+      $LANE/train_draft.py --data '$CAP' --steps $STEPS \
+      --window 2048 --micro-bs 4 --strategy fsdp \
+      ${CHAIN_WEIGHT:+--chain-weight $CHAIN_WEIGHT} \
+      --out $LANE/runs/real
+  " > $LOGS/pipe-train.out 2>&1 \
   || { echo TRAIN-FAILED; tail -30 $LOGS/pipe-train.out; exit 1; }
 tail -3 $LOGS/pipe-train.out
 
