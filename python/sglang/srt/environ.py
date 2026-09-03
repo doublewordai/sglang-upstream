@@ -694,6 +694,10 @@ class Envs:
     SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
     # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
     SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
+    # Per-category device-pool lock accounting (prefill-oom-1328): interval in
+    # seconds for the [pool-locks] breakdown log line on the disagg-prefill
+    # loop; 0 disables. The breakdown is also appended to any pool-OOM raise.
+    SGLANG_POOL_LOCK_LOG_SECS = EnvFloat(10.0)
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
