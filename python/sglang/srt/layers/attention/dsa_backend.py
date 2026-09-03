@@ -463,6 +463,7 @@ class DeepseekSparseAttnBackend(
         # the gather kernel fuses that in.  Same single-stream reuse
         # argument as `_q8kv8_qpad_buf`.
         self._q8kv8_kv_buf: Optional[torch.Tensor] = None
+        self._native_fp8_ws: Optional[dict] = None
         # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
         # rows whose topk indices end in a -1 pad run skip whole topk blocks
         # in-kernel.
@@ -2384,6 +2385,10 @@ class DeepseekSparseAttnBackend(
                 # this step resolves via num_newest=p+1 (1:1 slots below
                 # device_buffer_size, reserved page above). Results are
                 # interleaved back to row order.
+                # (merge note, lane/warm-local-prefill: the target-verify
+                # check comes FIRST — a verify batch on a retained session
+                # must keep the per-position verify table, not the WLP
+                # extend union table; WLP extends are plain EXTEND mode.)
                 assert topk_indices is not None, (
                     "hisparse target-verify requires the indexer's topk "
                     "positions"
@@ -2432,12 +2437,43 @@ class DeepseekSparseAttnBackend(
                         else None,
                     )
             else:
-                # flash_mla_sparse_fwd / tilelang require int32 page indices.
-                page_table_1 = (
-                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                        page_table_1
-                    ).to(torch.int32)
+                has_retained_prefix = bool(
+                    forward_batch.extend_prefix_lens_cpu
+                    and any(forward_batch.extend_prefix_lens_cpu)
                 )
+                if has_retained_prefix:
+                    # warm-local-prefill: the matched prefix is host-resident
+                    # (retained); its selections need a union swap-in from host
+                    # pages. Rebuild the table from the raw positions: prefix
+                    # selections point at scratch slots holding the host bytes,
+                    # delta selections translate through the device mapping.
+                    if self.use_fused_topk:
+                        raise NotImplementedError(
+                            "WLP: fused topk is not supported on the "
+                            "retained-prefix extend path (set both arms to the "
+                            "unfused topk for exactness)"
+                        )
+                    if topk_indices is None:
+                        raise AssertionError(
+                            "WLP: extend with a retained prefix requires topk_indices"
+                        )
+                    padded_positions = self._pad_topk_indices(
+                        topk_indices, q_nope.shape[0]
+                    )
+                    page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        topk_positions=padded_positions,
+                        prefix_lens=forward_batch.extend_prefix_lens,
+                        translated=page_table_1,
+                        layer_id=layer.layer_id,
+                    )
+                else:
+                    # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                    page_table_1 = (
+                        self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                            page_table_1
+                        ).to(torch.int32)
+                    )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -3312,6 +3348,78 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _forward_native_fp8_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """Lane sparse-decode-kernel path: native-fp8 SM90 split-KV kernel.
+
+        Semantics match _forward_flashmla_kv (all non-negative indices are
+        scored, negative sentinels masked; seqlens only schedules). Buffers
+        grow-only per (b, P) like _q8kv8_kv_buf; CUDA-graph stable at fixed
+        batch. MTP target-verify arrives as b' = bs * n_draft flattened rows
+        with per-row page tables - handled identically.
+        """
+        from sglang.kernels.ops.attention.sparse_mla_fp8_decode_sm90 import (
+            sparse_mla_fp8_decode_fwd,
+        )
+
+        q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
+        b = q_all.shape[0]
+        dev = q_all.device
+        topk = self.dsa_index_topk
+
+        kv_rows = kv_cache.view(torch.uint8).view(-1, 656)
+        idx = page_table_1 if page_table_1.dim() == 2 else page_table_1.view(b, topk)
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        seqlens = metadata.dsa_cache_seqlens_int32
+
+        # split policy: fill the SMs, capped by useful blocks (topk/64 = 32)
+        # and the fused co-residency limit (b*P <= 132 at 1 CTA/SM)
+        P = max(1, min(32, 132 // b))
+        ws = self._native_fp8_ws
+        if ws is None or ws["b"] < b or ws["P"] < P:
+            ws = {
+                "b": b,
+                "P": P,
+                "po": torch.empty((b, P, 64, 512), dtype=torch.float32, device=dev),
+                "pml": torch.empty((b, P, 64, 2), dtype=torch.float32, device=dev),
+                "out": torch.empty((b, 64, 512), dtype=torch.bfloat16, device=dev),
+                "q_fp8": torch.empty((b, 64, 512), dtype=torch.uint8, device=dev),
+                "q_rope": torch.empty((b, 64, 64), dtype=torch.bfloat16, device=dev),
+                "q_scale": torch.empty((b, 64), dtype=torch.float32, device=dev),
+                "counter": torch.zeros(1, dtype=torch.int32, device=dev),
+            }
+            self._native_fp8_ws = ws
+        # tail_sentinel: hisparse guarantees the -1 pads are a tail run
+        # (fast path writes device_loc = -1 for i >= count); the fallback
+        # allocator does not guarantee it, so only take the shortcut there.
+        tail_sentinel = self.hisparse_coordinator is not None
+        qprep = (ws["q_fp8"], ws["q_rope"], ws["q_scale"])
+        out, _, _ = sparse_mla_fp8_decode_fwd(
+            q_all,
+            kv_rows,
+            idx,
+            seqlens,
+            sm_scale,
+            num_splits=P,
+            tail_sentinel=tail_sentinel,
+            fused=True,
+            head_splits=1,
+            counter=ws["counter"],
+            qprep=qprep,
+            partial_o=ws["po"],
+            partial_ml=ws["pml"],
+            out=ws["out"],
+        )
+        return out.view(b, 1, 64, 512)
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3322,6 +3430,20 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        if (
+            envs.SGLANG_DSA_DECODE_FP8_NATIVE.get()
+            and self.device_sm_major == 9
+            and self.dsa_kv_cache_store_fp8
+            and self.real_page_size == 64
+            and layer.tp_q_head_num == 64
+            and layer.head_dim == 576
+            and v_head_dim == 512
+            and self.dsa_index_topk == 2048
+        ):
+            return self._forward_native_fp8_decode(
+                q_all, kv_cache, sm_scale, layer, metadata, page_table_1
+            )
+
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32

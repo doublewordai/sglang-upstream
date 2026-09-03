@@ -468,6 +468,17 @@ class Envs:
     # SGLANG_HICACHE_BULK_COPY is also on; byte-identical; falls back to the
     # merged copy-engine path when the JIT module is unavailable.
     SGLANG_D2H_SM_STORES = EnvBool(False)
+    # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
+    # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
+    # eligibility (max new-span tokens, min matched fraction of the prompt) and
+    # tracing.
+    SGLANG_WLP_ENABLE = EnvBool(False)
+    SGLANG_WLP_MAX_NEW_TOKENS = EnvInt(4096)
+    SGLANG_WLP_MIN_MATCH_FRAC = EnvFloat(0.5)
+    # Allow prefix_len == 0 (full local prefill of a short prompt on the decode
+    # rank): rig weight-equality probe + the local-refill fallback variant.
+    SGLANG_WLP_ALLOW_COLD = EnvBool(False)
+    SGLANG_WLP_TRACE = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -582,6 +593,13 @@ class Envs:
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
     SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
+    # Fuse the post-logits decode pipeline (temperature -> softmax -> token
+    # selection) into one Triton kernel, bit-exact vs the eager reference
+    # (greedy: torch.argmax tie-break; sampled: torch.multinomial's gumbel-max
+    # composite with identical philox RNG consumption). Falls back to the
+    # reference path for top-k/top-p/min-p, seeded/deterministic sampling,
+    # logprob requests, and non-CUDA devices.
+    SGLANG_FUSED_SAMPLING = EnvBool(False)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
@@ -606,6 +624,9 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Diagnostic: log HiSparse verify-step miss counts (per draft position,
+    # last anchor group's plans) every N verify steps; 0 = off.
+    SGLANG_HISPARSE_MISS_LOG = EnvInt(0)
     # Plan-then-IO swap-in split: the fused kernel plans only and a
     # full-GPU-grid kernel copies the recorded miss plan (warp per row).
     # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
@@ -1535,6 +1556,13 @@ class Envs:
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
     SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-kernel native-fp8 SM90 kernel (JIT).  Numerics:
+    # prod-class error vs the fp32 oracle (q per-row fp8 + exact per-group KV
+    # descale on the QK accumulator + bf16 P/V); NOT bit-exact vs FlashMLA.
+    # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
+    # than the production kernel; kept for development/A-B, default OFF.
+    SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
     # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
     # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
     # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV
