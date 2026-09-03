@@ -29,6 +29,7 @@ import torch
 
 from sglang.srt.mem_cache.handover.manifest import (
     bytes_to_manifest,
+    manifest_to_bytes,
     page_checksums,
 )
 from sglang.srt.mem_cache.handover.prefill_arm import (
@@ -138,8 +139,6 @@ def handover_export_push(payload_json: str, timeout_s: float = 300.0) -> Tuple[b
             if key not in agent._registered:
                 agent.register(key, list(zip(spec.data_ptrs, spec.data_lens)), "DRAM")
         agent.add_peer(base64.b64decode(req["agent_metadata"]))
-
-        from sglang.srt.mem_cache.handover.manifest import manifest_to_bytes
 
         mbytes = manifest_to_bytes(m)
         if not hasattr(_export_state, "_manifest_src") or _export_state._manifest_src is None:
@@ -303,18 +302,22 @@ def heir_import(
             )
 
             t0 = time.perf_counter()
+            phase2 = {
+                "fingerprint": info["fingerprint"],
+                "agent_metadata": base64.b64encode(agent.metadata()).decode(),
+                "agent_name": agent.agent.name,
+                "pools": pools_msg,
+                "manifest": {
+                    "ptr": int(manifest_buf.data_ptr()),
+                    "len": int(manifest_buf.numel()),
+                },
+            }
             push_rep = _http_json(
                 base,
                 {
                     "phase": "push",
-                    "fingerprint": info["fingerprint"],
-                    "agent_metadata": base64.b64encode(agent.metadata()).decode(),
-                    "agent_name": agent.agent.name,
-                    "pools": pools_msg,
-                    "manifest": {
-                        "ptr": int(manifest_buf.data_ptr()),
-                        "len": int(manifest_buf.numel()),
-                    },
+                    "payload_json": json.dumps(phase2),
+                    "timeout_s": timeout_s,
                 },
                 timeout=timeout_s,
                 admin_key=admin_key,
