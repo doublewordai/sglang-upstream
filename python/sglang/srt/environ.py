@@ -1373,6 +1373,11 @@ class Envs:
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
     SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    # lane/streamindex-topk: key-chunked scorer + partition-merge candidate
+    # maintenance for the prefill indexer top-k; the [q, L] logits tensor
+    # never exists (exact top-2048, tie-consistent at the boundary).
+    SGLANG_DSA_TOPK_STREAMINDEX = EnvBool(False)
+    SGLANG_DSA_TOPK_STREAMINDEX_W = EnvInt(8192)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )

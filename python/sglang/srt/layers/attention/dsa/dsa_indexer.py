@@ -1095,6 +1095,43 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_offset, k_offset, device_index
         )
 
+        if (
+            envs.SGLANG_DSA_TOPK_STREAMINDEX.get()
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and not _is_hip
+        ):
+            # lane/streamindex-topk: partition-merge top-k over key-chunked
+            # scorer calls (deep_gemm fp8_mqa_logits per key chunk + streaming
+            # candidate extract/merge). The [q, L] logits tensor never exists;
+            # replaces BOTH the chunked-mqa loop and the per-chunk top-k.
+            # Eager prefill path only (allocates streams/events per call).
+            from sglang.kernels.ops.attention.dsa.streamindex_topk import (
+                streamindex_topk_prefill,
+            )
+            from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+                TopkTransformMethod,
+            )
+
+            pt1 = metadata.attn_metadata.page_table_1
+            assert pt1 is not None, "streamindex top-k requires page_table_1"
+            q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                q_fp8[:q_offset], weights[:q_offset]
+            )
+            raw = streamindex_topk_prefill(
+                q_padded,
+                kv_fp8,
+                w_padded,
+                ks,
+                ke,
+                pt1,
+                metadata.attn_metadata.cu_seqlens_q.to(torch.int32),
+                self.index_topk,
+                W=envs.SGLANG_DSA_TOPK_STREAMINDEX_W.get(),
+                pipeline=True,
+            )
+            topk_result[:q_offset] = raw
+            return topk_result
+
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
