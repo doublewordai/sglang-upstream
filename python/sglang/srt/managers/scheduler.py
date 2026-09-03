@@ -4133,21 +4133,24 @@ class Scheduler(
         except DeviceKVPoolExhaustedError as e:
             error = e
 
-        failed = torch.tensor(
-            1 if error is not None else 0, dtype=torch.int, device="cpu"
+        # 1 = this rank's batch is runnable, 0 = it failed. MIN across the
+        # PP group turns this into "every rank runnable" (1) vs "at least
+        # one rank failed" (0) — the latter degrades on EVERY rank.
+        runnable = torch.tensor(
+            0 if error is not None else 1, dtype=torch.int, device="cpu"
         )
         try:
             group = self.pp_group.cpu_group
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
                 torch.distributed.all_reduce(
-                    failed, op=torch.distributed.ReduceOp.MIN, group=group
+                    runnable, op=torch.distributed.ReduceOp.MIN, group=group
                 )
         except Exception:
             # No usable PP collective (single-rank group, backend missing):
             # fall back to the local verdict.
             pass
 
-        if int(failed.item()) == 0:  # at least one rank failed
+        if int(runnable.item()) == 0:  # at least one rank failed
             self._device_pool_degrade_rollback(new_batch, adder, running_batch, error)
             return False
         return True
