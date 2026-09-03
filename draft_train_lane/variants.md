@@ -124,3 +124,21 @@ report):
    depth-5 training arm should verify g-magnitude stability per depth
    (add ||g||-by-depth to eval_draft if the real-data depth-5 arm shows
    drift).
+
+## ATLAS — online-adaptive drafter (scout note: online-adaptive-draft-deep)
+
+Heavyweight static draft (our fine-tuned NextN) + lightweight ADAPTIVE draft
+continuously updated from live traffic, with a confidence-aware controller
+choosing between them per step. Our capture pipeline is exactly the data
+source: the hook streams (token, target hidden) pairs — a small head (or
+LoRA delta on the static draft) could refresh on the live stream, and the
+controller picks the adaptive drafter only when its recent acceptance
+outperforms. Caveats for prod: online updates change the draft mid-flight
+(acceptance-based speed is safe — greedy verify keeps outputs exact — but
+the controller must be robust to distribution shift; and the draft weight
+path must support hot-reload, which sglang does not have today).
+**Gate B architecture #2**: fires under the same conditions as the AngelSpec
+gate (segment-differential accept on real data), but when the differential is
+*drift-shaped* (traffic composition shifts over days) rather than
+*segment-shaped* (code vs prose). Adaptive wins where the static fine-tune
+stales; routing wins where segments are stable and distinct.
