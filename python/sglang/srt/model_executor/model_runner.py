@@ -652,6 +652,10 @@ class ModelRunner:
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
+            allow_pp_mtp=(
+                self.server_args.pp_size > 1
+                and self.server_args.disaggregation_mode == "prefill"
+            ),
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
@@ -949,6 +953,16 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+        if envs.SGLANG_GLM_DSV3_BF16_SMALLM_GEMV.get():
+            # Post-load, pre-capture: build bf16 copies of the small decode
+            # projections (qkv_a + indexer wq_b/wk/weights_proj) for the
+            # dsv3_fused_a small-M GEMV path.
+            from sglang.srt.models.deepseek_v2 import (
+                materialize_bf16_smallm_weights,
+            )
+
+            materialize_bf16_smallm_weights(self.model)
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
@@ -1168,6 +1182,17 @@ class ModelRunner:
                 f"avail mem={after_avail_memory:.2f} GB, "
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
+
+        try:
+            from sglang.srt.utils.memory_snapshot import (
+                install_memsnap_hooks,
+                memsnap_phase,
+            )
+
+            install_memsnap_hooks(self, self.model)
+            memsnap_phase("after_weights")
+        except Exception:
+            pass
 
         report_online_quantization(model=self.model, server_args=self.server_args)
 
@@ -1515,6 +1540,13 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        try:
+            from sglang.srt.utils.memory_snapshot import memsnap_forward_begin
+
+            memsnap_forward_begin(forward_batch)
+        except Exception:
+            pass
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -1747,14 +1779,27 @@ class ModelRunner:
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        fused_sampling_ok: bool = False,
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        # Fused-sampling (lane fused-sampling): when the fused kernel will run,
+        # it applies the acc_* penalties itself; skip the eager penalty kernels
+        # and stash the tensors for the Sampler.
+        if fused_sampling_ok:
+            sampling_info._fused_pending_penalties = (
+                sampling_info.acc_additive_penalties,
+                sampling_info.acc_scaling_penalties,
+            )
+        sampling_info.apply_logits_bias(
+            logits_output.next_token_logits, skip_penalties=fused_sampling_ok
+        )
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
@@ -1777,7 +1822,32 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        # Fused-sampling eligibility; MUST be a subset of Sampler.forward's
+        # fused gate (see layers/sampler.py) so penalties are never skipped
+        # without the fused kernel consuming them.
+        _logits = logits_output.next_token_logits
+        _si = forward_batch.sampling_info
+        fused_sampling_ok = (
+            envs.SGLANG_FUSED_SAMPLING.get()
+            and _logits.is_cuda
+            and _logits.shape[0] > 0
+            and _logits.dtype == torch.float32
+            and not forward_batch.return_logprob
+            and not any(_si.return_sampling_masks or [])
+            and _si.sampling_seed is None
+            and not self.sampler.use_log_softmax_logprob
+            and (
+                _si.is_all_greedy
+                or (
+                    not _si.need_top_p_sampling
+                    and not _si.need_top_k_sampling
+                    and not _si.need_min_p_sampling
+                )
+            )
+        )
+        self._preprocess_logits(
+            logits_output, forward_batch.sampling_info, fused_sampling_ok=fused_sampling_ok
+        )
 
         # Sample the next tokens
         next_token_ids = self.sampler(

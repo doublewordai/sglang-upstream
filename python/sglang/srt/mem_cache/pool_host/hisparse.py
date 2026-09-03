@@ -8,9 +8,38 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+class HostPoolExhaustedError(RuntimeError):
+    """The HiSparse host KV pool has no whole pages left for a request.
+
+    Raised by :meth:`HiSparseHostPoolMixin.alloc_paged_token_slots`. Decode
+    pre-allocation treats it as a "not yet" admission signal (the request
+    stays queued and is retried after eviction frees host rows), never as a
+    scheduler-fatal error. Subclasses ``RuntimeError`` so pre-existing
+    handlers keep working.
+    """
+
+
 class HiSparseHostPoolMixin:
     def _round_up_to_page_size(self, size: int) -> int:
         return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def host_pages_needed(
+        self, start_pos: int, num_tokens: int, allocated_len: int
+    ) -> int:
+        """Whole pages ``alloc_paged_token_slots`` would newly allocate for
+        [start_pos, start_pos+num_tokens) given an already-allocated length.
+        Mirrors the accounting in alloc_paged_token_slots exactly, so an
+        admission pre-check agrees with the allocation it guards."""
+        if num_tokens <= 0:
+            return 0
+        page_end = self._round_up_to_page_size(start_pos + num_tokens)
+        if page_end <= allocated_len:
+            return 0
+        return (page_end - allocated_len) // self.page_size
+
+    def has_free_pages(self, num_pages: int) -> bool:
+        """Whether ``alloc_page(num_pages)`` can succeed right now."""
+        return num_pages * self.page_size <= self.available_size()
 
     def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
         host_locs = self.alloc(num_pages * self.page_size)
@@ -60,7 +89,7 @@ class HiSparseHostPoolMixin:
                     start_pos,
                     num_tokens,
                 )
-                raise RuntimeError(
+                raise HostPoolExhaustedError(
                     f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
                 )
 
@@ -70,6 +99,52 @@ class HiSparseHostPoolMixin:
             req_to_host_pool_allocated_len[req_pool_idx] = page_end
 
         return req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def alloc_paged_token_slots_batch(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_to_host_pool_allocated_len: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        start_pos_cpu: torch.Tensor,
+        num_tokens: int = 1,
+    ) -> torch.Tensor:
+        """Batch counterpart of alloc_paged_token_slots for a uniform
+        num_tokens (the decode eager backup backs up one row per request).
+
+        Fast path: when no request crosses into unallocated host pages (the
+        common case - one new compressed token per request per step), the
+        slots are a single gather. If any request needs new pages, or any
+        start_pos is negative (empty slice in the scalar path), fall back to
+        the per-request path so allocation order and pool state are exactly
+        those of sequential alloc_paged_token_slots calls.
+        """
+        assert num_tokens == 1
+        n = len(req_pool_indices_cpu)
+        if n == 0:
+            return torch.empty((0,), dtype=torch.int64, device=req_to_host_pool.device)
+        ps = self.page_size
+        end_pos = start_pos_cpu + num_tokens
+        page_end = (end_pos + ps - 1) // ps * ps
+        allocated = req_to_host_pool_allocated_len[req_pool_indices_cpu]
+        if bool((page_end > allocated).any()) or bool((start_pos_cpu < 0).any()):
+            return torch.cat(
+                [
+                    self.alloc_paged_token_slots(
+                        req_to_host_pool,
+                        req_to_host_pool_allocated_len,
+                        int(req_pool_indices_cpu[i]),
+                        int(start_pos_cpu[i]),
+                        num_tokens,
+                    )
+                    for i in range(n)
+                ]
+            )
+        device = req_to_host_pool.device
+        # Async pinned H2D (a blocking pageable copy would sync the schedule
+        # stream against the running forward - the stall this patch removes).
+        idx = req_pool_indices_cpu.pin_memory().to(device, non_blocking=True)
+        pos = start_pos_cpu.pin_memory().to(device, non_blocking=True)
+        return req_to_host_pool[idx, pos]
 
     def allocated_host_indices(
         self,

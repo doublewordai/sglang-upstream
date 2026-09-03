@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host import bulk_copy
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -240,6 +241,258 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device_pool.device,
         )
 
+    # ------------------------------------------------------------------
+    # Bulk (batched copy-engine) paths, SGLANG_HICACHE_BULK_COPY=1.
+    # Byte-identical to the per-layer kernel paths; only the transport
+    # differs (contiguous-run cudaMemcpyBatchAsync instead of per-row
+    # UVA gather/scatter kernels).
+    # ------------------------------------------------------------------
+
+    @property
+    def _bulk_device_ok(self) -> bool:
+        dev = self.device_pool.device
+        dev_type = dev.type if isinstance(dev, torch.device) else str(dev).split(":")[0]
+        return dev_type == "cuda"
+
+    @property
+    def supports_bulk_load(self) -> bool:
+        """H2D bulk load: page_first host layout only (a run of consecutive
+        host tokens is one contiguous multi-layer segment)."""
+        return (
+            self.layout == "page_first"
+            and (self.kv_cache_dim * self.dtype.itemsize) % 8 == 0
+            and getattr(self, "dcp_size", 1) == 1
+            and self._bulk_device_ok
+        )
+
+    @property
+    def supports_bulk_backup(self) -> bool:
+        """D2H bulk backup: layer_first host layout only (a joint run of
+        consecutive device + host tokens is one contiguous segment per layer,
+        no staging needed). The page_first staged write-back already runs at
+        the D2H roofline and keeps its path."""
+        return (
+            self.layout == "layer_first"
+            and (self.kv_cache_dim * self.dtype.itemsize) % 8 == 0
+            and getattr(self, "dcp_size", 1) == 1
+            and self._bulk_device_ok
+        )
+
+    def _bulk_staging_tokens(self) -> int:
+        return max(
+            self.page_size,
+            bulk_copy.BULK_STAGING_BYTES // max(self.layout_dim, 1),
+        )
+
+    _bulk_logged = False
+
+    def _log_bulk_engaged(self, what: str) -> None:
+        if not MLATokenToKVPoolHost._bulk_logged:
+            MLATokenToKVPoolHost._bulk_logged = True
+            logger.info(
+                "SGLANG_HICACHE_BULK_COPY engaged (%s path, layout=%s, "
+                "item=%d B, L=%d)",
+                what,
+                self.layout,
+                self.kv_cache_dim * self.dtype.itemsize,
+                self.layer_num,
+            )
+
+    def load_to_device_bulk(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ) -> None:
+        """H2D load of a whole op: coalesce host rows into contiguous runs,
+        cudaMemcpyBatchAsync each run into a device staging buffer (same
+        page_first layout), then scatter staging rows into the per-layer
+        device pool slots with index_put. Byte-identical to
+        load_to_device_per_layer over the same index set."""
+        assert self.layout == "page_first"
+        assert io_backend == "kernel"
+        item = self.kv_cache_dim * self.dtype.itemsize
+        row = self.layout_dim  # bytes per host token (all layers)
+        L = self.layer_num
+        self._log_bulk_engaged("load")
+
+        if host_indices.is_cuda:
+            host_cpu = host_indices.detach().to("cpu")  # sync D2H of indices
+        else:
+            host_cpu = host_indices
+        host_cpu = host_cpu.to(torch.int64).contiguous()
+        if device_indices.is_cuda:
+            dev = device_indices
+        else:
+            dev = device_indices.to(device_pool.device, non_blocking=True)
+        if dev.dtype != torch.int64:
+            dev = dev.to(torch.int64)
+
+        cap = self._bulk_staging_tokens()
+        if (
+            getattr(self, "_bulk_load_staging", None) is None
+            or self._bulk_load_staging.shape[0] < cap
+        ):
+            self._bulk_load_staging = torch.empty(
+                (cap, L, 1, self.kv_cache_dim),
+                dtype=self.dtype,
+                device=device_pool.device,
+            )
+        staging = self._bulk_load_staging
+        staging64 = staging.view(torch.int64).view(cap, L, -1)  # [cap, L, item/8]
+        host_base = self.kv_buffer.data_ptr()
+        stream = torch.cuda.current_stream(device_pool.device)
+
+        starts, lens = bulk_copy.find_runs(host_cpu)
+        pos = 0
+        for cstarts, clens, coffsets, filled in bulk_copy.chunk_runs(starts, lens, cap):
+            seg_src = host_base + cstarts * row
+            seg_dst = staging.data_ptr() + coffsets * row
+            seg_size = clens * row
+            ok = bulk_copy.batched_memcpy_async(
+                seg_dst, seg_src, seg_size, stream,
+                src_is_device=False, dst_is_device=True,
+            )
+            if not ok:
+                # per-run fallback (still bulk per run)
+                for j in range(cstarts.numel()):
+                    s = int(cstarts[j])
+                    n = int(clens[j])
+                    o = int(coffsets[j])
+                    staging[o : o + n].copy_(
+                        self.kv_buffer[s : s + n], non_blocking=True
+                    )
+            dev_chunk = dev[pos : pos + filled]
+            src64 = staging64[:filled]
+            for l in range(L):
+                dst64 = device_pool.kv_buffer[l].view(torch.int64).view(-1, item // 8)
+                dst64[dev_chunk] = src64[:, l, :]
+            pos += filled
+
+    def backup_from_device_bulk(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ) -> None:
+        """D2H backup of a whole op (layer_first host): joint runs where both
+        device and host tokens are consecutive become one contiguous segment
+        per layer, all submitted via cudaMemcpyBatchAsync; the remaining rows
+        fall back to the AOT all-layer kernel. Byte-identical to
+        backup_from_device_all_layer over the same index set."""
+        assert self.layout == "layer_first"
+        assert io_backend == "kernel"
+        item = self.kv_cache_dim * self.dtype.itemsize
+        L = self.layer_num
+        self._log_bulk_engaged("backup")
+
+        if host_indices.is_cuda:
+            host_cpu = host_indices.detach().to("cpu")
+        else:
+            host_cpu = host_indices
+        host_cpu = host_cpu.to(torch.int64).contiguous()
+        if device_indices.is_cuda:
+            dev_cpu = device_indices.detach().to("cpu")  # sync D2H of indices
+        else:
+            dev_cpu = device_indices
+        dev_cpu = dev_cpu.to(torch.int64).contiguous()
+
+        from sglang.srt.environ import envs
+
+        h_starts, d_starts, lens, positions = bulk_copy.find_joint_runs(
+            host_cpu, dev_cpu
+        )
+        seg_mask = lens * item >= bulk_copy.BULK_MIN_SEGMENT_BYTES
+
+        stream = torch.cuda.current_stream(device_pool.device)
+        seg_done = False
+        if bool(seg_mask.any()):
+            sel_h = h_starts[seg_mask]
+            sel_d = d_starts[seg_mask]
+            sel_len = lens[seg_mask]
+            dev_ptrs = torch.tensor(
+                [t.data_ptr() for t in device_pool.kv_buffer],
+                dtype=torch.int64,
+            )
+            host_ptrs = torch.tensor(
+                [t.data_ptr() for t in self.kv_buffer], dtype=torch.int64
+            )
+            # segments: [runs, layers] (layer-major inside each run)
+            src = (
+                dev_ptrs[None, :] + sel_d[:, None] * item
+            ).reshape(-1)
+            dst = (
+                host_ptrs[None, :] + sel_h[:, None] * item
+            ).reshape(-1)
+            sizes = sel_len[:, None].expand(-1, L).reshape(-1) * item
+            n_seg = sizes.numel()
+            if (
+                envs.SGLANG_D2H_SM_STORES.get()
+                and int(sizes.sum()) >= bulk_copy.SM_STORE_MIN_SEGMENT_BYTES
+            ):
+                # coalesced SM stores: ~383 GB/s vs the ~170 GB/s CE cap;
+                # only for big admits (see SM_STORE_MIN_SEGMENT_BYTES)
+                seg_done = bulk_copy.sm_store_d2h_segments(
+                    dst, src, sizes, item, L, stream
+                )
+            if not seg_done:
+                step = bulk_copy.BULK_MAX_SEGMENTS_PER_CALL
+                for i in range(0, n_seg, step):
+                    ok = bulk_copy.batched_memcpy_async(
+                        dst[i : i + step],
+                        src[i : i + step],
+                        sizes[i : i + step],
+                        stream,
+                        src_is_device=True,
+                        dst_is_device=False,
+                    )
+                    if not ok:
+                        # per-run fallback: torch D2H copies, layer by layer
+                        for j in range(sel_h.numel()):
+                            h0 = int(sel_h[j])
+                            d0 = int(sel_d[j])
+                            n = int(sel_len[j])
+                            for l in range(L):
+                                self.kv_buffer[l][h0 : h0 + n].copy_(
+                                    device_pool.kv_buffer[l][d0 : d0 + n],
+                                    non_blocking=True,
+                                )
+                        break
+
+        # remainder rows (not covered by an eligible joint run) -> AOT kernel
+        # (vectorized: find_joint_runs tiles [0, n) exactly, so the flat
+        # per-run eligibility expanded by run lengths IS the per-position mask)
+        rem_mask = torch.ones(host_cpu.numel(), dtype=torch.bool)
+        if h_starts.numel() > 0 and int(lens.sum()) == host_cpu.numel():
+            rem_mask = ~torch.repeat_interleave(seg_mask, lens)
+        rem_pos = rem_mask.nonzero().flatten()
+        if rem_pos.numel() > 0:
+            rem_h = host_cpu[rem_pos].to(device_pool.device, non_blocking=True)
+            rem_d = dev_cpu[rem_pos].to(device_pool.device, non_blocking=True)
+            device_data_ptrs, _ = self._resolve_device_transfer_buffers(device_pool)
+            # SM rows win when the HOST index set is chunky (mean run >= 2
+            # pages: coalesced dst spans); fully page-scattered writes are
+            # TLB-bound on every path (SM 25 / AOT 36 GB/s at 131k scattered
+            # rows over 20 GB pools) and keep the AOT kernel.
+            _hr_starts, _hr_lens = bulk_copy.find_runs(host_cpu)
+            _mean_host_run = (
+                float(_hr_lens.float().mean()) if _hr_lens.numel() else 0.0
+            )
+            if not (
+                envs.SGLANG_D2H_SM_STORES.get()
+                and _mean_host_run >= 2 * self.page_size
+                and bulk_copy.sm_store_d2h_rows(
+                    device_data_ptrs,
+                    self.data_ptrs,
+                    rem_d,
+                    rem_h,
+                    self.token_stride_size,
+                    L,
+                )
+            ):
+                transfer_kv_all_layer_mla(
+                    src_layers=device_data_ptrs,
+                    dst_layers=self.data_ptrs,
+                    src_indices=rem_d,
+                    dst_indices=rem_h,
+                    item_size=self.token_stride_size,
+                    num_layers=L,
+                )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -414,6 +667,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return device_pool.data_ptrs, device_pool.kv_buffer
 
     def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        # Bulk dispatch lives HERE (not only in L2TransferEngine) because the
+        # hisparse coordinator's staging/eager backups call this method
+        # directly, bypassing the engine. Flag off or unsupported -> the
+        # original kernel path, unchanged.
+        from sglang.srt.environ import envs
+
+        if (
+            envs.SGLANG_HICACHE_BULK_COPY.get()
+            and io_backend == "kernel"
+            and self.supports_bulk_backup
+            # tiny ops (hisparse eager per-step backup: 1-8 tokens) keep the
+            # kernel path: the index .cpu() sync would cost more than the copy
+            and host_indices.numel() >= bulk_copy.BULK_MIN_TOKENS
+        ):
+            return self.backup_from_device_bulk(
+                device_pool, host_indices, device_indices, io_backend
+            )
+        return self._backup_from_device_all_layer_kernel(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def _backup_from_device_all_layer_kernel(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
