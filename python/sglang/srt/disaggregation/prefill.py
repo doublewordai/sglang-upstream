@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -117,6 +118,107 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+# ---- pp4-spec-fix instrumentation (env-gated; strip before promote) ----
+import json as _pp4sf_json
+import os as _pp4sf_os
+
+_PP4SF_DEBUG = _pp4sf_os.environ.get("SGLANG_PP4SF_DEBUG", "0") == "1"
+_PP4SF_NDUMP = [0]
+
+
+def _pp4sf_b(x):
+    if x.dtype != torch.uint8:
+        x = x.view(torch.uint8)
+    return x.reshape(-1).tolist()[:16]
+
+
+def _pp4sf_s(x):
+    if x.dtype != torch.uint8:
+        x = x.view(torch.uint8)
+    return int(x.sum().item())
+
+
+def _pp4sf_dump_prefill_kv(sched, req, end_idx):
+    """Page sums + token byte prefixes for this stage's layers + draft + index-K."""
+    try:
+        if _PP4SF_NDUMP[0] >= 12:
+            return
+        if req.rid.startswith("HEALTH_CHECK") or len(req.origin_input_ids) < 4:
+            return
+        pool = sched.token_to_kv_pool_allocator.get_kvcache()
+        ps = int(getattr(pool, "page_size", 1))
+        seq = int(end_idx)
+        n_tok = min(seq, 2 * ps + 8)
+        locs = sched.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tok]
+        locs = locs.to(torch.int64).cpu()
+        out = {
+            "pp4sf": "pf", "rid": req.rid, "n_tok": n_tok, "ps": ps,
+            "pp_rank": int(getattr(sched.ps, "pp_rank", -1)) if hasattr(sched, "ps") else -1,
+            "start_layer": int(pool.start_layer), "end_layer": int(pool.end_layer),
+            "tok_locs": locs.tolist(),
+            "main": {}, "index_k": {}, "draft": None,
+        }
+        n_pg = max(1, min(2, (n_tok + ps - 1) // ps))
+        for lid in range(pool.start_layer, pool.end_layer):
+            buf = pool.kv_buffer[lid - pool.start_layer]
+            pages = []
+            for pg in range(n_pg):
+                loc0 = int(locs[min(pg * ps, n_tok - 1)])
+                row = buf[loc0 : loc0 + ps].cpu()
+                pages.append({
+                    "sum": _pp4sf_s(row),
+                    "toks": [_pp4sf_b(row[j]) for j in range(min(4, row.shape[0]))],
+                })
+            out["main"][lid] = pages
+        ikc = getattr(pool, "index_key_cache", None)
+        if ikc is not None and getattr(ikc, "buffer", None) is not None:
+            for lid in range(pool.start_layer, pool.end_layer):
+                buf = ikc.buffer[lid - pool.start_layer]
+                if buf is None or buf.numel() == 0:
+                    continue
+                pages = []
+                for pg in range(n_pg):
+                    pid = int(locs[min(pg * ps, n_tok - 1)]) // (ps or 1)
+                    row = buf[pid].cpu()
+                    pages.append({"sum": _pp4sf_s(row), "toks": [_pp4sf_b(row)]})
+                out["index_k"][lid] = pages
+        km = sched.disagg_prefill_bootstrap_queue
+        dp = getattr(km, "draft_token_to_kv_pool", None)
+        if dp is not None:
+            dps = int(getattr(dp, "page_size", 1))
+            dmain, dikc = {}, {}
+            n_dpg = max(1, min(2, (n_tok + dps - 1) // dps))
+            for i in range(dp.layer_num):
+                buf = dp.kv_buffer[i]
+                pages = []
+                for pg in range(n_dpg):
+                    loc0 = int(locs[min(pg * dps, n_tok - 1)])
+                    row = buf[loc0 : loc0 + dps].cpu()
+                    pages.append({
+                        "sum": _pp4sf_s(row),
+                        "toks": [_pp4sf_b(row[j]) for j in range(min(4, row.shape[0]))],
+                    })
+                dmain[i] = pages
+            ikd = getattr(dp, "index_key_cache", None)
+            if ikd is not None and getattr(ikd, "buffer", None) is not None:
+                for i in range(dp.layer_num):
+                    buf = ikd.buffer[i]
+                    if buf is None or buf.numel() == 0:
+                        continue
+                    pages = []
+                    for pg in range(n_dpg):
+                        pid = int(locs[min(pg * dps, n_tok - 1)]) // (dps or 1)
+                        row = buf[pid].cpu()
+                        pages.append({"sum": _pp4sf_s(row), "toks": [_pp4sf_b(row)]})
+                    dikc[i] = pages
+            out["draft"] = {"ps": dps, "main": dmain, "index_k": dikc}
+        _PP4SF_NDUMP[0] += 1
+        logger.warning("PP4SF " + _pp4sf_json.dumps(out))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("PP4SF pf-dump-failed %s", repr(e))
+# ---- end pp4-spec-fix instrumentation ----
 
 
 class PrefillBootstrapQueue:
@@ -792,7 +894,12 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                pdho_early_sent = False
+                if not req.pending_bootstrap:
+                    pdho_early_sent = self._pdho_early_send(req, next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
+                if pdho_early_sent:
+                    self._pdho_reconcile_early_send(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -827,7 +934,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if not req.pending_bootstrap:
+                if not req.pending_bootstrap and not pdho_early_sent:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
@@ -886,10 +993,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:
-                    assert (
-                        req.metadata_buffer_index >= 0
-                    ), f"Req {req.rid} does not have metadata buffer allocated"
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    if not self._pdho_early_send(req, None):
+                        assert (
+                            req.metadata_buffer_index >= 0
+                        ), f"Req {req.rid} does not have metadata buffer allocated"
+                        self.send_kv_chunk(
+                            req, last_chunk=False, end_idx=req.tmp_end_idx
+                        )
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -956,6 +1066,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
+                self._pdho_release_pending_free(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
@@ -1037,6 +1148,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        self._pdho_release_pending_free(req)
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -1219,6 +1331,228 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
+    # ---- pd-handover-latency lane: early chunk KV send (SGLANG_PDHO_EARLY_SEND=1)
+    def _pdho_early_send_eligible(self) -> bool:
+        if getattr(self, "_pdho_eligible", None) is None:
+            # Early KV send at the chunk's own result processing (from
+            # CPU-staged payloads) is the DEFAULT path: it removes the ~96ms
+            # batch handover stall measured at b>=2. SGLANG_PDHO_EARLY_SEND=0
+            # opts out (A/B testing); staging mode keeps the classic path.
+            ok = (
+                os.environ.get("SGLANG_PDHO_EARLY_SEND", "1") == "1"
+                and not self.enable_staging
+            )
+            state_types = None
+            if ok:
+                state_types = (
+                    self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+                )
+                allowed = (StateType.DSA, StateType.MINIMAX_INDEX_K)
+                ok = all(st in allowed for st in state_types)
+            self._pdho_eligible = ok
+            logger.info(
+                "pdho eligibility: env=%s staging=%s state_types=%s -> %s",
+                os.environ.get("SGLANG_PDHO_EARLY_SEND"),
+                self.enable_staging,
+                state_types,
+                ok,
+            )
+        return self._pdho_eligible
+
+    def _pdho_prestage_for_batch(self: Scheduler, batch) -> None:
+        """Pre-stage CPU transfer payloads for the chunks this batch's forward
+        will make sendable. Runs at run_batch time: req_to_token rows are
+        already written (prepare_for_extend ran inside get_new_batch_prefill)
+        and this batch's forward is not launched yet, so the GPU->CPU copies
+        sync only against the previous batch's sample -- not behind the next
+        forward (which is what makes the classic result-time send block).
+        """
+        if not self._pdho_early_send_eligible():
+            return
+        if not batch.forward_mode.is_extend():
+            cold_trace("pf_prestage_batch", mode=int(batch.forward_mode), n=len(batch.reqs))
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
+        for req in batch.reqs:
+            try:
+                if req.disagg_kv_sender is None or req.pending_bootstrap:
+                    cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="nosender" if req.disagg_kv_sender is None else "pending")
+                    continue
+                if req.extend_range is None:
+                    cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="noextend")
+                    continue
+                start = req.start_send_idx
+                end = min(req.extend_range.end, len(req.origin_input_ids))
+                last_chunk = end >= len(req.origin_input_ids)
+                if not last_chunk:
+                    end = end - end % page_size
+                if end <= start:
+                    cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="empty", start=start, end=end, ssi=req.start_send_idx, ere=req.extend_range.end if req.extend_range else -1)
+                    continue
+                row_raw = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, start:end
+                ]
+                row_xfer = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    row_raw
+                )
+                pages = kv_to_page_indices(row_xfer, page_size).astype(np.int32)
+                state_indices = None
+                if last_chunk and state_types:
+                    if req.metadata_buffer_index is None or req.metadata_buffer_index < 0:
+                        cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="noaux", last=1)
+                        continue  # aux not ready -> classic path
+                    row_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :end
+                    ]
+                    # prefill send_kv_chunk pages the DSA payload with the
+                    # allocator page size (the Scheduler has no
+                    # token_to_kv_pool attribute)
+                    dsa = kv_to_page_indices(row_full, page_size)
+                    state_indices = [
+                        (
+                            dsa
+                            if st in (StateType.DSA, StateType.MINIMAX_INDEX_K)
+                            else None
+                        )
+                        for st in state_types
+                    ]
+                cold_trace(
+                    "pf_prestage",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    start=start,
+                    end=end,
+                    last=1 if last_chunk else 0,
+                )
+                stash = {
+                    "start": start,
+                    "end": end,
+                    "last": last_chunk,
+                    "pages": pages,
+                    "state": state_indices,
+                    # raw (pre-translate) token ids in req_to_token space, for
+                    # the post-insert dedup reconcile
+                    "fresh": row_raw.cpu().numpy().astype(np.int64),
+                }
+                # Deque: the stash staged at fwd k's launch is consumed at fwd
+                # k's OWN result processing (one loop iteration later), which
+                # runs after fwd k's copy_done sync -- so the KV is written.
+                # A single slot would be consumed one result too early (at fwd
+                # k-1's result, while fwd k still runs -> read/write race).
+                q = getattr(req, "pdho_prepped_q", None)
+                if q is None:
+                    q = deque()
+                    req.pdho_prepped_q = q
+                q.append(stash)
+                while len(q) > 4:
+                    q.popleft()
+            except Exception as e:  # noqa: BLE001
+                req.pdho_prepped = None
+                logger.warning("pdho prestage failed for %s: %s", req.rid, e)
+
+    def _pdho_early_send(self: Scheduler, req: Req, next_token_id) -> bool:
+        """Issue the pre-staged chunk send with no GPU access. Returns False
+        when the caller must fall back to send_kv_chunk."""
+        q = getattr(req, "pdho_prepped_q", None)
+        prepped = q.popleft() if q else None
+        if prepped is None or not self._pdho_early_send_eligible():
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="nostash" if prepped is None else "ineligible")
+            return False
+        if req.pending_bootstrap or req.disagg_kv_sender is None:
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="pending")
+            return False
+        if prepped["start"] != req.start_send_idx:
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="stale", want=prepped["start"], have=req.start_send_idx)
+            return False  # stale stash (requeue/retry moved the window)
+        if prepped["last"] and next_token_id is None:
+            cold_trace("pf_early_skip", rid=req.rid, room=req.bootstrap_room, why="notoken")
+            return False
+        sender = req.disagg_kv_sender
+        if prepped["last"]:
+            self.disagg_metadata_buffers.set_buf(req)
+        pages = prepped["pages"]
+        if sender.should_send_kv_chunk(len(pages), prepped["last"]):
+            sender.send(
+                pages,
+                prepped["state"] if prepped["last"] else None,
+                num_kv_tokens=prepped["end"] - prepped["start"],
+            )
+        req.start_send_idx = prepped["end"]
+        if prepped["last"]:
+            # Suppress the radix insert's dedup-free of pages the in-flight
+            # transfer is still reading: bump cache_protected_len to the sent
+            # range end so cache_unfinished_req's free_segment
+            # [protected:new_prefix_len) skips the in-flight pages. The insert
+            # then overwrites cache_protected_len with the tree's coverage --
+            # we must NOT restore it afterwards (restoring would make the final
+            # cache_finished_req free the tree's own pages). The duplicate
+            # (orphan) pages are stashed and freed at transfer completion.
+            req.pdho_sent_fresh = prepped["fresh"]
+            req.pdho_sent_start = prepped["start"]
+            if (
+                req.cache_protected_len is not None
+                and req.cache_protected_len < prepped["end"]
+            ):
+                req.cache_protected_len = prepped["end"]
+        cold_trace(
+            "pf_chunk_send",
+            rid=req.rid,
+            room=req.bootstrap_room,
+            start_idx=prepped["start"],
+            end_idx=prepped["end"],
+            tokens=prepped["end"] - prepped["start"],
+            last=1 if prepped["last"] else 0,
+            early=1,
+        )
+        return True
+
+    def _pdho_reconcile_early_send(self: Scheduler, req: Req) -> None:
+        """After the radix insert: stash the dedup-orphaned pages (freshly
+        written pages the tree replaced with cached copies) for freeing once
+        the transfer completes. cache_protected_len is left at the value the
+        insert set (the tree's coverage) -- do NOT restore the pre-send value:
+        the final cache_finished_req frees [cache_protected_len:freed_end), and
+        restoring would free the tree's own pages."""
+        fresh = getattr(req, "pdho_sent_fresh", None)
+        start = getattr(req, "pdho_sent_start", None)
+        req.pdho_sent_fresh = None
+        req.pdho_sent_start = None
+        if fresh is None or start is None:
+            return
+        post = req.prefix_indices
+        if post is None:
+            return
+        n = min(len(post) - start, len(fresh))
+        if n <= 0:
+            return
+        post_np = post[start : start + n].cpu().numpy()
+        orphan_mask = post_np != fresh[:n]
+        if orphan_mask.any():
+            orphans = torch.as_tensor(
+                fresh[:n][orphan_mask], dtype=torch.int64, device=post.device
+            )
+            req.pdho_pending_free = orphans
+            logger.info(
+                "pdho early-send: %d dedup-orphaned pages held for rid=%s "
+                "until transfer completion",
+                int(orphan_mask.sum()),
+                req.rid,
+            )
+
+    def _pdho_release_pending_free(self: Scheduler, req: Req) -> None:
+        """Free the dedup-orphaned pages once the room's transfer concluded."""
+        orphans = getattr(req, "pdho_pending_free", None)
+        req.pdho_pending_free = None
+        if orphans is None:
+            return
+        try:
+            self.token_to_kv_pool_allocator.free(orphans)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pdho pending free failed for rid=%s: %s", req.rid, e)
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -1262,6 +1596,8 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            if _PP4SF_DEBUG:
+                _pp4sf_dump_prefill_kv(self, req, min(req.extend_range.end, transfer_input_len))
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request

@@ -13,6 +13,7 @@ from typing import (
 
 import torch
 
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -111,6 +112,14 @@ class SchedulerBatchResultProcessor:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
+        if cold_trace_enabled():
+            for req in batch.reqs:
+                cold_trace(
+                    "dec_token1_out",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    token=req.output_ids[-1] if req.output_ids else -1,
+                )
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         if use_free_group:
@@ -872,6 +881,18 @@ class SchedulerBatchResultProcessor:
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
+            if getattr(req, "pdho_first_result", False):
+                req.pdho_first_result = False
+                cold_trace(
+                    "dec_step_done",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    token=(
+                        next_token_id[0]
+                        if isinstance(next_token_id, list)
+                        else next_token_id
+                    ),
+                )
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
