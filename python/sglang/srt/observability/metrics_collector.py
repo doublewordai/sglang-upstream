@@ -2718,7 +2718,8 @@ def build_load_snapshot_metrics_collector(tokenizer_manager):
             server_args, "enable_priority_scheduling", False
         ),
         decode_hisparse=(
-            server_args.disaggregation_mode == DisaggregationMode.DECODE
+            DisaggregationMode(server_args.disaggregation_mode)
+            == DisaggregationMode.DECODE
             and server_args.enable_hisparse
         ),
     )
