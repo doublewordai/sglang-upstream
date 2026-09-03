@@ -497,7 +497,7 @@ def _decode_pool_geoms(tree_cache: Any) -> Dict[str, PoolGeom]:
     if bufs:
         item_i = int(bufs[0].shape[1] * bufs[0].element_size())
         pages_i = int(bufs[0].shape[0])
-        dev = int(pool.device.index if hasattr(pool.device, "index") else 0)
+        dev = int(getattr(bufs[0].device, "index", None) or 0)
         geoms["indexer"] = PoolGeom(
             "indexer", [int(t.data_ptr()) for t in bufs], item_i, pages_i,
             len(bufs), [t.reshape(t.shape[0], -1) for t in bufs],
