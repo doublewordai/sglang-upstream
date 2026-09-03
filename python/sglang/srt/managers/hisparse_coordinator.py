@@ -1206,18 +1206,16 @@ class HiSparseCoordinator:
         ]
         pos_cpu = torch.where(mask)[0]
         if pos_cpu.numel() == 0:
-            self._pending_backup = (0, None, None, None, None)
+            self._pending_backup = (0, None, None, None, None, None)
             return
         reqs_cpu = req_pool_indices_cpu[pos_cpu]
         start_cpu = seq_lens_cpu[pos_cpu] // cr - 1
         slot_cpu = start_cpu.clamp(max=self.device_buffer_size)
-        host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            reqs_cpu,
-            start_cpu,
-            1,
-        )
+        # NOTE: no host-pool alloc here. The req's host rows may not have
+        # landed yet (a transfer completes in the next iteration's
+        # process_decode_queue, BEFORE prepare_for_decode); allocating here
+        # asserts (start_pos <= allocated_len). The alloc runs at consume
+        # time with the same order/values as the inline path.
         if self._backup_stage is None:
             self._backup_stage = tuple(
                 torch.empty(self._staging_capacity, dtype=torch.int64, pin_memory=True)
@@ -1233,7 +1231,8 @@ class HiSparseCoordinator:
             pinned_req[:n].to(self.device, non_blocking=True),
             pinned_slot[:n].to(self.device, non_blocking=True),
             pinned_pos[:n].to(self.device, non_blocking=True),
-            host_locs,
+            reqs_cpu,
+            start_cpu,
         )
 
     def _fast_backup_eligible(
@@ -1322,12 +1321,28 @@ class HiSparseCoordinator:
             # The batch shrank since staging (retract/abort raced): recompute.
             staged = None
         if staged is not None:
-            n, backup_req_indices, buffer_slot, actual_compressed_pos, host_locs = staged
+            (
+                n,
+                backup_req_indices,
+                buffer_slot,
+                actual_compressed_pos,
+                staged_reqs,
+                staged_poss,
+            ) = staged
             # Clear first-backup skips for the current batch (the inline path
             # clears them on each req's first prepare; vectorised here).
             self._skip_first_backup[req_pool_indices_cpu] = False
             if n == 0:
                 return
+            # Host rows are allocated HERE (consume time): rows may only land
+            # in this iteration's process_decode_queue, before this call.
+            host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                staged_reqs,
+                staged_poss,
+                1,
+            )
             device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
             self._backup_log(
                 len(seq_lens_cpu),
