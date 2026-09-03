@@ -1679,12 +1679,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 except OSError as e:
                     logger.warning("verify timing write failed: %s", e)
         spec = batch.spec_info
+        bs = int(spec.req_pool_indices.shape[0])
         layout = getattr(spec, "ragged_verify_layout", None)
         vl_clone = (
             layout.verify_lens.to(torch.int64).clone()
             if layout is not None
             else torch.full(
-                (int(spec.bs),),
+                (bs,),
                 self.speculative_num_draft_tokens,
                 dtype=torch.int64,
                 device=self.device,
@@ -1696,7 +1697,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         out = self._verify_impl(batch, grammar_barrier)
         ev1.record()
         self._verify_timing_events = (ev0, ev1)
-        self._verify_timing_pending = {"bs": int(spec.bs), "verify_lens": vl_clone}
+        self._verify_timing_pending = {"bs": bs, "verify_lens": vl_clone}
         return out
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
