@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import seqlens_expand_triton
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -68,6 +69,28 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
     This mixin provides the _precompute_replay_metadata method and its helpers,
     which are used to optimize CUDA graph replay in multi-step scenarios.
     """
+
+    def _decode_flashmla_metadata(self, bs, dsa_cache_seqlens, seq_lens_cpu):
+        """[lane attn-streams] FlashMLA schedule for a decode step.
+
+        Fast path (SGLANG_DSA_IN_GRAPH_METADATA): when every request's context
+        length is >= the indexer top-k, compute_dsa_seqlens clips all rows to
+        topk, the schedule is a per-bs constant, and the cached entry is reused
+        instead of relaunching get_mla_metadata every step.
+        """
+        if self.dsa_decode_impl != "flashmla_kv":
+            return None
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and seq_lens_cpu is not None
+            and bs <= seq_lens_cpu.shape[0]
+            and bool((seq_lens_cpu[:bs] >= self.dsa_index_topk).all())
+        ):
+            return self._static_flashmla_for_decode(bs)
+        return self._compute_flashmla_metadata(
+            cache_seqlens=dsa_cache_seqlens,
+            seq_len_q=1,
+        )
 
     def _precompute_replay_metadata(
         self,
@@ -163,12 +186,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
 
-            flashmla_metadata = None
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens,
-                    seq_len_q=1,
-                )
+            flashmla_metadata = self._decode_flashmla_metadata(
+                bs, dsa_cache_seqlens, seq_lens_cpu
+            )
 
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
@@ -208,12 +228,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             real_page_table = None  # Will use page_indices directly
 
         # Compute FlashMLA metadata if needed
-        flashmla_metadata = None
-        if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=dsa_cache_seqlens,
-                seq_len_q=1,
-            )
+        flashmla_metadata = self._decode_flashmla_metadata(
+            bs, dsa_cache_seqlens, seq_lens_cpu
+        )
 
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
@@ -295,12 +312,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 next_n=self.speculative_num_draft_tokens,
             )
 
-            flashmla_metadata = None
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens,
-                    seq_len_q=1,
-                )
+            flashmla_metadata = self._decode_flashmla_metadata(
+                bs, dsa_cache_seqlens, seq_lens_cpu
+            )
 
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,

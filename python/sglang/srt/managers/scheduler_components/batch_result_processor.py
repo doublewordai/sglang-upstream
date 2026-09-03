@@ -282,7 +282,15 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            # warm-local-prefill: a retained-prefix extend
+                            # stages only the delta to host (the prefix's
+                            # rows are the tree's, adopted at match time).
+                            self.hisparse_coordinator.admit_request_into_staging(
+                                req,
+                                adopted_len=int(
+                                    getattr(req, "wlp_adopted_len", 0) or 0
+                                ),
+                            )
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
