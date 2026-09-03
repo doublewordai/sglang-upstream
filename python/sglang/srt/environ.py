@@ -701,6 +701,15 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Fail hard instead of silently falling back to base pages when the
+    # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
+    # hugetlb mmap failure, THP coverage below ~98%).
+    SGLANG_HUGEPAGE_STRICT = EnvBool(False)
+    # Disable transparent hugepages for the whole engine process tree at init
+    # (prctl PR_SET_THP_DISABLE, inherited by children). Stops khugepaged/
+    # kcompactd churn on non-pool host allocations while the pools themselves
+    # use explicit hugepages via SGLANG_HUGEPAGE_SIZE.
+    SGLANG_DISABLE_THP = EnvBool(False)
     # Back host KV pools with MAP_PRIVATE anonymous pages (huge pages off) instead
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
