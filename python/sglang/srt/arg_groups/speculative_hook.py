@@ -103,7 +103,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Consumed by DFLASH (compact draft KV cache), Llama EAGLE-3 (drafter
+    # attention SWA), and DSA/MLA NextN drafters (GLM/DeepSeek MTP via
+    # eagle_worker_v2: windowed indexer selection).
     if server_args.speculative_draft_window_size is not None:
         window_size = int(server_args.speculative_draft_window_size)
         if window_size <= 0:
@@ -111,12 +113,25 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in (
+            "EAGLE3",
+            "DFLASH",
+            "NEXTN",
+            "EAGLE",
+        ):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3, DFLASH, "
+                "and DSA/MLA NextN drafters only).",
                 server_args.speculative_algorithm,
             )
+        if server_args.speculative_draft_attn_sink is not None:
+            sink = int(server_args.speculative_draft_attn_sink)
+            if sink < 0:
+                raise ValueError(
+                    "--speculative-draft-attn-sink must be >= 0, got %d." % sink
+                )
+            server_args.speculative_draft_attn_sink = sink
 
     algo = None
     if server_args.speculative_algorithm is not None:

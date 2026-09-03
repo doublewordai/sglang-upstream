@@ -408,6 +408,74 @@ def _numa_pages_by_node(ptr: int, n_bytes: int):
     return byt, policies
 
 
+class HostPoolPopulationError(RuntimeError):
+    """A host-pool mapping is not fully populated: huge pages in it cannot
+    be faulted (typically the mempolicy-bound NUMA node is out of free
+    memory). The pool is unusable -- pinning or first touch of the missing
+    pages fails -- so allocation must abort with the real cause instead of
+    surfacing later as cudaErrorInvalidValue (staging-2 C8e, 2026-09-03).
+    """
+
+
+def populated_bytes_in_range(ptr: int, n_bytes: int) -> "int | None":
+    """Resident bytes overlapping [ptr, ptr+n_bytes), from /proc/self/numa_maps.
+
+    None when numa_maps cannot be read (callers treat as "cannot verify").
+    """
+    byt, _ = _numa_pages_by_node(ptr, n_bytes)
+    if byt is None:
+        return None
+    return sum(byt.values())
+
+
+def _node_free_bytes(node: int) -> "int | None":
+    """MemFree of a NUMA node in bytes (best-effort)."""
+    try:
+        with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
+            for line in f:
+                if "MemFree:" in line:
+                    return int(line.split()[3]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def verify_host_pool_populated(
+    ptr: int, n_bytes: int, what: str = "host pool", tol: int = 2 * 1024 * 1024
+) -> None:
+    """Abort when a MAP_POPULATE'd host pool is not fully resident.
+
+    Measured on Isambard GH200 (kernel 6.4; hugetlb-pin follow-up, 2026-09-03):
+    under numactl --membind (MPOL_BIND) a hugetlb surplus fault fails once the
+    bound NUMA node runs out of free memory. MAP_POPULATE silently ignores
+    those faults, mmap() succeeds with a PARTIALLY-populated mapping, and the
+    loss only surfaces later: cudaHostRegister returns cudaErrorInvalidValue
+    on the chunk containing the population frontier (its GUP cannot fault the
+    missing pages), and a plain first touch of them would SIGBUS. staging-2
+    arm C8e died exactly like this: 4 decode ranks/node x 86.9 GiB pools,
+    frontiers 21-78 GiB, whole-pool + 16 GiB-chunk registers rc=1.
+    """
+    populated = populated_bytes_in_range(ptr, n_bytes)
+    if populated is None or populated >= n_bytes - tol:
+        return
+    byt, policies = _numa_pages_by_node(ptr, n_bytes)
+    pol = ",".join(policies) if policies else "?"
+    free_str = ""
+    for n in sorted(byt or {}):
+        fb = _node_free_bytes(n)
+        if fb is not None:
+            free_str += f" N{n} MemFree={fb / 2**30:.1f}GiB"
+    raise HostPoolPopulationError(
+        f"{what}: only {populated / 2**30:.1f} of {n_bytes / 2**30:.1f} GiB "
+        f"could be faulted in (mempolicy={pol};{free_str or ' no per-node free info'})."
+        " The mapping is unusable from here: cudaHostRegister of it fails with"
+        " cudaErrorInvalidValue at this population frontier and touching the"
+        " missing pages would SIGBUS. Free node memory, relax the membind"
+        " policy, or shrink the pool (hisparse host_to_device_ratio /"
+        " max_total_tokens)."
+    )
+
+
 _NUMA_UNSET = object()
 _gpu_numa_node_cache = _NUMA_UNSET
 
@@ -527,6 +595,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
         alloc_bytes = math.ceil(n_bytes / page_size) * page_size
         array = _alloc_thp(n_bytes, alloc_bytes, strict)
         tensor = torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
+        tensor._sglang_mmap_alloc_bytes = alloc_bytes
         log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
         return tensor
 
@@ -563,7 +632,16 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
                 tensor = torch.frombuffer(
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
+                tensor._sglang_mmap_alloc_bytes = alloc_bytes
+                # NUMA-locality line FIRST so the binding is visible even
+                # when population fails; then verify MAP_POPULATE completed
+                # (it silently stops when a mempolicy-bound NUMA node runs
+                # out of memory; a partially-populated pool must fail HERE
+                # with the real cause -- see verify_host_pool_populated).
                 log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
+                verify_host_pool_populated(
+                    tensor.data_ptr(), alloc_bytes, "hugetlb host pool", tol=page_size
+                )
                 return tensor
             except OSError as e:
                 msg = (
@@ -580,6 +658,12 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
     mm = _alloc_plain(alloc_bytes)
     tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    tensor._sglang_mmap_alloc_bytes = alloc_bytes
+    # Same population check as the hugetlb path: the shared variant swallows
+    # MADV_POPULATE_WRITE failures, and a short pool breaks pinning later.
+    verify_host_pool_populated(
+        tensor.data_ptr(), alloc_bytes, "host pool", tol=mmap.PAGESIZE
+    )
     log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
     return tensor
 

@@ -2255,7 +2255,12 @@ class ServerArgs:
     ] = None
     speculative_draft_window_size: A[
         Optional[int],
-        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
+        "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and DSA/MLA NextN drafters (GLM/DeepSeek MTP via eagle_worker_v2: the drafter's indexer candidates are restricted to the union of the first `--speculative-draft-attn-sink` positions and the most recent N positions; selection-only, keys stay roped at true positions). For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
+        NS("spec"),
+    ] = None
+    speculative_draft_attn_sink: A[
+        Optional[int],
+        "Number of leading (session-start) keys the DSA NextN drafter always keeps in its indexer candidate set when --speculative-draft-window-size is set (attention-sink anchor, LongSpec-style). 0 = window-only. Ignored without --speculative-draft-window-size and by non-DSA drafters.",
         NS("spec"),
     ] = None
     speculative_moe_runner_backend: A[
@@ -2777,6 +2782,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "blob",
                 "shm",
             ],
         ),

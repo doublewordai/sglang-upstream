@@ -73,9 +73,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_memory,
     get_parallel,
     get_schedule,
 )
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -116,6 +118,107 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+# ---- pp4-spec-fix instrumentation (env-gated; strip before promote) ----
+import json as _pp4sf_json
+import os as _pp4sf_os
+
+_PP4SF_DEBUG = _pp4sf_os.environ.get("SGLANG_PP4SF_DEBUG", "0") == "1"
+_PP4SF_NDUMP = [0]
+
+
+def _pp4sf_b(x):
+    if x.dtype != torch.uint8:
+        x = x.view(torch.uint8)
+    return x.reshape(-1).tolist()[:16]
+
+
+def _pp4sf_s(x):
+    if x.dtype != torch.uint8:
+        x = x.view(torch.uint8)
+    return int(x.sum().item())
+
+
+def _pp4sf_dump_prefill_kv(sched, req, end_idx):
+    """Page sums + token byte prefixes for this stage's layers + draft + index-K."""
+    try:
+        if _PP4SF_NDUMP[0] >= 12:
+            return
+        if req.rid.startswith("HEALTH_CHECK") or len(req.origin_input_ids) < 4:
+            return
+        pool = sched.token_to_kv_pool_allocator.get_kvcache()
+        ps = int(getattr(pool, "page_size", 1))
+        seq = int(end_idx)
+        n_tok = min(seq, 2 * ps + 8)
+        locs = sched.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tok]
+        locs = locs.to(torch.int64).cpu()
+        out = {
+            "pp4sf": "pf", "rid": req.rid, "n_tok": n_tok, "ps": ps,
+            "pp_rank": int(getattr(sched.ps, "pp_rank", -1)) if hasattr(sched, "ps") else -1,
+            "start_layer": int(pool.start_layer), "end_layer": int(pool.end_layer),
+            "tok_locs": locs.tolist(),
+            "main": {}, "index_k": {}, "draft": None,
+        }
+        n_pg = max(1, min(2, (n_tok + ps - 1) // ps))
+        for lid in range(pool.start_layer, pool.end_layer):
+            buf = pool.kv_buffer[lid - pool.start_layer]
+            pages = []
+            for pg in range(n_pg):
+                loc0 = int(locs[min(pg * ps, n_tok - 1)])
+                row = buf[loc0 : loc0 + ps].cpu()
+                pages.append({
+                    "sum": _pp4sf_s(row),
+                    "toks": [_pp4sf_b(row[j]) for j in range(min(4, row.shape[0]))],
+                })
+            out["main"][lid] = pages
+        ikc = getattr(pool, "index_key_cache", None)
+        if ikc is not None and getattr(ikc, "buffer", None) is not None:
+            for lid in range(pool.start_layer, pool.end_layer):
+                buf = ikc.buffer[lid - pool.start_layer]
+                if buf is None or buf.numel() == 0:
+                    continue
+                pages = []
+                for pg in range(n_pg):
+                    pid = int(locs[min(pg * ps, n_tok - 1)]) // (ps or 1)
+                    row = buf[pid].cpu()
+                    pages.append({"sum": _pp4sf_s(row), "toks": [_pp4sf_b(row)]})
+                out["index_k"][lid] = pages
+        km = sched.disagg_prefill_bootstrap_queue
+        dp = getattr(km, "draft_token_to_kv_pool", None)
+        if dp is not None:
+            dps = int(getattr(dp, "page_size", 1))
+            dmain, dikc = {}, {}
+            n_dpg = max(1, min(2, (n_tok + dps - 1) // dps))
+            for i in range(dp.layer_num):
+                buf = dp.kv_buffer[i]
+                pages = []
+                for pg in range(n_dpg):
+                    loc0 = int(locs[min(pg * dps, n_tok - 1)])
+                    row = buf[loc0 : loc0 + dps].cpu()
+                    pages.append({
+                        "sum": _pp4sf_s(row),
+                        "toks": [_pp4sf_b(row[j]) for j in range(min(4, row.shape[0]))],
+                    })
+                dmain[i] = pages
+            ikd = getattr(dp, "index_key_cache", None)
+            if ikd is not None and getattr(ikd, "buffer", None) is not None:
+                for i in range(dp.layer_num):
+                    buf = ikd.buffer[i]
+                    if buf is None or buf.numel() == 0:
+                        continue
+                    pages = []
+                    for pg in range(n_dpg):
+                        pid = int(locs[min(pg * dps, n_tok - 1)]) // (dps or 1)
+                        row = buf[pid].cpu()
+                        pages.append({"sum": _pp4sf_s(row), "toks": [_pp4sf_b(row)]})
+                    dikc[i] = pages
+            out["draft"] = {"ps": dps, "main": dmain, "index_k": dikc}
+        _PP4SF_NDUMP[0] += 1
+        logger.warning("PP4SF " + _pp4sf_json.dumps(out))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("PP4SF pf-dump-failed %s", repr(e))
+# ---- end pp4-spec-fix instrumentation ----
 
 
 class PrefillBootstrapQueue:
@@ -593,6 +696,13 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        # Poll async HiCache events (write-through acks, load-backs). The
+        # normal loop does this in get_next_batch_to_run; without it the
+        # disagg-prefill loop never releases write-through page locks and the
+        # pool fills with protected (unevictable) pages under sustained load.
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            self.tree_cache.check_hicache_events()
+
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -1486,6 +1596,8 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            if _PP4SF_DEBUG:
+                _pp4sf_dump_prefill_kv(self, req, min(req.extend_range.end, transfer_input_len))
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
