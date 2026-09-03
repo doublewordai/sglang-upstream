@@ -3463,6 +3463,45 @@ class DeepseekSparseAttnBackend(
         )
         return out.view(b, 1, 64, 512)
 
+    def _forward_fused_persist_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """Lane sparse-decode-fused path: persistent fused split+combine Triton
+        kernel (single launch, in-kernel combine, deadlock-free at any batch).
+
+        Semantics match _forward_flashmla_kv (all non-negative indices scored,
+        negative sentinels masked; seqlens only schedule, never mask). The
+        workspace and self-resetting atomic counters live in a module-level
+        grow-only cache keyed by shape - CUDA-graph capturable at fixed batch
+        with no extra memset nodes. MTP target-verify arrives as
+        b' = bs * n_draft flattened rows with per-row page tables - handled
+        identically.
+        """
+        from sglang.kernels.ops.attention.sparse_mla_fused_persist import sdf_fwd
+
+        q_all = q_all.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        b = q_all.shape[0]
+        topk = self.dsa_index_topk
+
+        if kv_cache.dtype == torch.uint8:
+            kv_rows = kv_cache.view(torch.float8_e4m3fn).view(-1, 656)
+        else:
+            kv_rows = kv_cache.view(-1, 656)
+        idx = page_table_1 if page_table_1.dim() == 2 else page_table_1.view(b, topk)
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        if idx.stride(1) != 1:
+            idx = idx.contiguous()
+
+        out = sdf_fwd(q_all, kv_rows, idx, sm_scale)
+        return out.view(b, 1, layer.tp_q_head_num, 512)
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3473,6 +3512,20 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        if (
+            envs.SGLANG_DSA_DECODE_FUSED_PERSISTENT.get()
+            and self.device_sm_major == 9
+            and self.dsa_kv_cache_store_fp8
+            and self.real_page_size == 64
+            and layer.tp_q_head_num == 64
+            and layer.head_dim == 576
+            and v_head_dim == 512
+            and self.dsa_index_topk == 2048
+        ):
+            return self._forward_fused_persist_decode(
+                q_all, kv_cache, sm_scale, layer, metadata, page_table_1
+            )
+
         if (
             envs.SGLANG_DSA_DECODE_FP8_NATIVE.get()
             and self.device_sm_major == 9

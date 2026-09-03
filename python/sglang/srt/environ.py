@@ -1603,6 +1603,13 @@ class Envs:
     # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
     # than the production kernel; kept for development/A-B, default OFF.
     SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-fused persistent Triton kernel: single launch,
+    # in-kernel split+combine (no second launch / combine kernel), grid
+    # capped at co-resident capacity so it is deadlock-free at any batch.
+    # Numerics: prod-class vs the fp32 oracle (0.17-0.21% of RMS), NOT
+    # bit-exact vs FlashMLA (different dequant path and split order).
+    SGLANG_DSA_DECODE_FUSED_PERSISTENT = EnvBool(False)
     # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
     # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
     # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV
