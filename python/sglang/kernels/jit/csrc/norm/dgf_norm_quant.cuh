@@ -38,7 +38,7 @@ namespace sglang {
 
 using namespace device;
 
-template <int kK, int kBlockSize, bool kAdd, bool kMoeIn, bool kDualScale, bool kUsePDL>
+template <int kK, int kBlockSize, bool kAdd, bool kMoeIn, bool kDualScale, bool kSkipH, bool kUsePDL>
 __global__ __launch_bounds__(kBlockSize, 1) void dgf_norm_quant_kernel(
     bf16_t* __restrict__ out_h,        // [T, kK] normed bf16 h
     bf16_t* __restrict__ residual,     // [T, kK] in/out residual (kAdd/kMoeIn)
@@ -51,12 +51,14 @@ __global__ __launch_bounds__(kBlockSize, 1) void dgf_norm_quant_kernel(
     float const alpha,                 // routed scaling (kMoeIn)
     int const num_tokens,
     int const t_pad4,
+    int64_t const stride_x,             // row stride of x (strided views ok)
     float const eps) {
   constexpr int kGroups = kK / 128;
   constexpr int kWarps = kBlockSize / 32;
   constexpr int kGroupsPerWarp = (kGroups + kWarps - 1) / kWarps;
+  constexpr int kElems = kGroupsPerWarp * 4;  // per thread
   static_assert(kK % 128 == 0);
-  static_assert(kK % (kBlockSize * 8) == 0, "K must be a multiple of block*8 (bf16x8 vectors)");
+  static_assert(kGroupsPerWarp * 4 * 32 * kWarps == kK, "thread mapping must tile K exactly");
 
   int const tid = threadIdx.x;
   int const token = blockIdx.x;
@@ -64,110 +66,109 @@ __global__ __launch_bounds__(kBlockSize, 1) void dgf_norm_quant_kernel(
 
   PDLWaitPrimary<kUsePDL>();
 
-  bf16_t const* x_row = x + (int64_t)token * kK;
+  bf16_t const* x_row = x + (int64_t)token * stride_x;
   bf16_t* res_row = residual + (int64_t)token * kK;
   bf16_t* h_row = out_h + (int64_t)token * kK;
+  bf16_t const* sh_row = shared + (int64_t)token * kK;
+  fp8_e4m3_t* q_row = out_q + (int64_t)token * kK;
 
-  // ---- stage 1: load, residual update, sum_sq; stage v (res') to smem ----
-  __shared__ float sm_v[kK];
-  __shared__ float sm_red[kWarps];
+  int const warp = tid >> 5;
+  int const lane = tid & 31;
+
+  // ---- one pass: load into registers, partial sum_sq ----
+  float v[kElems];
   float sum_sq = 0.f;
   {
     float const alpha_f = alpha;
 #pragma unroll
-    for (int base = tid * 8; base < kK; base += kBlockSize * 8) {
-      AlignedVector<bf16_t, 8> xv, rv, sv;
+    for (int gg = 0; gg < kGroupsPerWarp; ++gg) {
+      int const g = warp * kGroupsPerWarp + gg;
+      int const base = g * 128 + lane * 4;
+      AlignedVector<bf16_t, 4> xv, rv, sv, wv;
       xv.load(x_row + base);
+      wv.load(weight + base);
       if constexpr (kMoeIn) {
-        // production chain: moe_out = bf16(shared + alpha*x) (torch add_), then
-        // fused_add_rmsnorm: res' = bf16(res + moe_out) -- TWO bf16 roundings.
         rv.load(res_row + base);
-        sv.load(shared + (int64_t)token * kK + base);
+        sv.load(sh_row + base);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < 4; ++j) {
+          // production chain: moe_out = bf16(sh + alpha*x); res' = bf16(res + moe_out)
           float v1 = cast<float>(sv[j]) + alpha_f * cast<float>(xv[j]);
           bf16_t v1r = cast<bf16_t>(v1);
-          float v = cast<float>(rv[j]) + cast<float>(v1r);
-          sm_v[base + j] = v;
-          sum_sq += v * v;
+          float vv = cast<float>(rv[j]) + cast<float>(v1r);
+          v[gg * 4 + j] = vv;
+          sum_sq += vv * vv;
         }
       } else if constexpr (kAdd) {
         rv.load(res_row + base);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          float v = cast<float>(rv[j]) + cast<float>(xv[j]);
-          sm_v[base + j] = v;
-          sum_sq += v * v;
+        for (int j = 0; j < 4; ++j) {
+          float vv = cast<float>(rv[j]) + cast<float>(xv[j]);
+          v[gg * 4 + j] = vv;
+          sum_sq += vv * vv;
         }
       } else {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          float v = cast<float>(xv[j]);
-          sm_v[base + j] = v;
-          sum_sq += v * v;
+        for (int j = 0; j < 4; ++j) {
+          float vv = cast<float>(xv[j]);
+          v[gg * 4 + j] = vv;
+          sum_sq += vv * vv;
         }
       }
+      (void)wv;  // weight re-loaded below (kept in L1)
     }
   }
 
+  // block reduce sum_sq
+  __shared__ float sm_red[kWarps];
   float wsum = warp::reduce_sum(sum_sq);
-  if ((tid & 31) == 0) sm_red[tid >> 5] = wsum;
+  if (lane == 0) sm_red[warp] = wsum;
   __syncthreads();
   float total = 0.f;
 #pragma unroll
   for (int w = 0; w < kWarps; ++w) total += sm_red[w];
   float const rsqrt_scale = rsqrtf(total / (float)kK + eps);
 
-  // ---- stage 2: h = res' * rsqrt * w (bf16), residual write, per-group quant ----
-  int const warp = tid >> 5;
-  int const lane = tid & 31;
-  fp8_e4m3_t* q_row = out_q + (int64_t)token * kK;
-
-#pragma unroll 1
+  // ---- per-group: h + residual write + amax + quant (registers) ----
+#pragma unroll
   for (int gg = 0; gg < kGroupsPerWarp; ++gg) {
     int const g = warp * kGroupsPerWarp + gg;
-    if (g >= kGroups) break;
     int const base = g * 128 + lane * 4;
-    AlignedVector<bf16_t, 4> wv;
+    AlignedVector<bf16_t, 4> wv, hv, rv;
     wv.load(weight + base);
     bf16_t h4[4];
     float amax = 0.f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      float h = sm_v[base + j] * rsqrt_scale * cast<float>(wv[j]);
+      float h = v[gg * 4 + j] * rsqrt_scale * cast<float>(wv[j]);
       h4[j] = cast<bf16_t>(h);
-      float a = fabsf(cast<float>(h4[j]));
-      amax = fmaxf(amax, a);
+      amax = fmaxf(amax, fabsf(cast<float>(h4[j])));
     }
     float gmax = warp::reduce_max(amax);
     gmax = fmaxf(gmax, 1e-10f);
-    float const scale_inv = gmax * (1.f / 448.f);   // stored scale (dequant)
-    float const qscale = 448.f / gmax;              // quant multiplier
-    // write h + residual
+    float const scale_inv = gmax * (1.f / 448.f);
+    float const qscale = 448.f / gmax;
     if constexpr (kAdd || kMoeIn) {
-      AlignedVector<bf16_t, 4> rv;
 #pragma unroll
-      for (int j = 0; j < 4; ++j) rv[j] = cast<bf16_t>(sm_v[base + j]);
+      for (int j = 0; j < 4; ++j) rv[j] = cast<bf16_t>(v[gg * 4 + j]);
       rv.store(res_row + base);
     }
-    {
-      AlignedVector<bf16_t, 4> hv;
+    if constexpr (!kSkipH) {
 #pragma unroll
       for (int j = 0; j < 4; ++j) hv[j] = h4[j];
       hv.store(h_row + base);
     }
-    // quant: q = satfinite(h_f32 * qscale)
     {
       fp8_e4m3_t q4[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        float v = cast<float>(h4[j]) * qscale;
-        q4[j] = cast<fp8_e4m3_t>(fminf(v, 448.f));
+        float qv = cast<float>(h4[j]) * qscale;
+        q4[j] = cast<fp8_e4m3_t>(fminf(qv, 448.f));
       }
-      AlignedVector<fp8_e4m3_t, 4> qv;
+      AlignedVector<fp8_e4m3_t, 4> qvec;
 #pragma unroll
-      for (int j = 0; j < 4; ++j) qv[j] = q4[j];
-      qv.store(q_row + base);
+      for (int j = 0; j < 4; ++j) qvec[j] = q4[j];
+      qvec.store(q_row + base);
     }
     if (lane == 0) {
       out_s_col[(int64_t)g * t_pad4 + token] = scale_inv;
@@ -180,7 +181,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void dgf_norm_quant_kernel(
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int kK, bool kAdd, bool kMoeIn, bool kDualScale, bool kUsePDL>
+template <int kK, bool kAdd, bool kMoeIn, bool kDualScale, bool kSkipH, bool kUsePDL>
 struct DGFNormQuantKernel {
   static void run(
       const tvm::ffi::TensorView out_h,
@@ -199,9 +200,15 @@ struct DGFNormQuantKernel {
     auto T = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({T, kK}).with_dtype<bf16_t>().with_device(device).verify(out_h);
-    TensorMatcher({T, kK}).with_dtype<bf16_t>().with_device(device).verify(residual);
-    TensorMatcher({T, kK}).with_dtype<bf16_t>().with_device(device).verify(x);
+    if constexpr (kSkipH) {
+      RuntimeCheck(out_h.numel() >= 1, "skip_h: out_h is a dummy");
+    } else {
+      TensorMatcher({T, kK}).with_dtype<bf16_t>().with_device(device).verify(out_h);
+    }
+    auto Sr = SymbolicSize{"stride_res"};
+    TensorMatcher({T, kK}).with_strides({Sr, 1}).with_dtype<bf16_t>().with_device(device).verify(residual);
+    auto Sx = SymbolicSize{"stride_x"};
+    TensorMatcher({T, kK}).with_strides({Sx, 1}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({T, kK}).with_dtype<bf16_t>().with_device(device).verify(shared);
     TensorMatcher({kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
     TensorMatcher({T, kK}).with_dtype<fp8_e4m3_t>().with_device(device).verify(out_q);
@@ -213,9 +220,9 @@ struct DGFNormQuantKernel {
     }
     RuntimeCheck(num_tokens == (int64_t)T.unwrap(), "num_tokens mismatch");
 
-    constexpr int kBlockSize = 256;
+    constexpr int kBlockSize = 512;
     constexpr auto kernel =
-        dgf_norm_quant_kernel<kK, kBlockSize, kAdd, kMoeIn, kDualScale, kUsePDL>;
+        dgf_norm_quant_kernel<kK, kBlockSize, kAdd, kMoeIn, kDualScale, kSkipH, kUsePDL>;
     LaunchKernel((unsigned)num_tokens, kBlockSize, device.unwrap())
         .enable_pdl(kUsePDL)(
             kernel,
@@ -230,6 +237,7 @@ struct DGFNormQuantKernel {
             (float)alpha,
             (int)num_tokens,
             (int)t_pad4,
+            (int64_t)Sx.unwrap(),
             (float)eps);
   }
 };

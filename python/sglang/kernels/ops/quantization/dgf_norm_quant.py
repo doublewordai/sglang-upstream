@@ -25,9 +25,9 @@ from sglang.kernels.jit.utils import (
 
 @cache_once
 def _dgf_norm_quant_module(
-    k: int, add: bool, moe_in: bool, dual: bool, use_pdl: bool
+    k: int, add: bool, moe_in: bool, dual: bool, skip_h: bool, use_pdl: bool
 ):
-    args = make_cpp_args(k, add, moe_in, dual, use_pdl)
+    args = make_cpp_args(k, add, moe_in, dual, skip_h, use_pdl)
     return load_jit(
         "dgf_norm_quant",
         *args,
@@ -61,6 +61,7 @@ def dgf_rmsnorm_quant(
     shared: Optional[torch.Tensor] = None,
     alpha: float = 1.0,
     dual_scale: bool = False,
+    skip_h: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
     """Fused (add-)RMSNorm + group-128 fp8 quant.
 
@@ -68,19 +69,21 @@ def dgf_rmsnorm_quant(
     - residual + shared given:       res' = res + shared + alpha*x      (MoE epilogue)
     - neither:                       h = rmsnorm(x)*w                   (q_a site)
 
-    Returns (h, res', q, s_col_view[, s_row if dual_scale]).
+    Returns (h, res', q, s_col_view[, s_row if dual_scale]). skip_h returns a
+    shape-only h dummy (the q_a site's h is only consumed via its quant).
+    x may be a strided row view (e.g. q_lora = qkv[:, :2048]).
     """
     T, K = x.shape
-    assert x.dtype == torch.bfloat16 and x.is_contiguous()
-    assert K % 128 == 0 and K % (256 * 8) == 0, f"K={K} unsupported"
+    assert x.dtype == torch.bfloat16 and x.stride(1) == 1
+    assert K % 2048 == 0, f"K={K} unsupported (needs K/128 a multiple of 16 warps)"
     moe_in = shared is not None
     add = residual is not None and not moe_in
     res = residual if residual is not None else x  # unused dummy when plain
     sh = shared if shared is not None else x  # unused dummy when not moe_in
-    h = torch.empty_like(x)
+    h = x.new_empty((1,)) if skip_h else torch.empty_like(x)
     q = torch.empty(T, K, dtype=torch.float8_e4m3fn, device=x.device)
     s_col, s_col_view, s_row, t_pad4 = _alloc_scales(T, K, dual_scale, x.device)
-    mod = _dgf_norm_quant_module(K, add, moe_in, dual_scale, is_arch_support_pdl())
+    mod = _dgf_norm_quant_module(K, add, moe_in, dual_scale, skip_h, is_arch_support_pdl())
     mod.dgf_norm_quant(
         h, res, x, sh, weight, q, s_col,
         s_row if s_row is not None else s_col,  # dummy when not dual
