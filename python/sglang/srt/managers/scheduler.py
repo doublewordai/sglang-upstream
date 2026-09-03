@@ -570,11 +570,7 @@ class Scheduler(
         # the local extend path when the retention match is good and the new
         # span is small; everything else keeps the PD path.
         self.local_extend_queue: List[Req] = []
-        self.wlp_enable = (
-            envs.SGLANG_WLP_ENABLE.get()
-            and self.enable_hisparse
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-        )
+        self._wlp_enable_env = envs.SGLANG_WLP_ENABLE.get()
         self.wlp_max_new_tokens = envs.SGLANG_WLP_MAX_NEW_TOKENS.get()
         self.wlp_min_match_frac = envs.SGLANG_WLP_MIN_MATCH_FRAC.get()
         self.wlp_allow_cold = envs.SGLANG_WLP_ALLOW_COLD.get()
@@ -3190,6 +3186,15 @@ class Scheduler(
     # ------------------------------------------------------------------
     # warm-local-prefill (lane warm-local-prefill)
     # ------------------------------------------------------------------
+
+    @property
+    def wlp_enable(self) -> bool:
+        """Warm-local-prefill is active (env on + hisparse + decode arm)."""
+        return (
+            self._wlp_enable_env
+            and self.enable_hisparse
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        )
 
     def _wlp_try_local_extend(self, req: Req, is_retracted: bool = False) -> bool:
         """Eligibility gate for the warm-local extend path.
