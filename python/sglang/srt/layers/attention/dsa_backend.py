@@ -2640,7 +2640,11 @@ class DeepseekSparseAttnBackend(
 
         out = self._hisparse_verify_page_table(slots, n, width)
         outv = out.view(slots, n, -1)
-        for p in range(n):
+        # A/B measurement gate: cap swap-in positions (default full n). The
+        # loop bound is baked into captured graphs, so a python clamp is only
+        # valid for forced-uniform runs with verify_len <= the cap.
+        p_hi = envs.SGLANG_EAGLE_SWAPIN_MAXPOS.get() or n
+        for p in range(p_hi):
             pt = self.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens + (p + 1),
