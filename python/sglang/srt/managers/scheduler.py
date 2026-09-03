@@ -4128,6 +4128,9 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
+            # pd-handover-latency: stage CPU payloads for the chunk send so the
+            # result-time send does not block behind the next forward.
+            self._pdho_prestage_for_batch(batch)
 
         # Run forward
         if self.is_generation:
