@@ -993,7 +993,7 @@ class HiSparseCoordinator:
         page_size = self.mem_pool_host.page_size
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first[req_idx]:
+            if self._skip_first_backup[req_idx]:
                 return False
             page_end = (
                 (int(seq_lens_cpu[i]) - 1 + page_size - 1) // page_size * page_size
