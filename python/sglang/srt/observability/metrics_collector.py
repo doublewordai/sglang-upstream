@@ -134,6 +134,9 @@ class SchedulerStats:
     hisparse_host_pool_pinned_tokens: int = -1
     hisparse_host_pool_evictable_tokens: int = -1
     hisparse_host_pool_wait_events: int = 0
+    # Age of the oldest prealloc blocked on a full host pool, seconds
+    # (-1.0 = not reported: not a hisparse decode arm).
+    hisparse_host_pool_wait_age_s: float = -1.0
 
     # Utilization
     utilization: float = 0.0
@@ -550,6 +553,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     multiprocess_mode="mostrecent",
                 ),
             )
+        self.hisparse_host_pool_wait_age_s = Gauge(
+            name="sglang:hisparse_host_pool_wait_age_s",
+            documentation="HiSparse host KV pool age of the oldest prealloc blocked on a full pool, seconds (-1 if not reported).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.num_bootstrap_failed_reqs = Counter(
             name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
@@ -1411,6 +1420,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge(
             self.hisparse_host_pool_wait_events, stats.hisparse_host_pool_wait_events
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_wait_age_s, stats.hisparse_host_pool_wait_age_s
         )
 
         # Utilization
@@ -2465,9 +2477,17 @@ _ALL_RANKS_WAIT_FAMILY = (
     "sglang:hisparse_host_pool_wait_events",
     "HiSparse host KV pool cumulative prealloc admission waits (host pool full).",
 )
+_ALL_RANKS_WAIT_AGE_FAMILY = (
+    "sglang:hisparse_host_pool_wait_age_s",
+    "HiSparse host KV pool age of the oldest prealloc blocked on a full pool, seconds (-1 if not reported).",
+)
 _ALL_RANKS_QUEUE_FAMILY = (
     "sglang:num_queue_reqs",
     "The number of requests in the waiting queue.",
+)
+_ALL_RANKS_PREALLOC_QUEUE_FAMILY = (
+    "sglang:num_decode_prealloc_queue_reqs",
+    "The number of requests in the decode prealloc queue.",
 )
 
 
@@ -2583,12 +2603,19 @@ class AllRanksLoadSnapshotCollector:
             s.node_rank != self._local_node_rank for s in snapshots
         )
         take_pool = remote_present
+        # Queue-depth families carry per-priority series on the scheduler
+        # side when priority scheduling is on; the snapshot has only totals,
+        # so the multiprocess version wins there (remote ranks get no queue
+        # series — documented gap).
         take_queue = remote_present and not self._priority and any(
             s.queues is not None for s in snapshots
         )
+        take_prealloc = remote_present and not self._priority and any(
+            s.disaggregation is not None for s in snapshots
+        )
 
         mp = self._mp.collect() if self._mp is not None else iter(())
-        if not (take_pool or take_queue):
+        if not (take_pool or take_queue or take_prealloc):
             yield from mp
             return
 
@@ -2597,7 +2624,9 @@ class AllRanksLoadSnapshotCollector:
             if (
                 (take_pool and name in _ALL_RANKS_POOL_FAMILY_NAMES)
                 or (take_pool and name == _ALL_RANKS_WAIT_FAMILY[0])
+                or (take_pool and name == _ALL_RANKS_WAIT_AGE_FAMILY[0])
                 or (take_queue and name == _ALL_RANKS_QUEUE_FAMILY[0])
+                or (take_prealloc and name == _ALL_RANKS_PREALLOC_QUEUE_FAMILY[0])
             ):
                 continue
             yield metric
@@ -2632,6 +2661,16 @@ class AllRanksLoadSnapshotCollector:
                 )
                 family.add_metric(self._label_values(s), value)
             yield family
+            name, doc = _ALL_RANKS_WAIT_AGE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            for s in snapshots:
+                value = (
+                    float(s.host_pool_wait_age_s)
+                    if self._decode_hisparse and s.host_pool_total_tokens > 0
+                    else -1.0
+                )
+                family.add_metric(self._label_values(s), value)
+            yield family
 
         if take_queue:
             name, doc = _ALL_RANKS_QUEUE_FAMILY
@@ -2639,6 +2678,17 @@ class AllRanksLoadSnapshotCollector:
             for s in snapshots:
                 if s.queues is not None:
                     family.add_metric(self._label_values(s), int(s.queues.waiting))
+            yield family
+
+        if take_prealloc:
+            name, doc = _ALL_RANKS_PREALLOC_QUEUE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            for s in snapshots:
+                if s.disaggregation is not None:
+                    family.add_metric(
+                        self._label_values(s),
+                        int(s.disaggregation.decode_prealloc_queue_reqs),
+                    )
             yield family
 
 

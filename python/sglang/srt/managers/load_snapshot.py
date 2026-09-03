@@ -226,6 +226,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     host_pool_pinned_tokens: int = 0
     host_pool_evictable_tokens: int = 0
     host_pool_wait_events: int = 0
+    # Age of the OLDEST prealloc currently blocked on a full host pool
+    # (seconds; 0.0 when nothing waits). The signal that distinguishes a
+    # busy rank from a STUCK one (supervisor's DP2 incident 09-03: 130 s
+    # wait_age at evictable=0 was invisible in every exported metric).
+    host_pool_wait_age_s: float = 0.0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
