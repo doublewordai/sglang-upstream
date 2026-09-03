@@ -386,6 +386,36 @@ def _numa_pages_by_node(ptr: int, n_bytes: int):
     return byt, policies
 
 
+_NUMA_UNSET = object()
+_gpu_numa_node_cache = _NUMA_UNSET
+
+
+def _gpu_numa_node():
+    """NUMA node of the current CUDA device via NVML (best-effort, cached).
+
+    None when CUDA is not initialized, pynvml is unavailable, or the query
+    fails (CPU-only hosts, unit tests); callers fall back to the
+    affinity-derived node.
+    """
+    global _gpu_numa_node_cache
+    if _gpu_numa_node_cache is not _NUMA_UNSET:
+        return _gpu_numa_node_cache
+    node = None
+    try:
+        import torch
+
+        if torch.cuda.is_initialized():
+            from sglang.srt.utils.numa_utils import _query_numa_node_for_gpu
+
+            nodes = _query_numa_node_for_gpu(torch.cuda.current_device())
+            if nodes:
+                node = nodes[0]
+    except Exception:
+        node = None
+    _gpu_numa_node_cache = node
+    return node
+
+
 def log_host_pool_numa_locality(ptr: int, n_bytes: int, name: str = "") -> None:
     """Print pct_local (share of a host pool's populated pages on the
     GPU-local NUMA node) once at allocation; warn below 99%.
@@ -406,18 +436,30 @@ def log_host_pool_numa_locality(ptr: int, n_bytes: int, name: str = "") -> None:
     pol_str = ",".join(policies) or "?"
     prefix = f"[host-pool numa] {name}: " if name else "[host-pool numa] "
     local, contained = _numa_local_node()
-    if local is None:
+    gpu_node = _gpu_numa_node()
+    if gpu_node is not None:
+        # the true locality target is the GPU's own node (NVML); the
+        # affinity node is only a proxy for it
+        target, tgt = gpu_node, f"gpu_node=N{gpu_node}"
+    elif local is not None:
+        target, tgt = local, f"local_node=N{local}"
+    else:
         logger.info(
-            "%s%.1f GiB at %#x: no single local node for this affinity; "
-            "by_node: %s (policy=%s)",
+            "%s%.1f GiB at %#x: no local node determined (affinity spans "
+            "nodes and GPU node unavailable); by_node: %s (policy=%s)",
             prefix, total / 2**30, ptr, by_str, pol_str,
         )
         return
-    pct = 100.0 * byt.get(local, 0) / total
+    notes = []
+    if local is not None and gpu_node is not None and local != gpu_node:
+        notes.append(f"rank bound to N{local} but its GPU is on N{gpu_node}")
+    if not contained:
+        notes.append("affinity spans nodes")
+    notes_s = ("; " + "; ".join("WARNING " + n for n in notes)) if notes else ""
+    pct = 100.0 * byt.get(target, 0) / total
     line = (
-        f"{prefix}{total / 2**30:.1f} GiB at {ptr:#x}: local_node=N{local} "
-        f"pct_local={pct:.2f}% by_node: {by_str} (policy={pol_str}"
-        f"{'' if contained else '; WARNING affinity spans nodes'})"
+        f"{prefix}{total / 2**30:.1f} GiB at {ptr:#x}: {tgt} "
+        f"pct_local={pct:.2f}% by_node: {by_str} (policy={pol_str}{notes_s})"
     )
     if pct >= _NUMA_LOCALITY_WARN_PCT:
         logger.info(line)
