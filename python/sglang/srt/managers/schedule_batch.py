@@ -3105,13 +3105,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.map_last_loc_to_buffer(
-                self.seq_lens,
-                self.out_cache_loc,
-                self.req_pool_indices,
-                self.seq_lens_cpu,
-                self.req_pool_indices_cpu,
-            )
+            if envs.SGLANG_HISPARSE_DEFER_DECODE_MAP.get():
+                # Defer the hisparse map/backup chain until the forward launch
+                # (flush_deferred_hisparse_map, called by run_batch): a rank
+                # still running this chain is a straggler entering the per-step
+                # DP-attention all_gather, and the other ranks then wait with
+                # their GPUs idle. Stash references taken now, flush in the
+                # same scheduler iteration - same rows backed up at the same
+                # step boundary, nothing between here and the flush reads the
+                # hisparse mappings.
+                self._deferred_hisparse_map = (
+                    self.hisparse_coordinator,
+                    self.seq_lens,
+                    self.out_cache_loc,
+                    self.req_pool_indices,
+                    self.seq_lens_cpu,
+                    self.req_pool_indices_cpu,
+                )
+            else:
+                self.hisparse_coordinator.map_last_loc_to_buffer(
+                    self.seq_lens,
+                    self.out_cache_loc,
+                    self.req_pool_indices,
+                    self.seq_lens_cpu,
+                    self.req_pool_indices_cpu,
+                )
 
         if mamba_extra_buffer_enabled():
             mamba_track_interval = get_exec().mamba.mamba_track_interval
@@ -3144,6 +3162,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask = track_mask_cpu.pin_memory().to(
                 device=self.device, non_blocking=True
             )
+
+    def flush_deferred_hisparse_map(self) -> None:
+        """Run the deferred hisparse map/backup chain (see prepare_for_decode).
+        Must run before the batch's forward launch; run_batch calls it first
+        thing. No-op unless the deferral flag stashed a call."""
+        pending = getattr(self, "_deferred_hisparse_map", None)
+        if pending is None:
+            return
+        self._deferred_hisparse_map = None
+        (
+            coordinator,
+            seq_lens,
+            out_cache_loc,
+            req_pool_indices,
+            seq_lens_cpu,
+            req_pool_indices_cpu,
+        ) = pending
+        coordinator.map_last_loc_to_buffer(
+            seq_lens,
+            out_cache_loc,
+            req_pool_indices,
+            seq_lens_cpu,
+            req_pool_indices_cpu,
+        )
 
     def filter_batch(
         self,

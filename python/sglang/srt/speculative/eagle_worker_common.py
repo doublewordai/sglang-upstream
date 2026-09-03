@@ -662,6 +662,11 @@ def run_eagle_verify(
     coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
     if coord is not None:
         coord.record_verify_sample_done()
+    if coord is not None and coord.dpf_probe is not None and not batch.forward_mode.is_idle():
+        coord.dpf_probe.finalize_step(
+            seq_lens_cpu=batch.seq_lens_cpu,
+            accept_lens=accept_lens,
+        )
     new_seq_lens = batch.seq_lens + accept_lens
     # pd/mtp-hisparse: the accepted tokens' KV backup moved AFTER the
     # draft-extend launch (maybe_commit_verify_tokens, called by the workers)

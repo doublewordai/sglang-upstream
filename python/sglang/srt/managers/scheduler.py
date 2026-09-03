@@ -574,6 +574,8 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
+        self.maybe_init_session_migration()
+
         # warm-local-prefill (lane warm-local-prefill): decode-rank local
         # extends of warm-turn appends. Requests whose rid carries the
         # "WLP-" marker (set by the bench client / future router hook) take
@@ -1825,6 +1827,9 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1869,6 +1874,9 @@ class Scheduler(
             maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
+
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2040,6 +2048,41 @@ class Scheduler(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
+
+    def maybe_init_session_migration(self) -> None:
+        """Start the session-migration agent when SGLANG_RANK_MIGRATION_PORT_BASE
+        is set (prefill-arm DP ranks push session host pages to each other)."""
+        self.session_migration_agent = None
+        port_base = os.environ.get("SGLANG_RANK_MIGRATION_PORT_BASE")
+        if not port_base:
+            return
+        try:
+            from sglang.srt.managers.session_migration import (
+                MIGRATION_STATS_FILE_ENV,
+                SessionMigrationAgent,
+            )
+
+            dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            # Pin the UCCL agent to this rank's physical CXI device (the CUDA
+            # device id is remapped by CUDA_VISIBLE_DEVICES).
+            cxi = None
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible:
+                ids = [int(x) for x in visible.split(",") if x.strip() != ""]
+                if 0 <= self.ps.gpu_id < len(ids):
+                    cxi = ids[self.ps.gpu_id]
+            agent = SessionMigrationAgent(
+                tree_cache=self.tree_cache,
+                dp_rank=dp_rank,
+                port=int(port_base) + dp_rank,
+                cxi_device_index=cxi,
+                stats_file=os.environ.get(MIGRATION_STATS_FILE_ENV),
+            )
+            agent.start()
+            self.session_migration_agent = agent
+        except Exception:
+            logger.exception("session-migration agent init failed; disabled")
+            self.session_migration_agent = None
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
@@ -2233,6 +2276,7 @@ class Scheduler(
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_tree_cache=lambda: self.tree_cache,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -2805,6 +2849,13 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
+            logger.info(
+                "[kvl3] prefetch gate rid=%s last_host_node=%s is_backuped=%s is_root=%s prefix_idx=%d host_hit=%d",
+                req.rid, req.last_host_node,
+                tree_cache.is_backuped(req.last_host_node),
+                tree_cache.is_root(req.last_host_node),
+                len(req.prefix_indices), req.host_hit_length,
+            )
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
                 req.last_host_node
             ):
@@ -2814,7 +2865,12 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
+                    # FULL chain incl. the matched node's own pages: the core
+                    # get_prefix_hash_values returns ancestors only, and
+                    # position-aware storage backends (blob) address groups
+                    # by absolute chain position.
                     tree_cache.get_prefix_hash_values(req.last_host_node)
+                    + tree_cache.get_hash_values(req.last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
@@ -2836,6 +2892,8 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._reject_on_host_pool_exhausted(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -2895,6 +2953,33 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
+        return True
+
+    def _reject_on_host_pool_exhausted(self, recv_req: Req) -> bool:
+        """prefill-pool-degrade ladder step 3: when the hicache host tier is
+        exhausted (evict + skip cannot keep up), reject the admit with a
+        503 the router can retry instead of accepting work that cannot be
+        retained."""
+        tree_cache = self.tree_cache
+        host_pool_exhausted = getattr(tree_cache, "host_pool_exhausted", None)
+        if host_pool_exhausted is None or not host_pool_exhausted():
+            return False
+        message = (
+            "The prefill host KV pool (hicache) is exhausted; "
+            "request rejected for retry."
+        )
+        logger.warning("Rejecting %s: %s", recv_req.rid, message)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -4045,6 +4130,11 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # Flush the deferred hisparse map/backup chain (if the deferral flag
+        # stashed one in prepare_for_decode) BEFORE any forward work: this is
+        # past the per-step DP-attention all_gather but ahead of every reader
+        # of the hisparse mappings / host rows (swap-in).
+        batch.flush_deferred_hisparse_map()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4786,11 +4876,44 @@ class Scheduler(
             ret["hisparse_host_pool"] = {
                 "free_tokens": int(host_pool.available_size()),
                 "total_tokens": int(host_pool.size),
+                "pinned_tokens": int(host_pool.size) - int(host_pool.available_size()),
+                "evictable_tokens": int(
+                    self.disagg_decode_prealloc_queue.tree_cache.evictable_size()
+                ),
                 "page_size": int(host_pool.page_size),
                 "prealloc_wait_events": int(
                     self.disagg_decode_prealloc_queue.host_pool_wait_events
                 ),
             }
+
+        if self.enable_hierarchical_cache and self.tree_cache is not None:
+            # prefill-pool-degrade: per-rank hicache host-pool state + the
+            # degrade-ladder counters so routers/ops can see the retention
+            # constraint and its pressure.
+            cc = getattr(self.tree_cache, "cache_controller", None)
+            if cc is not None:
+                host_pool = cc.mem_pool_host
+                ret["hicache_host_pool"] = {
+                    "free_tokens": int(host_pool.available_size()),
+                    "total_tokens": int(host_pool.size),
+                    "page_size": int(host_pool.page_size),
+                    "write_skips": int(
+                        getattr(self.tree_cache, "host_pool_write_skips", 0)
+                    ),
+                    "write_skip_tokens": int(
+                        getattr(self.tree_cache, "host_pool_write_skip_tokens", 0)
+                    ),
+                    "force_evicted_tokens": int(
+                        getattr(
+                            self.tree_cache, "host_pool_force_evicted_tokens", 0
+                        )
+                    ),
+                    "exhausted": bool(
+                        getattr(
+                            self.tree_cache, "host_pool_exhausted", lambda: False
+                        )()
+                    ),
+                }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

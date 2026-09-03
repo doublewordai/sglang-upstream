@@ -205,10 +205,17 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
-    # HiSparse host KV pool (decode arm): free/total host tokens and the
-    # cumulative prealloc admission-wait counter (host-pool backpressure).
+    # HiSparse host KV pool (decode arm): free/total/pinned host tokens, the
+    # radix tree's evictable (unlocked retained) tokens, and the cumulative
+    # prealloc admission-wait counter (host-pool backpressure). "pinned" =
+    # total - free: tokens held by active requests and retained radix rows
+    # (locked or evictable) — the occupancy signal a controller can act on
+    # BEFORE the pool limit (cf. CONCUR: cache efficiency degrades
+    # mid-phase, not only at capacity).
     host_pool_free_tokens: int = 0
     host_pool_total_tokens: int = 0
+    host_pool_pinned_tokens: int = 0
+    host_pool_evictable_tokens: int = 0
     host_pool_wait_events: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
