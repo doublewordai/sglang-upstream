@@ -539,8 +539,10 @@ class TestResolveSpecGate(unittest.TestCase):
         from sglang.srt.configs.model_config import dsa_layer_skips_topk
 
         cfg = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM"],
+            index_topk=2048,
             num_hidden_layers=8,
-            index_topk_pattern=[False, True, True, True] * 2,
+            index_topk_pattern=["C", "S", "S", "S"] * 2,
             index_topk_freq=1,
             cli_factor=1,
         )
