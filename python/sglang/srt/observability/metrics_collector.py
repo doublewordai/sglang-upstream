@@ -2473,6 +2473,67 @@ _ALL_RANKS_POOL_FAMILIES: tuple = (
     ),
 )
 _ALL_RANKS_POOL_FAMILY_NAMES = frozenset(f[0] for f in _ALL_RANKS_POOL_FAMILIES)
+
+# Device token-pool lock breakdown (prefill-oom-1328), holder-based taxonomy
+# shared with the [pool-locks] log line and the attributed OOM message. -1 =
+# not reported (rank not wired for the breakdown).
+_ALL_RANKS_DEVICE_POOL_FAMILIES: tuple = (
+    (
+        "sglang:device_token_pool_free_tokens",
+        "Device KV token pool free (unallocated) tokens (-1 if not reported).",
+        "device_token_pool_free_tokens",
+    ),
+    (
+        "sglang:device_token_pool_reclaimable_tokens",
+        "Device KV token pool reclaimable margin: free + evictable (the quantity that is exactly zero when the pool refuses; -1 if not reported).",
+        "device_token_pool_reclaimable_tokens",
+    ),
+    (
+        "sglang:device_token_pool_evictable_tokens",
+        "Device KV token pool unlocked radix rows, freeable by eviction (-1 if not reported).",
+        "device_token_pool_evictable_tokens",
+    ),
+    (
+        "sglang:device_token_pool_locked_transfer_tokens",
+        "Device KV tokens held by in-flight inter-rank KV transfers (prefill done, handover incomplete; preemptible).",
+        "device_token_pool_locked_transfer_tokens",
+    ),
+    (
+        "sglang:device_token_pool_locked_forward_tokens",
+        "Device KV tokens held by requests that still have a forward to run (owner needs them as attention input).",
+        "device_token_pool_locked_forward_tokens",
+    ),
+    (
+        "sglang:device_token_pool_locked_admission_tokens",
+        "Device KV tokens held by admitted-but-not-running requests (matched-prefix admission locks).",
+        "device_token_pool_locked_admission_tokens",
+    ),
+    (
+        "sglang:device_token_pool_locked_store_acks",
+        "In-flight device-to-host store (write-through) transitions holding device pages (preemptible).",
+        "device_token_pool_locked_store_acks",
+    ),
+    (
+        "sglang:device_token_pool_locked_migration_tokens",
+        "Device KV tokens held by park/migration/handover transitions (preemptible).",
+        "device_token_pool_locked_migration_tokens",
+    ),
+)
+_ALL_RANKS_DEVICE_POOL_FAMILY_NAMES = frozenset(
+    f[0] for f in _ALL_RANKS_DEVICE_POOL_FAMILIES
+)
+_ALL_RANKS_DEVICE_POOL_AGES: tuple = (
+    (
+        "sglang:device_token_pool_oldest_transfer_age_s",
+        "Age of the oldest in-flight inter-rank transfer holding device pages (s; -1 if not reported).",
+        "device_token_pool_oldest_transfer_age_s",
+    ),
+    (
+        "sglang:device_token_pool_oldest_admission_age_s",
+        "Age of the oldest admitted-but-not-running request holding an admission lock (s; -1 if not reported).",
+        "device_token_pool_oldest_admission_age_s",
+    ),
+)
 _ALL_RANKS_WAIT_FAMILY = (
     "sglang:hisparse_host_pool_wait_events",
     "HiSparse host KV pool cumulative prealloc admission waits (host pool full).",
@@ -2488,6 +2549,10 @@ _ALL_RANKS_QUEUE_FAMILY = (
 _ALL_RANKS_PREALLOC_QUEUE_FAMILY = (
     "sglang:num_decode_prealloc_queue_reqs",
     "The number of requests in the decode prealloc queue.",
+)
+_ALL_RANKS_SNAPSHOT_AGE_FAMILY = (
+    "sglang:load_snapshot_age_seconds",
+    "Age of the rank's newest load snapshot (scheduler liveness tripwire: a rank whose age keeps growing has stopped publishing -- hung scheduler or dead zmq path -- while its budget values silently freeze at the last snapshot).",
 )
 
 
@@ -2614,23 +2679,13 @@ class AllRanksLoadSnapshotCollector:
             s.disaggregation is not None for s in snapshots
         )
 
-        mp = self._mp.collect() if self._mp is not None else iter(())
-        if not (take_pool or take_queue or take_prealloc):
-            yield from mp
-            return
-
-        for metric in mp:
-            name = metric.name
-            if (
-                (take_pool and name in _ALL_RANKS_POOL_FAMILY_NAMES)
-                or (take_pool and name == _ALL_RANKS_WAIT_FAMILY[0])
-                or (take_pool and name == _ALL_RANKS_WAIT_AGE_FAMILY[0])
-                or (take_queue and name == _ALL_RANKS_QUEUE_FAMILY[0])
-                or (take_prealloc and name == _ALL_RANKS_PREALLOC_QUEUE_FAMILY[0])
-            ):
-                continue
-            yield metric
-
+        # Liveness tripwire: emitted for EVERY rank with a snapshot (new family,
+        # no mmdb counterpart, so no takeover gating needed -- including the
+        # single-node case). A rank whose age grows without bound has stopped
+        # publishing while consumers (DP budget, /v1/loads, this exporter)
+        # silently hold its last values -- the quietest failure mode of this
+        # channel (found in the 09-03 silent-discard audit; the zmq CONFLATE
+        # bug was another instance of the same class).
         labelnames = [
             "model_name",
             "engine_type",
@@ -2642,6 +2697,36 @@ class AllRanksLoadSnapshotCollector:
         if self._priority:
             labelnames.append("priority")
         self._labelnames = labelnames
+        if snapshots:
+            name, doc = _ALL_RANKS_SNAPSHOT_AGE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            now = time.time()
+            for s in snapshots:
+                family.add_metric(
+                    self._label_values(s), max(0.0, now - s.timestamp)
+                )
+            yield family
+
+        mp = self._mp.collect() if self._mp is not None else iter(())
+        if not (take_pool or take_queue or take_prealloc):
+            yield from mp
+            return
+        for metric in mp:
+            name = metric.name
+            if (
+                (take_pool and name in _ALL_RANKS_POOL_FAMILY_NAMES)
+                or (take_pool and name == _ALL_RANKS_WAIT_FAMILY[0])
+                or (take_pool and name == _ALL_RANKS_WAIT_AGE_FAMILY[0])
+                or (take_pool and name in _ALL_RANKS_DEVICE_POOL_FAMILY_NAMES)
+                or (
+                    take_pool
+                    and name in {n for n, _, _ in _ALL_RANKS_DEVICE_POOL_AGES}
+                )
+                or (take_queue and name == _ALL_RANKS_QUEUE_FAMILY[0])
+                or (take_prealloc and name == _ALL_RANKS_PREALLOC_QUEUE_FAMILY[0])
+            ):
+                continue
+            yield metric
 
         if take_pool:
             for name, doc, field in _ALL_RANKS_POOL_FAMILIES:
@@ -2671,6 +2756,18 @@ class AllRanksLoadSnapshotCollector:
                 )
                 family.add_metric(self._label_values(s), value)
             yield family
+
+        if take_pool:
+            for name, doc, field in _ALL_RANKS_DEVICE_POOL_FAMILIES:
+                family = GaugeMetricFamily(name, doc, labels=labelnames)
+                for s_ in snapshots:
+                    family.add_metric(self._label_values(s_), int(getattr(s_, field)))
+                yield family
+            for name, doc, field in _ALL_RANKS_DEVICE_POOL_AGES:
+                family = GaugeMetricFamily(name, doc, labels=labelnames)
+                for s_ in snapshots:
+                    family.add_metric(self._label_values(s_), float(getattr(s_, field)))
+                yield family
 
         if take_queue:
             name, doc = _ALL_RANKS_QUEUE_FAMILY

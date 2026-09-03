@@ -277,4 +277,20 @@ def _release_overallocated_kv_indices(
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
-    return tree_cache.available_and_evictable_str()
+    s = tree_cache.available_and_evictable_str()
+    # prefill-oom-1328: if the scheduler wired the per-category lock
+    # breakdown onto this cache, attribute the failure instead of reporting
+    # bare aggregates.
+    breakdown = getattr(tree_cache, "pool_lock_breakdown_str", None)
+    if breakdown is None:
+        try:
+            from sglang.srt.managers.scheduler_components.pool_lock_breakdown import _HOOKS
+            breakdown = _HOOKS.get(id(tree_cache))
+        except Exception:
+            breakdown = None
+    if breakdown is not None:
+        try:
+            s = s + chr(10) + breakdown()
+        except Exception:
+            pass
+    return s

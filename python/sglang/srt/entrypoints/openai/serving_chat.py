@@ -1051,6 +1051,15 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        # The rendered prompt can be megabytes at long contexts. The
+        # tokenizer manager drops its reference after tokenization; release
+        # this frame's copies too so nothing pins a second full copy for the
+        # (possibly minutes-long) request lifetime.
+        prompt_kwargs = None
+        if processed_messages is not None:
+            processed_messages.prompt = None
+            processed_messages.prompt_ids = None
+
         return adapted_request, request
 
     def _process_messages(

@@ -694,6 +694,10 @@ class Envs:
     SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
     # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
     SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
+    # Per-category device-pool lock accounting (prefill-oom-1328): interval in
+    # seconds for the [pool-locks] breakdown log line on the disagg-prefill
+    # loop; 0 disables. The breakdown is also appended to any pool-OOM raise.
+    SGLANG_POOL_LOCK_LOG_SECS = EnvFloat(10.0)
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
@@ -1370,6 +1374,10 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Frontend (tokenizer manager) periodic full-gc interval in seconds.
+    # Bounds the pymalloc arenas pinned by per-request cyclic garbage; <=0
+    # disables the periodic collection.
+    SGLANG_FRONTEND_GC_INTERVAL_S = EnvInt(600)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
