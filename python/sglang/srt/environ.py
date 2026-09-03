@@ -1531,6 +1531,13 @@ class Envs:
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
     SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    # lane/pagetable-gather: in the chunked-mqa PAGED prefill top-k path,
+    # pass the per-step page table to the 1-pass kernel whole plus a per-row
+    # table-row map (row_to_page) instead of materializing
+    # page_table_1[batch_idx] as a [rows, L] int32 copy per row-chunk per
+    # topk layer (~31 GB/layer of HBM writes at L~950k, 5x redundant across
+    # the step). Identity-exact; requires SGLANG_DSA_TOPK_PREFILL_1PASS=1.
+    SGLANG_DSA_PAGETABLE_HOIST = EnvBool(False)
     # lane/streamindex-topk: key-chunked scorer + partition-merge candidate
     # maintenance for the prefill indexer top-k; the [q, L] logits tensor
     # never exists (exact top-2048, tie-consistent at the boundary).
