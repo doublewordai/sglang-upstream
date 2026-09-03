@@ -450,6 +450,8 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    SGLANG_DSA_IN_GRAPH_METADATA = EnvBool(False)
+    SGLANG_HISPARSE_FAST_BACKUP = EnvBool(False)
     # mtp-debug lane: log the first target-verify step's hisparse page table
     # and the draft pool's transferred rows (diagnosis of spec x hisparse).
     SGLANG_MTP_DEBUG = EnvBool(False)
