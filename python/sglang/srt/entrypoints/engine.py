@@ -1743,8 +1743,10 @@ def _set_envs_and_config(server_args: ServerArgs):
             "the process tree when a child process fails."
         )
 
-    # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    # Set mp start method (boot-path: SGLANG_MP_START_METHOD overrides; "fork"
+    # removes the child re-import of the DP controller / scheduler /
+    # detokenizer — measured ~8 s per spawned child on boot)
+    mp.set_start_method(os.environ.get("SGLANG_MP_START_METHOD", "spawn"), force=True)
 
     # Set gc threshold
     if gc_threshold := server_args.gc_threshold:
