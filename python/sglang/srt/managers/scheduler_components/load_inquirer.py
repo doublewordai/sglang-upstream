@@ -165,11 +165,16 @@ class SchedulerLoadInquirer:
                         )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+        elif self.disaggregation_mode in (DisaggregationMode.PREFILL, None):
             # prefill-pool-degrade: the hicache host pool is the retention
             # constraint on a prefill arm; without this the snapshot reports
             # host_free_tok=0 unconditionally (staging C10B showed all-zero
             # host_free_tok from boot - the router was blind).
+            # kv-unit: the same reporting now also covers NON-disaggregated
+            # hicache servers (dp rigs where each rank is a full engine), and
+            # adds the tree's evictable (unlocked retained) tokens: the
+            # reclaimable half of the free+evictable capacity a dispatcher
+            # can place a session against.
             if self.server_args.enable_hierarchical_cache:
                 try:
                     tree_cache = self.get_tree_cache()
@@ -182,6 +187,9 @@ class SchedulerLoadInquirer:
                         host_pool = cc.mem_pool_host
                         host_pool_free_tokens = int(host_pool.available_size())
                         host_pool_total_tokens = int(host_pool.size)
+                        host_pool_evictable_tokens = int(
+                            tree_cache.evictable_size()
+                        )
                     except (AttributeError, TypeError) as e:
                         logger.debug(f"HiCache host pool metrics not available: {e}")
 

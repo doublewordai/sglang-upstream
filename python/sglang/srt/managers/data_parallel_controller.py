@@ -243,6 +243,17 @@ class DataParallelController:
         self.rank_migration_timeout = float(
             os.environ.get("SGLANG_RANK_MIGRATION_TIMEOUT_S", "120")
         )
+        # kv-unit: rank-free admission for oversize sessions. When the holder
+        # rank cannot host the session's context (host free+evictable < the
+        # request's prompt length), place the request on a rank that can,
+        # instead of pinning it to the holder where it waits on a full pool
+        # (the park-1m-wedge / DP2 shapes). The merged migration plane does the
+        # holder->target push when the holder still has the prefix; otherwise
+        # the target restores from the hicache L3 (shared blob tier) or
+        # re-prefills. Default OFF.
+        self.rank_free_admission = (
+            os.environ.get("SGLANG_RANK_FREE_ADMISSION") == "1"
+        )
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
             self.max_dp_size - self.launch_dp_size
@@ -929,6 +940,7 @@ class DataParallelController:
             target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
             if target is None:
                 target = self._new_session_rank()
+            target = self._rank_free_admission(req, holder, target)
             if holder is not None:
                 target = self._maybe_migrate_session(req, keys, holder, target)
             sock_send(self.workers[target], req)
@@ -985,6 +997,64 @@ class DataParallelController:
             else "127.0.0.1"
         )
         return host, self.rank_migration_port_base + rank
+
+    def _rank_free_admission(self, req: Req, holder: Optional[int], target: int) -> int:
+        """kv-unit: a session that does not fit its holder rank is placed on
+        a rank that can host it, instead of waiting on the holder's full pool.
+
+        The quantity that governs placement is the HOST tier's
+        free+evictable tokens against the request's whole prompt length: a
+        rank that must (re)host the session needs the full context resident
+        (pushed, restored from L3, or re-prefilled), so "the holder can host
+        it" means free+evictable >= prompt. Fail-open: when no rank can host
+        the session the request stays on the affinity path (the fast,
+        attributed refusal for that case belongs to the allocator-level
+        invariant, not to placement).
+        """
+        if not self.rank_free_admission or holder is None:
+            return target
+        # Only act when the holder actually reports a host pool (total==0
+        # means "not reported", e.g. a non-hicache rank or a stale snapshot);
+        # a blind bounce would be worse than affinity.
+        if self.dp_budget.host_pool_total_tokens[holder] == 0:
+            return target
+        need = len(req.input_ids)
+
+        def cap(r: int) -> int:
+            return (
+                self.dp_budget.host_pool_free_tokens[r]
+                + self.dp_budget.host_pool_evictable_tokens[r]
+            )
+
+        holder_cap = cap(holder)
+        if holder_cap >= need:
+            return target
+        cands = [r for r in self._active_workers if r != holder and cap(r) >= need]
+        if not cands:
+            logger.info(
+                "[rank-free-admission] rid=%s len=%d holder=dp%d cannot host "
+                "(free+evictable=%d < %d) and no other rank can either; "
+                "staying on the affinity path",
+                req.rid,
+                need,
+                holder,
+                holder_cap,
+                need,
+            )
+            return target
+        new_target = max(cands, key=lambda r: (cap(r), -self._rank_load(r)))
+        logger.info(
+            "[rank-free-admission] rid=%s len=%d holder=dp%d cannot host "
+            "(free+evictable=%d < %d) -> dp%d (free+evictable=%d)",
+            req.rid,
+            need,
+            holder,
+            holder_cap,
+            need,
+            new_target,
+            cap(new_target),
+        )
+        return new_target
 
     def _maybe_migrate_session(
         self, req: Req, keys: List[int], holder: int, target: int
