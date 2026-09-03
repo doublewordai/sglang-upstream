@@ -134,6 +134,26 @@ def _cuda_host_register(buffer: torch.Tensor, reg_bytes: int | None = None) -> N
     n_bytes = reg_bytes if reg_bytes is not None else buffer.numel() * buffer.element_size()
     rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
     if int(rc) != 0:
+        # A partially-populated mapping cannot be pinned: while pinning, the
+        # driver faults the still-missing pages and fails with
+        # cudaErrorInvalidValue at the population frontier (hugetlb-pin
+        # follow-up, 2026-09-03: staging-2 C8e died on exactly this). Name
+        # the real cause instead of a bare CUDA error.
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            HostPoolPopulationError,
+            populated_bytes_in_range,
+        )
+
+        populated = populated_bytes_in_range(buffer.data_ptr(), n_bytes)
+        if populated is not None and populated < n_bytes - (2 * 1024 * 1024):
+            raise HostPoolPopulationError(
+                f"cudaHostRegister failed (rc={int(rc)}, "
+                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+                f"size={n_bytes}: the range is only {populated / 2**30:.1f} of "
+                f"{n_bytes / 2**30:.1f} GiB populated -- huge pages in it cannot "
+                "be faulted (mempolicy-bound NUMA node out of free memory). "
+                "See the allocation-time check in mmap_allocator for remediation."
+            )
         raise RuntimeError(
             f"cudaHostRegister failed (rc={int(rc)}, "
             f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
@@ -185,6 +205,22 @@ def _register_chunked(buffer: torch.Tensor, reg_bytes: int, page: int) -> None:
             if int(rc) != 0:
                 for start, _ in reversed(chunks):
                     cudart.cudaHostUnregister(start)
+                from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                    HostPoolPopulationError,
+                    populated_bytes_in_range,
+                )
+
+                populated = populated_bytes_in_range(ptr, reg_bytes)
+                if populated is not None and populated < reg_bytes - (2 * 1024 * 1024):
+                    raise HostPoolPopulationError(
+                        f"cudaHostRegister chunk failed (rc={int(rc)}, "
+                        f"{cudart.cudaGetErrorString(rc)}) at ptr={ptr + off:#x} "
+                        f"size={sz} (chunk {chunk >> 30} GiB): the pool is only "
+                        f"{populated / 2**30:.1f} of {reg_bytes / 2**30:.1f} GiB "
+                        "populated -- this chunk straddles the population "
+                        "frontier; huge pages beyond it cannot be faulted "
+                        "(mempolicy-bound NUMA node out of free memory)."
+                    )
                 raise RuntimeError(
                     f"cudaHostRegister chunk failed (rc={int(rc)}, "
                     f"{cudart.cudaGetErrorString(rc)}) at ptr={ptr + off:#x} "
@@ -260,7 +296,13 @@ def alloc_with_host_register(
         _cuda_host_register(buffer, reg_bytes)
         return buffer
     except RuntimeError as e:
-        if not hugepage_mode:
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            HostPoolPopulationError,
+        )
+
+        if isinstance(e, HostPoolPopulationError) or not hugepage_mode:
+            # Partially-populated pools are unfixable by chunking (the pages
+            # cannot be faulted at all); surface the capacity cause directly.
             raise
         logger.warning(
             "cudaHostRegister failed on the page-rounded hugepage pool "
