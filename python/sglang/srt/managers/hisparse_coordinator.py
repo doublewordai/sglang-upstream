@@ -2103,6 +2103,8 @@ class HiSparseCoordinator:
         layer_id: int,
         record_plan: bool = False,
         num_newest: int = 1,
+        probe_plan: Optional[Dict[str, torch.Tensor]] = None,
+        plan_slot: Optional[int] = None,
     ) -> torch.Tensor:
         """Swap-in on the green-context stream when the flag is set (fork+join
         with events; capture-safe inside CUDA graphs), else on the current
@@ -2115,6 +2117,8 @@ class HiSparseCoordinator:
                 layer_id,
                 record_plan=record_plan,
                 num_newest=num_newest,
+                probe_plan=probe_plan,
+                plan_slot=plan_slot,
             )
         cur = device_module.current_stream()
         self._swapin_stream.wait_stream(cur)
@@ -2126,6 +2130,8 @@ class HiSparseCoordinator:
                 layer_id,
                 record_plan=record_plan,
                 num_newest=num_newest,
+                probe_plan=probe_plan,
+                plan_slot=plan_slot,
             )
         cur.wait_stream(self._swapin_stream)
         return out
