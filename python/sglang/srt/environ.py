@@ -325,10 +325,6 @@ class Envs:
     # Logging
     # ===================================================================
     SGLANG_LOG_GC = EnvBool(False)
-    # decode-cpu-path: auto gc.freeze after scheduler init; log every GC pause
-    # >= 1ms (scheduler process) for the timeline attribution.
-    SGLANG_AUTO_FREEZE_GC = EnvBool(True)
-    SGLANG_DCP_GC_LOG = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
@@ -1532,7 +1528,7 @@ class Envs:
     # sgl_kernel fast_topk_v2 on decode/verify shapes (row_starts is None,
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
-    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(True)
     # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
     # persistent launch with in-kernel grid barriers reading each row once
     # (plus a small sample and a rare fg-equivalent fallback re-read),
@@ -1557,7 +1553,7 @@ class Envs:
     # Prefill-shaped PAGED DSA top-k: use the single-pass JIT kernel
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
-    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(True)
     # lane/pagetable-gather: in the chunked-mqa PAGED prefill top-k path,
     # pass the per-step page table to the 1-pass kernel whole plus a per-row
     # table-row map (row_to_page) instead of materializing
