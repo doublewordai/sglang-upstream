@@ -736,7 +736,7 @@ class Envs:
     # threshold calibrated from prefill-oom-1328's per-category page data).
     SGLANG_PDHO_INFLIGHT_FRACTION = EnvFloat(0.0)
     # The companion ADMISSION FLOOR: refuse NEW cold admissions while the
-    # device pool's reclaimable mass (available + evictable) is below this
+    # device pool reclaimable mass (available + evictable) is below this
     # many tokens. This is the enforced margin the 13:28Z outage ran without:
     # the un-refusable chunked continuation (chunked_prefill_size + page
     # over-estimate) must always fit. Sized from prefill-oom-1328 row 11: the
@@ -1390,6 +1390,10 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Frontend (tokenizer manager) periodic full-gc interval in seconds.
+    # Bounds the pymalloc arenas pinned by per-request cyclic garbage; <=0
+    # disables the periodic collection.
+    SGLANG_FRONTEND_GC_INTERVAL_S = EnvInt(600)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
