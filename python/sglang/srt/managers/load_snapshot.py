@@ -231,6 +231,21 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # busy rank from a STUCK one (supervisor's DP2 incident 09-03: 130 s
     # wait_age at evictable=0 was invisible in every exported metric).
     host_pool_wait_age_s: float = 0.0
+    # Device token-pool lock breakdown, holder-based taxonomy
+    # (scheduler_components/pool_lock_breakdown.py; lane prefill-oom-1328).
+    # -1 = not reported (arm not wired / not a prefill rank).
+    device_token_pool_free_tokens: int = -1
+    # free + evictable: the exact quantity that was EXACTLY ZERO at the
+    # 13:28Z device-pool refusal - the reclaimable margin, one gauge.
+    device_token_pool_reclaimable_tokens: int = -1
+    device_token_pool_evictable_tokens: int = -1
+    device_token_pool_locked_transfer_tokens: int = -1
+    device_token_pool_locked_forward_tokens: int = -1
+    device_token_pool_locked_admission_tokens: int = -1
+    device_token_pool_locked_store_acks: int = -1
+    device_token_pool_locked_migration_tokens: int = -1
+    device_token_pool_oldest_transfer_age_s: float = -1.0
+    device_token_pool_oldest_admission_age_s: float = -1.0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
