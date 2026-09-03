@@ -18,6 +18,7 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.environ import envs
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -59,6 +60,9 @@ _disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAM
 
 if is_npu():
     import torch_npu
+
+if is_cuda():
+    from sglang.srt.layers.fused_sampling import fused_decode_sample
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +130,41 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
+
+        # Fused post-logits pipeline (lane fused-sampling): one Triton kernel
+        # for temperature -> softmax -> selection, bit-exact vs the reference
+        # path below for the production shapes (all-greedy, or temperature-only
+        # sampling without a per-request seed).
+        if (
+            envs.SGLANG_FUSED_SAMPLING.get()
+            and logits.is_cuda
+            and logits.shape[0] > 0
+            and logits.dtype == torch.float32
+            and not return_logprob
+            and not return_sampling_mask
+            and sampling_info.sampling_seed is None
+            and (
+                sampling_info.is_all_greedy
+                or (
+                    not sampling_info.need_top_p_sampling
+                    and not sampling_info.need_top_k_sampling
+                    and not sampling_info.need_min_p_sampling
+                    and not self.use_log_softmax_logprob
+                )
+            )
+        ):
+            _pens = getattr(sampling_info, "_fused_pending_penalties", None)
+            if _pens is None:
+                _pens = (None, None)
+            batch_next_token_ids = fused_decode_sample(
+                logits,
+                sampling_info.temperatures,
+                _pens[0],  # acc penalties folded into the kernel
+                _pens[1],
+                greedy=sampling_info.is_all_greedy,
+            )
+            self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+            return batch_next_token_ids
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:

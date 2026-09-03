@@ -15,6 +15,8 @@
 
 import dataclasses
 import faulthandler
+
+from sglang.srt.boot_timeline import mark
 import logging
 import os
 import signal
@@ -112,12 +114,17 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+import sglang.srt.mem_cache.handover  # noqa: F401  (registers hiradix_dsa backend)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
+    HandoverExportReqInput,
+    HandoverExportReqOutput,
+    HandoverImportReqInput,
+    HandoverImportReqOutput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -569,6 +576,21 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
+        self.maybe_init_session_migration()
+
+        # decode-cpu-path: freeze the boot-time object graph once init is done
+        # (the /freeze_gc endpoint exists but nothing calls it in production;
+        # a frozen heap removes gen-2 collection scans from the decode path).
+        if envs.SGLANG_AUTO_FREEZE_GC.get():
+            import gc as _gc
+
+            _gc.collect()
+            freeze_gc("Scheduler (post-init, auto)")
+        if envs.SGLANG_DCP_GC_LOG.get():
+            from sglang.srt.utils.common import configure_gc_warning
+
+            configure_gc_warning(0.001)
+
         # warm-local-prefill (lane warm-local-prefill): decode-rank local
         # extends of warm-turn appends. Requests whose rid carries the
         # "WLP-" marker (set by the bench client / future router hook) take
@@ -999,6 +1021,7 @@ class Scheduler(
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
+        mark("init_memory_pools_begin")
         self.init_target_memory_pool()
         # Lands the retraction backend on the disagg bag before the draft
         # worker's HiCache plan reads it.
@@ -1012,6 +1035,7 @@ class Scheduler(
             )
             self.draft_worker.init_hicache_draft_plan()
 
+        mark("init_memory_pools_end")
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
@@ -1020,10 +1044,12 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        mark("init_cuda_graphs_begin")
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+        mark("init_cuda_graphs_end")
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -1615,6 +1641,8 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (HandoverImportReqInput, self.handover_import_wrapped),
+                (HandoverExportReqInput, self.handover_export_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1818,6 +1846,9 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1862,6 +1893,9 @@ class Scheduler(
             maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
+
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1915,6 +1949,11 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # decode-cpu-path: stage the next decode step's eager-backup
+            # inputs while this forward executes (off the launch path).
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.precompute_eager_backup(batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -2033,6 +2072,41 @@ class Scheduler(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
+
+    def maybe_init_session_migration(self) -> None:
+        """Start the session-migration agent when SGLANG_RANK_MIGRATION_PORT_BASE
+        is set (prefill-arm DP ranks push session host pages to each other)."""
+        self.session_migration_agent = None
+        port_base = os.environ.get("SGLANG_RANK_MIGRATION_PORT_BASE")
+        if not port_base:
+            return
+        try:
+            from sglang.srt.managers.session_migration import (
+                MIGRATION_STATS_FILE_ENV,
+                SessionMigrationAgent,
+            )
+
+            dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            # Pin the UCCL agent to this rank's physical CXI device (the CUDA
+            # device id is remapped by CUDA_VISIBLE_DEVICES).
+            cxi = None
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible:
+                ids = [int(x) for x in visible.split(",") if x.strip() != ""]
+                if 0 <= self.ps.gpu_id < len(ids):
+                    cxi = ids[self.ps.gpu_id]
+            agent = SessionMigrationAgent(
+                tree_cache=self.tree_cache,
+                dp_rank=dp_rank,
+                port=int(port_base) + dp_rank,
+                cxi_device_index=cxi,
+                stats_file=os.environ.get(MIGRATION_STATS_FILE_ENV),
+            )
+            agent.start()
+            self.session_migration_agent = agent
+        except Exception:
+            logger.exception("session-migration agent init failed; disabled")
+            self.session_migration_agent = None
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
@@ -2226,6 +2300,7 @@ class Scheduler(
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_tree_cache=lambda: self.tree_cache,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -2798,6 +2873,13 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
+            logger.info(
+                "[kvl3] prefetch gate rid=%s last_host_node=%s is_backuped=%s is_root=%s prefix_idx=%d host_hit=%d",
+                req.rid, req.last_host_node,
+                tree_cache.is_backuped(req.last_host_node),
+                tree_cache.is_root(req.last_host_node),
+                len(req.prefix_indices), req.host_hit_length,
+            )
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
                 req.last_host_node
             ):
@@ -2807,7 +2889,12 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
+                    # FULL chain incl. the matched node's own pages: the core
+                    # get_prefix_hash_values returns ancestors only, and
+                    # position-aware storage backends (blob) address groups
+                    # by absolute chain position.
                     tree_cache.get_prefix_hash_values(req.last_host_node)
+                    + tree_cache.get_hash_values(req.last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
@@ -2829,6 +2916,8 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._reject_on_host_pool_exhausted(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -2888,6 +2977,33 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
+        return True
+
+    def _reject_on_host_pool_exhausted(self, recv_req: Req) -> bool:
+        """prefill-pool-degrade ladder step 3: when the hicache host tier is
+        exhausted (evict + skip cannot keep up), reject the admit with a
+        503 the router can retry instead of accepting work that cannot be
+        retained."""
+        tree_cache = self.tree_cache
+        host_pool_exhausted = getattr(tree_cache, "host_pool_exhausted", None)
+        if host_pool_exhausted is None or not host_pool_exhausted():
+            return False
+        message = (
+            "The prefill host KV pool (hicache) is exhausted; "
+            "request rejected for retry."
+        )
+        logger.warning("Rejecting %s: %s", recv_req.rid, message)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3936,8 +4052,29 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
-            for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and get_disagg().disaggregation_decode_retraction_backup
+                == "rebootstrap"
+            ):
+                # True retraction: the retracted KV was freed outright (no
+                # backup), so the request re-enters through the PD
+                # rebootstrap -- the original prefill worker recomputes the
+                # prefix KV and transfers it back over a fresh bootstrap, and
+                # the already-emitted boundary token is replayed on the decode
+                # side. Mirrors the retract-mode weight-update path
+                # (pause_generation), minus the pause/hold: the engine keeps
+                # serving the surviving requests while this one waits in the
+                # preallocation queue.
+                for req in retracted_reqs:
+                    if req.output_ids:
+                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    req.pd_rebootstrap_in_progress = True
+                    req.time_stats.set_retract_time()
+                    self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+            else:
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -4017,6 +4154,11 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # Flush the deferred hisparse map/backup chain (if the deferral flag
+        # stashed one in prepare_for_decode) BEFORE any forward work: this is
+        # past the per-step DP-attention all_gather but ahead of every reader
+        # of the hisparse mappings / host rows (swap-in).
+        batch.flush_deferred_hisparse_map()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4535,6 +4677,65 @@ class Scheduler(
             mb is None or mb.is_empty() for mb in self.mbs
         )
 
+    def handover_import_wrapped(
+        self, recv_req: HandoverImportReqInput
+    ) -> HandoverImportReqOutput:
+        if not self.enable_hierarchical_cache:
+            return HandoverImportReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        if not self.is_fully_idle():
+            return HandoverImportReqOutput(
+                success=False,
+                message=(
+                    "Reject handover import: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+        from sglang.srt.mem_cache.handover.admin import heir_import
+
+        model_path = getattr(self.model_config, "path", None) or (
+            self.server_args.model_path
+        )
+        ok, msg, data = heir_import(
+            self.tree_cache,
+            model_path,
+            recv_req.src_host,
+            0,
+            recv_req.src_http_port,
+            recv_req.timeout_s,
+            recv_req.verify,
+            recv_req.admin_key,
+        )
+        return HandoverImportReqOutput(success=ok, message=msg, data=data)
+
+    def handover_export_wrapped(
+        self, recv_req: HandoverExportReqInput
+    ) -> HandoverExportReqOutput:
+        if not self.enable_hierarchical_cache:
+            return HandoverExportReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        from sglang.srt.mem_cache.handover import admin
+
+        if recv_req.phase == "info":
+            model_path = recv_req.model_path or getattr(
+                self.model_config, "path", None
+            ) or (self.server_args.model_path)
+            ok, msg, data = admin.handover_export_info(
+                self.tree_cache, model_path, staged=recv_req.staged
+            )
+        elif recv_req.phase == "push":
+            ok, msg, data = admin.handover_export_push(
+                recv_req.payload_json or "{}", recv_req.timeout_s
+            )
+        elif recv_req.phase == "release":
+            ok, msg, data = admin.handover_export_release()
+        else:
+            ok, msg, data = False, f"unknown phase {recv_req.phase!r}", None
+        return HandoverExportReqOutput(success=ok, message=msg, data=data)
+
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
@@ -4699,11 +4900,44 @@ class Scheduler(
             ret["hisparse_host_pool"] = {
                 "free_tokens": int(host_pool.available_size()),
                 "total_tokens": int(host_pool.size),
+                "pinned_tokens": int(host_pool.size) - int(host_pool.available_size()),
+                "evictable_tokens": int(
+                    self.disagg_decode_prealloc_queue.tree_cache.evictable_size()
+                ),
                 "page_size": int(host_pool.page_size),
                 "prealloc_wait_events": int(
                     self.disagg_decode_prealloc_queue.host_pool_wait_events
                 ),
             }
+
+        if self.enable_hierarchical_cache and self.tree_cache is not None:
+            # prefill-pool-degrade: per-rank hicache host-pool state + the
+            # degrade-ladder counters so routers/ops can see the retention
+            # constraint and its pressure.
+            cc = getattr(self.tree_cache, "cache_controller", None)
+            if cc is not None:
+                host_pool = cc.mem_pool_host
+                ret["hicache_host_pool"] = {
+                    "free_tokens": int(host_pool.available_size()),
+                    "total_tokens": int(host_pool.size),
+                    "page_size": int(host_pool.page_size),
+                    "write_skips": int(
+                        getattr(self.tree_cache, "host_pool_write_skips", 0)
+                    ),
+                    "write_skip_tokens": int(
+                        getattr(self.tree_cache, "host_pool_write_skip_tokens", 0)
+                    ),
+                    "force_evicted_tokens": int(
+                        getattr(
+                            self.tree_cache, "host_pool_force_evicted_tokens", 0
+                        )
+                    ),
+                    "exhausted": bool(
+                        getattr(
+                            self.tree_cache, "host_pool_exhausted", lambda: False
+                        )()
+                    ),
+                }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

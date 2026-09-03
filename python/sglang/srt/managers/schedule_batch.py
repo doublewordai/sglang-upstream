@@ -2832,6 +2832,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
+        # True retraction (PD rebootstrap): the KV is freed outright and the
+        # request re-enters through a prefill recompute, so skip the CPU/host
+        # KV backup that release_req would otherwise take.
+        offload_kv = not (
+            server_args.disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_retraction_backup == "rebootstrap"
+        )
+
         retracted_reqs = []
         first_iter = True
         while first_iter or (
@@ -2846,7 +2854,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx, len(sorted_indices), server_args, offload_kv=offload_kv
+            )
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -3095,13 +3105,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.map_last_loc_to_buffer(
-                self.seq_lens,
-                self.out_cache_loc,
-                self.req_pool_indices,
-                self.seq_lens_cpu,
-                self.req_pool_indices_cpu,
-            )
+            if envs.SGLANG_HISPARSE_DEFER_DECODE_MAP.get():
+                # Defer the hisparse map/backup chain until the forward launch
+                # (flush_deferred_hisparse_map, called by run_batch): a rank
+                # still running this chain is a straggler entering the per-step
+                # DP-attention all_gather, and the other ranks then wait with
+                # their GPUs idle. Stash references taken now, flush in the
+                # same scheduler iteration - same rows backed up at the same
+                # step boundary, nothing between here and the flush reads the
+                # hisparse mappings.
+                self._deferred_hisparse_map = (
+                    self.hisparse_coordinator,
+                    self.seq_lens,
+                    self.out_cache_loc,
+                    self.req_pool_indices,
+                    self.seq_lens_cpu,
+                    self.req_pool_indices_cpu,
+                )
+            else:
+                self.hisparse_coordinator.map_last_loc_to_buffer(
+                    self.seq_lens,
+                    self.out_cache_loc,
+                    self.req_pool_indices,
+                    self.seq_lens_cpu,
+                    self.req_pool_indices_cpu,
+                )
 
         if mamba_extra_buffer_enabled():
             mamba_track_interval = get_exec().mamba.mamba_track_interval
@@ -3134,6 +3162,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask = track_mask_cpu.pin_memory().to(
                 device=self.device, non_blocking=True
             )
+
+    def flush_deferred_hisparse_map(self) -> None:
+        """Run the deferred hisparse map/backup chain (see prepare_for_decode).
+        Must run before the batch's forward launch; run_batch calls it first
+        thing. No-op unless the deferral flag stashed a call."""
+        pending = getattr(self, "_deferred_hisparse_map", None)
+        if pending is None:
+            return
+        self._deferred_hisparse_map = None
+        (
+            coordinator,
+            seq_lens,
+            out_cache_loc,
+            req_pool_indices,
+            seq_lens_cpu,
+            req_pool_indices_cpu,
+        ) = pending
+        coordinator.map_last_loc_to_buffer(
+            seq_lens,
+            out_cache_loc,
+            req_pool_indices,
+            seq_lens_cpu,
+            req_pool_indices_cpu,
+        )
 
     def filter_batch(
         self,

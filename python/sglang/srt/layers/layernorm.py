@@ -19,6 +19,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+from sglang.srt.boot_timeline import maybe_copy_weight_view_before_h2d
 import torch.nn.functional as F
 
 from sglang.kernels.fused_op import BaseFusedOp
@@ -1020,7 +1022,7 @@ class GemmaRMSNorm(BaseFusedOp):
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight)
+        param.data.copy_(maybe_copy_weight_view_before_h2d(loaded_weight))
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
 

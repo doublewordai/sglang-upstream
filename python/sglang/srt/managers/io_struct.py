@@ -1730,6 +1730,45 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class HandoverImportReqInput(BaseReq, kw_only=True):
+    """Heir-side generation handover: pull the old generation's host-tier
+    radix cache from the engine at src_host:src_http_port (its /handover/export
+    endpoint) between boot and validate."""
+
+    src_host: str
+    src_http_port: int
+    timeout_s: float = 600.0
+    verify: bool = True
+    admin_key: Optional[str] = None
+
+
+class HandoverImportReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    data: Optional[dict] = None
+
+
+class HandoverExportReqInput(BaseReq, kw_only=True):
+    """Old-side generation handover export.
+
+    phase: "info" (build+cache the export, return sizes/fingerprint),
+           "push" (push into the heir's registered buffers per payload_json),
+           "release" (drop the cached export and its protections).
+    """
+
+    phase: str
+    model_path: Optional[str] = None
+    staged: bool = False
+    payload_json: Optional[str] = None
+    timeout_s: float = 300.0
+
+
+class HandoverExportReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    data: Optional[dict] = None
+
+
 class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.

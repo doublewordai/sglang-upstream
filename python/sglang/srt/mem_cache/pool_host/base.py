@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import abc
+
+from sglang.srt.boot_timeline import mark
 import logging
 import threading
 from functools import wraps
@@ -171,7 +173,9 @@ class HostKVCache(abc.ABC):
                     requested_bytes / 1e9,
                 )
 
+        mark("hostpool_alloc_begin", tokens=self.size, gb=round(self.size * self.size_per_token / 1e9, 2))
         self.kv_buffer = self.init_kv_buffer()
+        mark("hostpool_alloc_end")
         self.fd = getattr(self.allocator, "fd", None)
 
         # A lock for synchronized operations on memory allocation and state transitions.

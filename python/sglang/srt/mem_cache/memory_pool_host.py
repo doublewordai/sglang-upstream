@@ -1192,6 +1192,24 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def get_contiguous_buf_infos(self):
+        """Return per-layer page-row buffers for direct transfer registration.
+
+        One page row is ``indexer_page_stride_size`` bytes; rows are indexed
+        by page (host slot // page_size), matching the anchor pool's page
+        rows so one set of indices addresses both pools.
+        """
+        if self.layout != "layer_first":
+            raise NotImplementedError(
+                "DSAIndexerPoolHost.get_contiguous_buf_infos supports layer_first only"
+            )
+        data_ptrs = [int(x) for x in self.index_k_data_ptrs.tolist()]
+        data_lens = [b.nbytes for b in self.index_k_data_refs]
+        item_lens = [
+            self.indexer_page_stride_size * self.indexer_dtype.itemsize
+        ] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         device_pools = (self.device_pool, *self.mtp_draft_device_pools)

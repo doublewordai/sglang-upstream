@@ -463,6 +463,7 @@ class DeepseekSparseAttnBackend(
         # the gather kernel fuses that in.  Same single-stream reuse
         # argument as `_q8kv8_qpad_buf`.
         self._q8kv8_kv_buf: Optional[torch.Tensor] = None
+        self._native_fp8_ws: Optional[dict] = None
         # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
         # rows whose topk indices end in a -1 pad run skip whole topk blocks
         # in-kernel.
@@ -2394,6 +2395,17 @@ class DeepseekSparseAttnBackend(
                 )
                 n = self.speculative_num_draft_tokens
                 topk_pos = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                if (
+                    getattr(self.hisparse_coordinator, "dpf_prefetch_enabled", False)
+                    and layer.layer_id == 0
+                ):
+                    # Fork the draft-seed prefetch before the first real
+                    # swap-in of the step (no-op after the first position).
+                    self.hisparse_coordinator.begin_draft_prefetch(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        topk_pos.shape[0] // n,
+                    )
                 ragged_layout = self._resolve_ragged_verify_layout(forward_batch)
                 if ragged_layout is not None:
                     page_table_1 = self._hisparse_ragged_verify_page_table(
@@ -2408,33 +2420,65 @@ class DeepseekSparseAttnBackend(
                     tk = topk_pos.view(bs, n, -1)
                     out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
                     outv = out.view(bs, n, -1)
+                    probe = getattr(self.hisparse_coordinator, "dpf_probe", None)
+                    if probe is not None:
+                        probe.on_verify_layer(
+                            layer.layer_id,
+                            tk,
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens,
+                            bs,
+                            n,
+                        )
                     for p in range(n):
+                        if (
+                            self.hisparse_coordinator.dpf_prefetch_enabled
+                            and self.hisparse_coordinator._dprefetch_forked
+                        ):
+                            # Join this layer's seed prefetch (recorded at the
+                            # layer-0 fork earlier in this same step/capture)
+                            # before the real swap-in reads the buffer.
+                            self.hisparse_coordinator.wait_layer_prefetch(
+                                layer.layer_id
+                            )
+                        ev = (
+                            probe.events_for(layer.layer_id, p)
+                            if probe is not None
+                            else None
+                        )
+                        if ev is not None:
+                            ev[0].record()
                         pt = self.hisparse_coordinator.swap_in_selected_pages(
                             forward_batch.req_pool_indices,
                             forward_batch.seq_lens + (p + 1),
                             tk[:, p].contiguous(),
                             layer.layer_id,
                             num_newest=p + 1,
+                            probe_plan=probe.plan() if probe is not None else None,
                         )
+                        if ev is not None:
+                            ev[1].record()
+                        if probe is not None:
+                            probe.after_swap_in(layer.layer_id, p)
                         outv[:, p].copy_(pt)
-                if (
-                    envs.SGLANG_MTP_DEBUG.get()
-                    and layer.layer_id == 0
-                    and not getattr(self, "_mtp_dbg_fe_logged", False)
-                ):
-                    self._mtp_dbg_fe_logged = True
-                    logger.warning(
-                        "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
-                        "row0[:12] %s | seq_lens %s out_cache_loc %s",
-                        tuple(page_table_1.shape),
-                        page_table_1[0, :12].tolist()
-                        if page_table_1.dim() == 2
-                        else page_table_1.view(-1)[:12].tolist(),
-                        forward_batch.seq_lens[:4].tolist(),
-                        forward_batch.out_cache_loc[:8].tolist()
-                        if forward_batch.out_cache_loc is not None
-                        else None,
-                    )
+                    if (
+                        envs.SGLANG_MTP_DEBUG.get()
+                        and layer.layer_id == 0
+                        and not getattr(self, "_mtp_dbg_fe_logged", False)
+                    ):
+                        self._mtp_dbg_fe_logged = True
+                        logger.warning(
+                            "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
+                            "row0[:12] %s | seq_lens %s out_cache_loc %s",
+                            tuple(page_table_1.shape),
+                            page_table_1[0, :12].tolist()
+                            if page_table_1.dim() == 2
+                            else page_table_1.view(-1)[:12].tolist(),
+                            forward_batch.seq_lens[:4].tolist(),
+                            forward_batch.out_cache_loc[:8].tolist()
+                            if forward_batch.out_cache_loc is not None
+                            else None,
+                        )
             else:
                 has_retained_prefix = bool(
                     forward_batch.extend_prefix_lens_cpu
@@ -3368,6 +3412,117 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _forward_native_fp8_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """Lane sparse-decode-kernel path: native-fp8 SM90 split-KV kernel.
+
+        Semantics match _forward_flashmla_kv (all non-negative indices are
+        scored, negative sentinels masked; seqlens only schedules). Buffers
+        grow-only per (b, P) like _q8kv8_kv_buf; CUDA-graph stable at fixed
+        batch. MTP target-verify arrives as b' = bs * n_draft flattened rows
+        with per-row page tables - handled identically.
+        """
+        from sglang.kernels.ops.attention.sparse_mla_fp8_decode_sm90 import (
+            sparse_mla_fp8_decode_fwd,
+        )
+
+        q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
+        b = q_all.shape[0]
+        dev = q_all.device
+        topk = self.dsa_index_topk
+
+        kv_rows = kv_cache.view(torch.uint8).view(-1, 656)
+        idx = page_table_1 if page_table_1.dim() == 2 else page_table_1.view(b, topk)
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        seqlens = metadata.dsa_cache_seqlens_int32
+
+        # split policy: fill the SMs, capped by useful blocks (topk/64 = 32)
+        # and the fused co-residency limit (b*P <= 132 at 1 CTA/SM)
+        P = max(1, min(32, 132 // b))
+        ws = self._native_fp8_ws
+        if ws is None or ws["b"] < b or ws["P"] < P:
+            ws = {
+                "b": b,
+                "P": P,
+                "po": torch.empty((b, P, 64, 512), dtype=torch.float32, device=dev),
+                "pml": torch.empty((b, P, 64, 2), dtype=torch.float32, device=dev),
+                "out": torch.empty((b, 64, 512), dtype=torch.bfloat16, device=dev),
+                "q_fp8": torch.empty((b, 64, 512), dtype=torch.uint8, device=dev),
+                "q_rope": torch.empty((b, 64, 64), dtype=torch.bfloat16, device=dev),
+                "q_scale": torch.empty((b, 64), dtype=torch.float32, device=dev),
+                "counter": torch.zeros(1, dtype=torch.int32, device=dev),
+            }
+            self._native_fp8_ws = ws
+        # tail_sentinel: hisparse guarantees the -1 pads are a tail run
+        # (fast path writes device_loc = -1 for i >= count); the fallback
+        # allocator does not guarantee it, so only take the shortcut there.
+        tail_sentinel = self.hisparse_coordinator is not None
+        qprep = (ws["q_fp8"], ws["q_rope"], ws["q_scale"])
+        out, _, _ = sparse_mla_fp8_decode_fwd(
+            q_all,
+            kv_rows,
+            idx,
+            seqlens,
+            sm_scale,
+            num_splits=P,
+            tail_sentinel=tail_sentinel,
+            fused=True,
+            head_splits=1,
+            counter=ws["counter"],
+            qprep=qprep,
+            partial_o=ws["po"],
+            partial_ml=ws["pml"],
+            out=ws["out"],
+        )
+        return out.view(b, 1, 64, 512)
+
+    def _forward_fused_persist_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """Lane sparse-decode-fused path: persistent fused split+combine Triton
+        kernel (single launch, in-kernel combine, deadlock-free at any batch).
+
+        Semantics match _forward_flashmla_kv (all non-negative indices scored,
+        negative sentinels masked; seqlens only schedule, never mask). The
+        workspace and self-resetting atomic counters live in a module-level
+        grow-only cache keyed by shape - CUDA-graph capturable at fixed batch
+        with no extra memset nodes. MTP target-verify arrives as
+        b' = bs * n_draft flattened rows with per-row page tables - handled
+        identically.
+        """
+        from sglang.kernels.ops.attention.sparse_mla_fused_persist import sdf_fwd
+
+        q_all = q_all.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        b = q_all.shape[0]
+        topk = self.dsa_index_topk
+
+        if kv_cache.dtype == torch.uint8:
+            kv_rows = kv_cache.view(torch.float8_e4m3fn).view(-1, 656)
+        else:
+            kv_rows = kv_cache.view(-1, 656)
+        idx = page_table_1 if page_table_1.dim() == 2 else page_table_1.view(b, topk)
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        if idx.stride(1) != 1:
+            idx = idx.contiguous()
+
+        out = sdf_fwd(q_all, kv_rows, idx, sm_scale)
+        return out.view(b, 1, layer.tp_q_head_num, 512)
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3378,6 +3533,34 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        if (
+            envs.SGLANG_DSA_DECODE_FUSED_PERSISTENT.get()
+            and self.device_sm_major == 9
+            and self.dsa_kv_cache_store_fp8
+            and self.real_page_size == 64
+            and layer.tp_q_head_num == 64
+            and layer.head_dim == 576
+            and v_head_dim == 512
+            and self.dsa_index_topk == 2048
+        ):
+            return self._forward_fused_persist_decode(
+                q_all, kv_cache, sm_scale, layer, metadata, page_table_1
+            )
+
+        if (
+            envs.SGLANG_DSA_DECODE_FP8_NATIVE.get()
+            and self.device_sm_major == 9
+            and self.dsa_kv_cache_store_fp8
+            and self.real_page_size == 64
+            and layer.tp_q_head_num == 64
+            and layer.head_dim == 576
+            and v_head_dim == 512
+            and self.dsa_index_topk == 2048
+        ):
+            return self._forward_native_fp8_decode(
+                q_all, kv_cache, sm_scale, layer, metadata, page_table_1
+            )
+
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32

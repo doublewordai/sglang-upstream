@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.pool_host.hisparse import HostPoolExhaustedError
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 
@@ -56,7 +57,9 @@ def resolve_shared_index_layers(
 
     Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
     index_topk_freq / cli_factor); None when the model has no sharing or the
-    prefetch cannot run (PP, speculative decoding, kill-switch).
+    prefetch cannot run (PP, kill-switch). Speculative decoding is supported:
+    the verify path plans one multi-position IO group per skip layer
+    (see swap_in_selected_pages).
     """
     if not is_deepseek_dsa(hf_text_config):
         return None
@@ -68,11 +71,28 @@ def resolve_shared_index_layers(
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
-    if pp_size != 1 or is_speculative:
+    if pp_size != 1:
+        # Under PP a rank's first layers can be skip layers whose anchor lives
+        # on the previous rank; _build_prefetch_groups would mis-group them.
+        # Prod never runs hisparse with PP (only the pp_size=1 decode arm enables
+        # it), so keep the synchronous fallback rather than guessing boundaries.
         logger.warning(
             "HiSparse shared-index prefetch is unsupported under pipeline "
-            "parallelism / speculative decoding; falling back to synchronous "
-            "swap-in."
+            "parallelism (pp_size=%d); falling back to synchronous swap-in.",
+            pp_size,
+        )
+        return None
+    if is_speculative and not envs.SGLANG_HISPARSE_SPEC_PREFETCH.get():
+        # The MTP verify path's multi-position prefetch (one IO group per skip
+        # layer over the union of the draft positions' selections) is the
+        # DEFAULT (exact + measured-positive, 2.6-3.2x vs synchronous); this
+        # branch is the documented synchronous fallback, taken when
+        # SGLANG_HISPARSE_SPEC_PREFETCH=0. The decode path (num_draft_tokens
+        # == 1) is unaffected.
+        logger.info(
+            "HiSparse shared-index prefetch under speculative decoding "
+            "disabled via SGLANG_HISPARSE_SPEC_PREFETCH=0; using "
+            "synchronous swap-in."
         )
         return None
     if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
@@ -124,6 +144,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        num_draft_tokens: int = 1,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -131,6 +152,8 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        # MTP/EAGLE verify positions per target forward (1 = plain decode).
+        self.num_draft_tokens = max(1, int(num_draft_tokens))
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
@@ -191,6 +214,7 @@ class HiSparseCoordinator:
         self._wide_gather = (
             envs.SGLANG_HISPARSE_WIDE_GATHER.get() and not self.is_dsv4_hisparse
         )
+        self._rightsize_copy_grid = envs.SGLANG_HISPARSE_RIGHTSIZE_COPY_GRID.get()
         self._sm_count = torch.cuda.get_device_properties(
             device
         ).multi_processor_count
@@ -283,6 +307,15 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._backup_log_fh = None
+
+        # decode-cpu-path: precomputed eager-backup staging, filled by
+        # precompute_eager_backup at the END of the previous scheduler
+        # iteration (while the forward executes on the GPU) and consumed by
+        # the next prepare_for_decode. None => integration inline path.
+        self._pending_backup = None
+        self._backup_stage = None  # (pinned_req, pinned_slot, pinned_pos)
+        self._staging_capacity = req_to_token_pool.req_to_token.shape[0]
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -344,13 +377,163 @@ class HiSparseCoordinator:
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
-        self._skip_first_backup = [False] * max_num_req_slots
+        # CPU bool tensor (not a list) so the decode-step clear/check is one
+        # gather/scatter instead of a per-request Python loop (hiccup-3).
+        self._skip_first_backup = torch.zeros(
+            max_num_req_slots, dtype=torch.bool
+        )
+        # Store-degradation-rollback (host-pool-backpressure): set when a
+        # host-pool backup allocation failed for this request; freezes its
+        # mirror watermark so the mirror stays a clean prefix. CPU bool
+        # tensor for the same reason as _skip_first_backup — the decode
+        # backup mask excludes frozen requests with one gather.
+        self._mirror_degraded = torch.zeros(
+            max_num_req_slots, dtype=torch.bool
+        )
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+
+        # draft-seed prefetch (lane/draft-prefetch, SGLANG_DPF_PREFETCH)
+        self.dpf_prefetch_enabled = bool(envs.SGLANG_DPF_PREFETCH.get()) and (
+            not self.is_dsv4_hisparse
+        )
+        self.dpf_prefetch_stream = None
+        self._dprefetch_events = None
+        self.dpf_seed_buf = None
+        self.dprefetch_nreqs = None
+        self._dprefetch_out = None
+        self._dprefetch_forked = False
+        if self.dpf_prefetch_enabled:
+            self._init_draft_prefetch(max_num_req_slots)
+
+        # draft-prefetch probe (lane/draft-prefetch, SGLANG_DPF_PROBE)
+        self.dpf_probe = None
+        if envs.SGLANG_DPF_PROBE.get():
+            from sglang.srt.managers.draft_prefetch_probe import DraftPrefetchProbe
+
+            self.dpf_probe = DraftPrefetchProbe(
+                self,
+                out_path=envs.SGLANG_DPF_PROBE_OUT.get(),
+                probe_reqs=int(envs.SGLANG_DPF_PROBE_REQS.get()),
+                raw_steps=int(envs.SGLANG_DPF_PROBE_RAW_STEPS.get()),
+            )
+            logger.info(
+                "draft-prefetch probe enabled (probe_reqs=%d, out=%s)",
+                self.dpf_probe.probe_reqs,
+                self.dpf_probe.out_path,
+            )
+
+    def _init_draft_prefetch(self, max_num_req_slots: int) -> None:
+        """Persistent state for the draft-seed prefetch (see patch header).
+        The prefetch launches are issued inside the verify CUDA graph (join
+        pattern); every per-step input is a device buffer updated by the host
+        before replay: dpf_seed_buf (the draft seed positions, -1 rows for
+        padded requests are never read because the kernel early-returns on
+        bid >= num_real_reqs[0]) and dprefetch_nreqs (0 disables the prefetch
+        work while keeping the per-layer events recorded -> no stalls)."""
+        dev = self.device
+        self.dpf_prefetch_stream = device_module.Stream()
+        self.dpf_seed_buf = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=dev
+        )
+        # num_real_reqs-style gate for the prefetch kernels (device scalar).
+        self.dprefetch_nreqs = torch.zeros(1, dtype=torch.int32, device=dev)
+        # scratch output table for the prefetch swap-ins (never consumed; the
+        # real swap-in re-plans against the updated resident tables).
+        self._dprefetch_out = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=dev
+        )
+        layer_num = self.mem_pool_device.layer_num
+        self._dprefetch_events = [device_module.Event() for _ in range(layer_num)]
+        logger.info(
+            "HiSparse: draft-seed prefetch enabled (%d layers, top_k=%d).",
+            layer_num,
+            self.top_k,
+        )
+
+    def dpf_on_seed(self, seed: Optional[torch.Tensor], bs: int) -> None:
+        """Host hook before the draft step: refresh the persistent seed
+        buffer and the per-step prefetch gate. Called from
+        EAGLEWorkerV2.forward_batch_generation (same place the probe hooks)."""
+        if not self.dpf_prefetch_enabled:
+            return
+        self._dprefetch_forked = False
+        if seed is None or bs <= 0:
+            self.dprefetch_nreqs.fill_(0)
+            return
+        assert seed.shape[-1] == self.top_k and seed.dtype in (
+            torch.int32,
+            torch.int64,
+        ), f"dpf seed: bad shape {tuple(seed.shape)} / dtype {seed.dtype}"
+        n = min(bs, self.dpf_seed_buf.shape[0])
+        self.dpf_seed_buf[:n].copy_(seed[:n].to(torch.int32))
+        self.dprefetch_nreqs.fill_(n)
+
+    def begin_draft_prefetch(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bs: int,
+    ) -> None:
+        """Fork the per-layer seed prefetch on the side stream. Called at the
+        first verify swap-in call of the step (layer 0, position 0) from
+        dsa_backend; inside CUDA-graph capture this joins the graph (same
+        pattern as the shared-index prefetch fork). req_pool_indices/seq_lens
+        must be the same tensors the real swap-ins use so replays see current
+        values."""
+        if not self.dpf_prefetch_enabled:
+            return
+        # NOTE: no `_dprefetch_forked` early-return here — every verify
+        # forward must fork (the warmup AND capture forwards each record
+        # their own events; skipping the capture-time fork makes the
+        # in-capture event waits join eager-warmup events -> capture
+        # invalidation). `_dprefetch_forked` stays as the p-loop gate only.
+        self._dprefetch_forked = True
+        # Match the real swap-in's position-0 window: seq_lens + 1 with
+        # num_newest=1 binds the window [S, S+1) to the reserved page; the
+        # seed's selections are all <= S-1 (host-backed).
+        seq_lens = seq_lens + 1
+        swap_in_fn = (
+            load_cache_to_device_buffer_dsv4_mla
+            if self.is_dsv4_hisparse
+            else load_cache_to_device_buffer_mla
+        )
+        # Fork: the prefetch stream observes everything the compute stream has
+        # done so far (this layer's KV write) before its kernels run.
+        self.dpf_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self.dpf_prefetch_stream):
+            for layer_id in range(self.mem_pool_device.layer_num):
+                swap_in_fn(
+                    top_k_tokens=self.dpf_seed_buf,
+                    device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                    host_cache_locs=self.req_to_host_pool,
+                    device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    top_k_device_locs=self._dprefetch_out,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    lru_slots=self.lru_slots[layer_id],
+                    item_size_bytes=self.item_size_bytes,
+                    num_top_k=self.top_k,
+                    hot_buffer_size=self.device_buffer_size,
+                    page_size=1,
+                    block_size=self.swap_in_block_size,
+                    num_real_reqs=self.dprefetch_nreqs,
+                )
+                self._dprefetch_events[layer_id].record(self.dpf_prefetch_stream)
+
+    def wait_layer_prefetch(self, layer_id: int) -> None:
+        """Join the layer's seed prefetch into the caller's (compute) stream.
+        Only called from the target-verify path, where begin_draft_prefetch
+        recorded the events earlier in the same host execution (and, under
+        CUDA graphs, earlier in the same capture) — so the wait is a legal
+        in-capture join and never crosses capture contexts."""
+        self._dprefetch_events[layer_id].wait(device_module.current_stream())
 
     def _init_shared_index_prefetch(
         self,
@@ -376,6 +559,20 @@ class HiSparseCoordinator:
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
+        # Diagnostic cadence (verify steps): log per-position miss counts every
+        # N steps from commit_verify_tokens (outside the CUDA graph).
+        self._miss_log_every = int(envs.SGLANG_HISPARSE_MISS_LOG.get())
+        self._miss_log_seen = 0
+        # Debug guard: sample each step's swap-in selection and verify the
+        # distinct-positions invariant off-graph (see _run_swap_in_kernel).
+        self._debug_check_topk = bool(envs.SGLANG_DEBUG_HISPARSE_CHECK_TOPK.get())
+        self._debug_topk_stash = None
+        self._debug_topk_num_reqs = 0
+        self._miss_src_v = None
+        self._miss_dst_v = None
+        self._miss_count_v = None
+        self._verify_slot_table = None
+        self._prefetch_events_v = None
         if not self.enable_prefetch:
             return
 
@@ -385,12 +582,67 @@ class HiSparseCoordinator:
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = self._make_io_stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
+
+        # MTP target-verify: one plan buffer set + slot-table stash per draft
+        # position (the verify page table is interleaved [bs*n, top_k], and each
+        # position has its own selection set and newest-token window). The
+        # anchor records position p's plan into slot p; the skip layers replay
+        # all positions' plans as one IO group on the prefetch stream.
+        # [mtp-speed 2026-09-03] restored verbatim from lane/hisparse-prefetch-spec:
+        # the merge into integration-0902 kept the _verify_swap_in users but
+        # dropped this allocation — spec boots died at decode graph capture with
+        # TypeError: 'NoneType' object is not subscriptable (line ~2099).
+        if self.num_draft_tokens > 1:
+            n_pos = self.num_draft_tokens
+            self._miss_src_v = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._miss_dst_v = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._miss_count_v = torch.zeros(
+                (n_pos, max_num_req_slots), dtype=torch.int32, device=self.device
+            )
+            # Slot tables returned to skip layers: the anchor's per-position
+            # top_k_device_locs, stashed on the compute stream right after each
+            # anchor kernel (top_k_device_locs_buffer is reused per position).
+            self._verify_slot_table = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            # Separate event set from the decode path: decode and verify graphs
+            # are distinct captures, and a shared event would couple them.
+            # One event per (skip-slot, draft position): the anchor forks the
+            # prefetch stream after EVERY position's kernel (position p's plan
+            # is complete then), so position p's copies overlap the anchor's
+            # remaining position kernels instead of waiting for the group's
+            # last plan (h2d-phase-overlap: the two host->device phases are
+            # independent per position; only plan(p) -> copy(p) is a real
+            # dependency). NOTE: this tree's _verify_swap_in uses the nested
+            # [p][slot] indexing with the per-position fork (the measured
+            # variant, -1.3..-7.6 ms/step vs the flat group-fork); mtp-speed's
+            # flat shape exists for trees whose _verify_swap_in group-forks.
+            # Do not mix shapes (mtp-speed b7797f3bd3).
+            self._prefetch_events_v = [
+                [device_module.Event() for _ in range(max_group_size)]
+                for _ in range(n_pos)
+            ]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
-            "group(s), %d skip layer(s) of %d total.",
+            "group(s), %d skip layer(s) of %d total%s.",
             len(self._prefetch_groups),
             sum(self._is_shared_index_layer),
             layer_num,
+            (
+                f"; MTP verify: {self.num_draft_tokens}-position plan replay"
+                if self.num_draft_tokens > 1
+                else ""
+            ),
         )
 
     def _make_io_stream(self):
@@ -518,6 +770,7 @@ class HiSparseCoordinator:
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self._mirror_degraded[req.req_pool_idx] = False
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def remap_draft_kv_from_host_rows(self, req: Req) -> None:
@@ -745,6 +998,7 @@ class HiSparseCoordinator:
             if adopted > 0:
                 self._fixup_wlp_buffer_tokens(req, adopted)
             self._skip_first_backup[req.req_pool_idx] = True
+            self._mirror_degraded[req.req_pool_idx] = False
             req.hisparse_staging = False
             finish_count -= 1
             ready_reqs.append(req)
@@ -943,6 +1197,7 @@ class HiSparseCoordinator:
                 seq_lens_cpu = pin_seq
             if req_pool_indices_cpu is None:
                 req_pool_indices_cpu = pin_req
+        self._log_verify_misses(seq_lens_cpu, req_pool_indices_cpu)
         self.wait_for_pending_backup()
         # Grow 1:1 buffers to cover the last new position; allocates the reserved
         # page for requests crossing device_buffer_size.
@@ -1063,6 +1318,52 @@ class HiSparseCoordinator:
         self._ragged_ghost_loc = ghost_loc
         return ghost_loc
 
+    def _log_verify_misses(
+        self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> None:
+        """Diagnostics (SGLANG_HISPARSE_MISS_LOG=N / SGLANG_DEBUG_HISPARSE_CHECK_TOPK):
+        every N verify steps, log the per-position miss counts recorded by the
+        last anchor group's plans; with the topk check on, also verify the
+        distinct-positions invariant of the last swap-in selection."""
+        if self._debug_check_topk and self._debug_topk_stash is not None:
+            sel = self._debug_topk_stash[: self._debug_topk_num_reqs].cpu()
+            for r in range(sel.shape[0]):
+                row = sel[r].tolist()
+                seen, dups = set(), []
+                for t in row:
+                    if t < 0:
+                        continue
+                    if t in seen:
+                        dups.append(t)
+                    else:
+                        seen.add(t)
+                if dups:
+                    raise RuntimeError(
+                        "HiSparse swap-in selection contains duplicate positions "
+                        f"(req row {r}: {sorted(set(dups))[:8]}...); the fused "
+                        "kernel requires distinct positions per row "
+                        "(miss-compaction race)."
+                    )
+        if (
+            self._miss_log_every <= 0
+            or self._miss_count_v is None
+            or not self.enable_prefetch
+        ):
+            return
+        self._miss_log_seen += 1
+        if self._miss_log_seen % self._miss_log_every:
+            return
+        n_pos = self.num_draft_tokens
+        counts = self._miss_count_v[:, : seq_lens_cpu.numel()].to("cpu", non_blocking=False)
+        msg = "; ".join(
+            f"p{p}:[{' '.join(str(int(c)) for c in counts[p].tolist())}]" for p in range(n_pos)
+        )
+        logger.info(
+            "HiSparse verify miss counts (anchor plans, of top_k=%d): %s",
+            self.top_k,
+            msg,
+        )
+
     def commit_verify_tokens(
         self,
         seq_lens: torch.Tensor,
@@ -1100,19 +1401,47 @@ class HiSparseCoordinator:
         accept_gpu = accept_lens.to(torch.int64).view(-1, 1)
         device_locs = slot_locs[col < accept_gpu].to(torch.int64)
         host_locs_list = []
+        keep = []
+        base = 0
         for i, a in enumerate(accept_cpu):
             if a <= 0:
                 continue
             req_idx = int(req_pool_indices_cpu[i])
-            start_pos = int(seq_lens_cpu[i])
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
-                a,
-            )
-            host_locs_list.append(host_locs)
+            ok = True
+            if self._mirror_degraded[req_idx]:
+                ok = False
+            else:
+                start_pos = int(seq_lens_cpu[i])
+                try:
+                    host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                        self.req_to_host_pool,
+                        self.req_to_host_pool_allocated_len,
+                        req_idx,
+                        start_pos,
+                        a,
+                    )
+                    host_locs_list.append(host_locs)
+                except HostPoolExhaustedError:
+                    # Store-degradation-rollback: warn, skip, freeze
+                    # the watermark — never kill the verify commit.
+                    self._mirror_degraded[req_idx] = True
+                    logger.warning(
+                        "HiSparse: host pool full during verify backup "
+                        "(req_idx=%d, pos=%d, accept=%d) — mirror "
+                        "watermark frozen at %d",
+                        req_idx,
+                        start_pos,
+                        a,
+                        int(self.req_to_host_pool_allocated_len[req_idx]),
+                    )
+                    ok = False
+            if ok:
+                keep.extend(range(base, base + a))
+            base += a
+        if keep:
+            device_locs = device_locs[
+                torch.tensor(keep, dtype=torch.long, device=device_locs.device)
+            ]
         if not host_locs_list:
             return
         host_locs = torch.cat(host_locs_list)
@@ -1133,6 +1462,71 @@ class HiSparseCoordinator:
                 host_locs.record_stream(self.decode_backup_stream)
             device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+
+    def invalidate_pending_backup(self) -> None:
+        """decode-cpu-path: drop precomputed eager-backup staging. Called on
+        membership changes the consume-time shrink guard cannot see (aborts,
+        releases); the next prepare_for_decode takes the inline path."""
+        self._pending_backup = None
+
+    def precompute_eager_backup(self, batch) -> None:
+        """decode-cpu-path: stage the NEXT prepare_for_decode's eager-backup
+        inputs at the END of the current scheduler iteration, while the just
+        launched forward executes on the GPU.
+
+        Uses the batch's post-increment seq_lens L; the next prepare sees
+        L' = L + 1 and the inline path's decisions reduce identically:
+          align:  (L' - 1) % cr == 0  <=>  L % cr == 0
+          pos:    (L' - 1) // cr - 1  ==   L // cr - 1
+        Entries are keyed by req_pool_idx (not batch position): requests that
+        join later are simply absent (they skip their first backup, matching
+        the inline path); any shrink or invalidation falls back to the inline
+        path at consume time. Same mask arithmetic and the same batched host
+        alloc as the integration inline path, just one iteration earlier and
+        off the launch path.
+        """
+        if batch is None or not batch.forward_mode.is_decode():
+            self._pending_backup = None
+            return
+        if self.is_dsv4_hisparse:
+            self._pending_backup = None
+            return
+        seq_lens_cpu = batch.seq_lens_cpu
+        req_pool_indices_cpu = batch.req_pool_indices_cpu
+        cr = self.compress_ratio
+        mask = (seq_lens_cpu % cr == 0) & ~self._skip_first_backup[
+            req_pool_indices_cpu
+        ]
+        pos_cpu = torch.where(mask)[0]
+        if pos_cpu.numel() == 0:
+            self._pending_backup = (0, None, None, None, None, None)
+            return
+        reqs_cpu = req_pool_indices_cpu[pos_cpu]
+        start_cpu = seq_lens_cpu[pos_cpu] // cr - 1
+        slot_cpu = start_cpu.clamp(max=self.device_buffer_size)
+        # NOTE: no host-pool alloc here. The req's host rows may not have
+        # landed yet (a transfer completes in the next iteration's
+        # process_decode_queue, BEFORE prepare_for_decode); allocating here
+        # asserts (start_pos <= allocated_len). The alloc runs at consume
+        # time with the same order/values as the inline path.
+        if self._backup_stage is None:
+            self._backup_stage = tuple(
+                torch.empty(self._staging_capacity, dtype=torch.int64, pin_memory=True)
+                for _ in range(3)
+            )
+        pinned_req, pinned_slot, pinned_pos = self._backup_stage
+        n = pos_cpu.numel()
+        pinned_req[:n].copy_(reqs_cpu)
+        pinned_slot[:n].copy_(slot_cpu)
+        pinned_pos[:n].copy_(start_cpu)
+        self._pending_backup = (
+            n,
+            pinned_req[:n].to(self.device, non_blocking=True),
+            pinned_slot[:n].to(self.device, non_blocking=True),
+            pinned_pos[:n].to(self.device, non_blocking=True),
+            reqs_cpu,
+            start_cpu,
+        )
 
     def _fast_backup_eligible(
         self,
@@ -1210,6 +1604,70 @@ class HiSparseCoordinator:
         - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
           token was produced this step.
         """
+        # decode-cpu-path: consume staging precomputed at the end of the
+        # previous iteration (precompute_eager_backup) while the forward ran:
+        # no mask compute, no H2D, no host alloc on the launch path. The GPU
+        # op sequence and stream chaining mirror the inline path exactly.
+        staged = self._pending_backup
+        self._pending_backup = None
+        if staged is not None and staged[0] > len(seq_lens_cpu):
+            # The batch shrank since staging (retract/abort raced): recompute.
+            staged = None
+        if staged is not None:
+            (
+                n,
+                backup_req_indices,
+                buffer_slot,
+                actual_compressed_pos,
+                staged_reqs,
+                staged_poss,
+            ) = staged
+            # Clear first-backup skips for the current batch (the inline path
+            # clears them on each req's first prepare; vectorised here).
+            self._skip_first_backup[req_pool_indices_cpu] = False
+            if n == 0:
+                return
+            # Host rows are allocated HERE (consume time): rows may only land
+            # in this iteration's process_decode_queue, before this call.
+            host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                staged_reqs,
+                staged_poss,
+                1,
+            )
+            device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
+            self._backup_log(
+                len(seq_lens_cpu),
+                backup_req_indices.tolist(),
+                host_locs,
+                device_locs,
+                req_pool_indices_cpu,
+            )
+            self.wait_for_pending_backup()
+            schedule_stream = device_module.current_stream()
+            with device_module.stream(self.decode_backup_stream):
+                self.decode_backup_stream.wait_stream(schedule_stream)
+                if self.decode_producer_stream is not None:
+                    self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_locs,
+                    device_locs,
+                    io_backend="kernel",
+                )
+                self._backup_done_event.record()
+                if host_locs.is_cuda:
+                    host_locs.record_stream(self.decode_backup_stream)
+                if backup_req_indices.is_cuda:
+                    backup_req_indices.record_stream(self.decode_backup_stream)
+                if actual_compressed_pos.is_cuda:
+                    actual_compressed_pos.record_stream(self.decode_backup_stream)
+                if device_locs.is_cuda:
+                    device_locs.record_stream(self.decode_backup_stream)
+            self._has_pending_backup = True
+            return
+
         # [lane attn-streams] Steady-state fast path (SGLANG_HISPARSE_FAST_BACKUP,
         # compress_ratio == 1): every request backs up its previous token, so the
         # index list is the whole batch and both loc vectors are two gathers --
@@ -1224,23 +1682,32 @@ class HiSparseCoordinator:
             self._fast_backup_previous_token(seq_lens, req_pool_indices)
             return
 
-        # Build the list of batch positions that need a host backup.
+        # Build the mask of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio == 0:
-                backup_indices.append(i)
-
-        if not backup_indices:
+        # Vectorised (hiccup-3): one CPU-tensor pass instead of a per-request
+        # Python loop; this runs on the scheduler critical path before the
+        # per-step DP all_gather, where the loop cost 1.4-2.1 ms under load.
+        # Same set, same order (ascending batch position), same flag clears.
+        skip = self._skip_first_backup[req_pool_indices_cpu]
+        self._skip_first_backup[req_pool_indices_cpu] = False
+        backup_mask = ((seq_lens_cpu - 1) % self.compress_ratio == 0) & ~skip
+        # Store-degradation-rollback (host-pool-backpressure): a request whose
+        # mirror watermark is frozen never backs up again — a later successful
+        # alloc would advance the watermark past rows that were never backed
+        # up (a mirror hole). The finish flush heals the range in one alloc.
+        backup_mask &= ~self._mirror_degraded[req_pool_indices_cpu]
+        if not bool(backup_mask.any()):
             return
 
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
+        backup_indices_cpu = torch.where(backup_mask)[0]
+        # One ASYNC pinned H2D for the batch-position indices. The previous
+        # torch.tensor(..., device=self.device) was a blocking pageable H2D:
+        # under the overlap scheduler it cudaStreamSynchronize'd the schedule
+        # stream against the previous step's still-running forward (measured
+        # 0.5-2.9 ms/step on the rig; the per-step stall inside prepare_for_decode).
+        backup_indices_gpu = (
+            backup_indices_cpu.pin_memory().to(self.device, non_blocking=True)
         )
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
@@ -1256,20 +1723,69 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        host_locs_list = []
-        for i in backup_indices:
-            req_idx = int(req_pool_indices_cpu[i])
-            start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+        backup_req_indices_cpu = req_pool_indices_cpu[backup_indices_cpu]
+        start_pos_cpu = (seq_lens_cpu[backup_indices_cpu] - 1) // (
+            self.compress_ratio
+        ) - 1
+        try:
+            host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
                 self.req_to_host_pool,
                 self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
+                backup_req_indices_cpu,
+                start_pos_cpu,
                 1,
             )
-            host_locs_list.append(host_locs)
-        host_locs = torch.cat(host_locs_list)
+        except HostPoolExhaustedError:
+            # Store-degradation-rollback (host-pool-backpressure), rare path:
+            # the host pool went full inside the batch alloc. The batch call
+            # allocates per request in order, so requests it already
+            # satisfied re-enter the scalar path below needing no new pages
+            # (idempotent); for the requests that cannot be backed up, warn +
+            # skip + freeze the mirror watermark — never kill the decode step
+            # for a save failure. A hole is impossible: the failed page never
+            # advances req_to_host_pool_allocated_len, and the finish flush
+            # heals the range in one alloc.
+            host_locs_list = []
+            keep_rows = []
+            for k in range(int(backup_req_indices_cpu.numel())):
+                req_idx = int(backup_req_indices_cpu[k])
+                try:
+                    host_locs_list.append(
+                        self.mem_pool_host.alloc_paged_token_slots(
+                            self.req_to_host_pool,
+                            self.req_to_host_pool_allocated_len,
+                            req_idx,
+                            int(start_pos_cpu[k]),
+                            1,
+                        )
+                    )
+                    keep_rows.append(k)
+                except HostPoolExhaustedError:
+                    self._mirror_degraded[req_idx] = True
+                    logger.warning(
+                        "HiSparse: host pool full during decode backup "
+                        "(req_idx=%d, pos=%d) — mirror watermark frozen "
+                        "at %d; the finished request's cache will shorten",
+                        req_idx,
+                        int(start_pos_cpu[k]),
+                        int(self.req_to_host_pool_allocated_len[req_idx]),
+                    )
+            if not host_locs_list:
+                return
+            host_locs = torch.cat(host_locs_list)
+            keep_rows_t = torch.tensor(keep_rows, dtype=torch.long)
+            device_locs = device_locs[keep_rows_t.to(device_locs.device)]
+            # Keep the (measurement-only) backup log consistent: idx/host/dev
+            # must all describe the surviving subset.
+            backup_indices_cpu = backup_indices_cpu[keep_rows_t]
 
+        self._backup_log(
+            len(seq_lens_cpu),
+            backup_indices_cpu.tolist(),
+            host_locs,
+            device_locs,
+            req_pool_indices_cpu,
+        )
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
@@ -1292,6 +1808,30 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+
+    def _backup_log(self, bs, backup_indices, host_locs, device_locs, req_pool_indices_cpu):
+        """Measurement-only (hiccup-3): log every eager-backup call's rows."""
+        import json as _json
+
+        path = envs.SGLANG_HISPARSE_BACKUP_LOG.get()
+        if not path:
+            return
+        if self._backup_log_fh is None:
+            self._backup_log_fh = open(path, "a", buffering=1)
+        self._backup_log_fh.write(
+            _json.dumps(
+                {
+                    "bs": int(bs),
+                    "idx": [int(i) for i in backup_indices],
+                    "host": host_locs.tolist(),
+                    "dev": device_locs.tolist(),
+                    "alloc": self.req_to_host_pool_allocated_len[
+                        req_pool_indices_cpu
+                    ].tolist(),
+                }
+            )
+            + "\n"
+        )
 
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
@@ -1601,6 +2141,8 @@ class HiSparseCoordinator:
         Must be called when aborting a request that has been admitted into staging
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
+        # decode-cpu-path: staged backup metadata may reference this req.
+        self.invalidate_pending_backup()
         # Remove from staging queue
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
@@ -1648,6 +2190,7 @@ class HiSparseCoordinator:
         # device pool (the staging backup never consumed it).
         self.free_extend_scratch(req.req_pool_idx)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mirror_degraded[req.req_pool_idx] = False
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -1657,6 +2200,7 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        self.invalidate_pending_backup()
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -1703,6 +2247,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mirror_degraded[req.req_pool_idx] = False
 
     # ------------------------------------------------------------------
     # Prefix retention (radix-over-hisparse)
@@ -1787,19 +2332,35 @@ class HiSparseCoordinator:
             [s for _, s in recoverable], dtype=torch.int64, device=self.device
         )
         device_locs = self.req_to_device_buffer[idx, slots]
-        host_locs = self.mem_pool_host.alloc_paged_token_slots(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            idx,
-            positions[0],
-            len(positions),
-        )
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs,
-            io_backend="kernel",
-        )
+        try:
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                idx,
+                positions[0],
+                len(positions),
+            )
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+        except HostPoolExhaustedError:
+            # Store-degradation-rollback: the pool is full at
+            # finish time. Warn, keep the verified mirror head,
+            # shorten the retained prefix — never kill the engine
+            # for a save failure.
+            logger.warning(
+                "HiSparse: host pool full during finish-flush "
+                "(req_idx=%d, have=%d, want=%d) — retaining the "
+                "%d-token mirror head only",
+                idx,
+                have,
+                want,
+                have,
+            )
+            return have
         device_module.current_stream().synchronize()
         return min(target_len, positions[-1] + 1)
 
@@ -1810,13 +2371,28 @@ class HiSparseCoordinator:
         return self.req_to_host_pool[idx, :n].clone()
 
     def retain_rows(self, logical_values: torch.Tensor, rows: torch.Tensor) -> None:
-        """Move host-row ownership for `logical_values` to the side table."""
+        """Move host-row ownership for `logical_values` to the side table.
+
+        Store-degradation-rollback: a logical index that already
+        holds a retained row (duplicate content / accounting
+        drift) keeps the EXISTING row; the duplicate row is freed
+        and a warning logged — never assert and kill the engine.
+        """
         assert logical_values.numel() == rows.numel()
         idx = logical_values.to(device="cpu", dtype=torch.int64)
-        assert bool(
-            (self.logical_to_host_row[idx] < 0).all()
-        ), "retain_rows: logical index already holds a retained row"
-        self.logical_to_host_row[idx] = rows.to(device="cpu", dtype=torch.int64)
+        rows = rows.to(device="cpu", dtype=torch.int64)
+        dup = self.logical_to_host_row[idx] >= 0
+        if bool(dup.any()):
+            self.mem_pool_host.free(rows[dup])
+            logger.warning(
+                "HiSparse retain_rows: %d logical indices already "
+                "retained; freed the duplicate host rows",
+                int(dup.sum()),
+            )
+            idx = idx[~dup]
+            rows = rows[~dup]
+        if idx.numel() > 0:
+            self.logical_to_host_row[idx] = rows
 
     def adopt_prefix(self, req: Req, prefix_indices: torch.Tensor) -> None:
         """Point a new request's host-row table at a retained prefix."""
@@ -1888,6 +2464,7 @@ class HiSparseCoordinator:
         self.req_adopted_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mirror_degraded[req.req_pool_idx] = False
 
     def free_unretained_rows(self, rows: torch.Tensor) -> None:
         """Free host rows that were never moved to the side table."""
@@ -1903,11 +2480,15 @@ class HiSparseCoordinator:
         layer_id: int,
         record_plan: bool = False,
         num_newest: int = 1,
+        probe_plan: Optional[Dict[str, torch.Tensor]] = None,
+        plan_slot: Optional[int] = None,
     ) -> torch.Tensor:
         """Run the swap-in kernel for one layer; return its slot table.
 
         record_plan (set on the anchor of a shared-index group) also records the
-        miss plan into self._miss_{src,dst,count} for the skip layers to replay.
+        miss plan for the skip layers to replay: into self._miss_{src,dst,count}
+        for decode (plan_slot=None) or into the per-position
+        self._miss_{src,dst,count}_v[plan_slot] for MTP verify.
         num_newest: the tokens [seq_len - num_newest, seq_len) were written this
         step and resolve to the reserved page (MTP target-verify; 1 = decode).
 
@@ -1920,6 +2501,16 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         if num_newest != 1:
             assert not self.is_dsv4_hisparse, "MTP verify swap-in: DSA hisparse only"
+        if self._debug_check_topk:
+            # Invariant (green-contexts finding): every row of top_k_result must
+            # contain DISTINCT token positions. The kernel's miss compaction
+            # assumes miss_offset < my_token_idx; duplicate positions clobber a
+            # pending scratch read (inter-warp race, run-to-run divergence).
+            # Production top-k is distinct by construction; this debug guard
+            # (SGLANG_DEBUG_HISPARSE_CHECK_TOPK=1) samples the last call's
+            # selection per step and raises if the invariant is violated.
+            self._debug_topk_stash = top_k_result.detach()
+            self._debug_topk_num_reqs = num_reqs
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
@@ -1927,15 +2518,36 @@ class HiSparseCoordinator:
             else load_cache_to_device_buffer_mla
         )
         plan_only = self._wide_gather
-        plan = (
-            dict(
-                miss_src=self._miss_src[:num_reqs],
-                miss_dst=self._miss_dst[:num_reqs],
-                miss_count=self._miss_count[:num_reqs],
+        # Route on plan_slot: decode (plan_slot=None, incl. decode wide-gather)
+        # records into the shared decode plan buffers; each MTP verify position
+        # records into its own _v[plan_slot] buffers (positions' plans are
+        # replayed independently on the prefetch stream -- a shared buffer
+        # would let the next position's kernel overwrite a plan that an
+        # in-flight prefetch copy is still reading).
+        if plan_slot is None:
+            plan = (
+                dict(
+                    miss_src=self._miss_src[:num_reqs],
+                    miss_dst=self._miss_dst[:num_reqs],
+                    miss_count=self._miss_count[:num_reqs],
+                )
+                if record_plan or plan_only
+                else {}
             )
-            if record_plan or plan_only
-            else {}
-        )
+        else:
+            plan = (
+                dict(
+                    miss_src=self._miss_src_v[plan_slot][:num_reqs],
+                    miss_dst=self._miss_dst_v[plan_slot][:num_reqs],
+                    miss_count=self._miss_count_v[plan_slot][:num_reqs],
+                )
+                if record_plan or plan_only
+                else {}
+            )
+        if probe_plan is not None:
+            # The probe's plan buffers override the anchor/wide-gather plan
+            # (same recorded data, different destination tensors).
+            plan = dict(probe_plan)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1958,7 +2570,7 @@ class HiSparseCoordinator:
             **({} if self.is_dsv4_hisparse else {"num_newest": num_newest}),
         )
         if plan_only and not self.skip_io:
-            self._run_wide_copy_kernel(num_reqs, layer_id)
+            self._run_wide_copy_kernel(num_reqs, layer_id, plan_slot=plan_slot)
         return top_k_indices
 
     def _wide_copy_blocks(self, num_reqs: int) -> int:
@@ -1970,14 +2582,25 @@ class HiSparseCoordinator:
         wanted = (num_reqs * self.top_k + warps_per_block - 1) // warps_per_block
         return min(wanted, 4 * self._sm_count)
 
-    def _run_wide_copy_kernel(self, num_reqs: int, layer_id: int) -> None:
+    def _run_wide_copy_kernel(
+        self, num_reqs: int, layer_id: int, plan_slot=None
+    ) -> None:
         """Copy this layer's recorded miss plan host->device with a
         full-GPU-grid gather (warp per planned row; see lanes/gather for why
-        the C2C link needs the whole grid at small batch)."""
+        the C2C link needs the whole grid at small batch). plan_slot selects
+        the draft position's plan buffer (MTP verify)."""
+        if plan_slot is None:
+            miss_src = self._miss_src[:num_reqs]
+            miss_dst = self._miss_dst[:num_reqs]
+            miss_count = self._miss_count[:num_reqs]
+        else:
+            miss_src = self._miss_src_v[plan_slot][:num_reqs]
+            miss_dst = self._miss_dst_v[plan_slot][:num_reqs]
+            miss_count = self._miss_count_v[plan_slot][:num_reqs]
         copy_cache_planned_wide_mla(
-            miss_src=self._miss_src[:num_reqs],
-            miss_dst=self._miss_dst[:num_reqs],
-            miss_count=self._miss_count[:num_reqs],
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
             num_real_reqs=self.num_real_reqs,
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
@@ -1985,24 +2608,54 @@ class HiSparseCoordinator:
             num_blocks=self._wide_copy_blocks(num_reqs),
         )
 
-    def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
+    def _run_copy_only_kernel(
+        self, num_reqs: int, skip_layer: int, plan_slot: Optional[int] = None
+    ) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
-        (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        (IO-only; the anchor's slot table stays valid -- lockstep layout).
+        plan_slot selects the draft position's plan buffer (MTP verify);
+        None replays the decode plan."""
+        if plan_slot is None:
+            miss_src = self._miss_src[:num_reqs]
+            miss_dst = self._miss_dst[:num_reqs]
+            miss_count = self._miss_count[:num_reqs]
+        else:
+            miss_src = self._miss_src_v[plan_slot][:num_reqs]
+            miss_dst = self._miss_dst_v[plan_slot][:num_reqs]
+            miss_count = self._miss_count_v[plan_slot][:num_reqs]
         if self._wide_gather and not self.skip_io:
-            self._run_wide_copy_kernel(num_reqs, skip_layer)
+            copy_cache_planned_wide_mla(
+                miss_src=miss_src,
+                miss_dst=miss_dst,
+                miss_count=miss_count,
+                num_real_reqs=self.num_real_reqs,
+                host_cache=self.mem_pool_host.kv_buffer[skip_layer],
+                device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
+                item_size_bytes=self.item_size_bytes,
+                num_blocks=self._wide_copy_blocks(num_reqs),
+            )
             return
+        num_blocks = self._prefetch_copy_blocks
+        if self._rightsize_copy_grid:
+            # Size the grid by bytes: one CTA per 64 KiB of worst-case miss
+            # bytes, capped at the SM count.  The kernel warp-strides the
+            # flattened (request, miss) space, so any grid is byte-identical
+            # (lanes/mk-batch-curve).
+            worst_bytes = num_reqs * self.top_k * self.item_size_bytes
+            num_blocks = min((worst_bytes + 65535) // 65536, self._sm_count)
         copy_cache_planned_mla(
-            miss_src=self._miss_src[:num_reqs],
-            miss_dst=self._miss_dst[:num_reqs],
-            miss_count=self._miss_count[:num_reqs],
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
             num_real_reqs=self.num_real_reqs,
             host_cache=self.mem_pool_host.kv_buffer[skip_layer],
             device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
             item_size_bytes=self.item_size_bytes,
-            num_blocks=self._prefetch_copy_blocks,
+            num_blocks=num_blocks,
             is_dsv4_layout=self.is_dsv4_hisparse,
             skip_io=self.skip_io,
         )
+
 
     def _maybe_green_swap_in(
         self,
@@ -2012,6 +2665,8 @@ class HiSparseCoordinator:
         layer_id: int,
         record_plan: bool = False,
         num_newest: int = 1,
+        probe_plan: Optional[Dict[str, torch.Tensor]] = None,
+        plan_slot: Optional[int] = None,
     ) -> torch.Tensor:
         """Swap-in on the green-context stream when the flag is set (fork+join
         with events; capture-safe inside CUDA graphs), else on the current
@@ -2024,6 +2679,8 @@ class HiSparseCoordinator:
                 layer_id,
                 record_plan=record_plan,
                 num_newest=num_newest,
+                probe_plan=probe_plan,
+                plan_slot=plan_slot,
             )
         cur = device_module.current_stream()
         self._swapin_stream.wait_stream(cur)
@@ -2035,6 +2692,8 @@ class HiSparseCoordinator:
                 layer_id,
                 record_plan=record_plan,
                 num_newest=num_newest,
+                probe_plan=probe_plan,
+                plan_slot=plan_slot,
             )
         cur.wait_stream(self._swapin_stream)
         return out
@@ -2046,25 +2705,40 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         num_newest: int = 1,
+        probe_plan: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
         With prefetch enabled, anchors plan (and, unless the wide gather is
         on, copy) synchronously, recording the miss plan, and prefetch their
         skip layers' copies; skip layers just wait. num_newest > 1 is an MTP
-        target-verify position (prefetch is off under speculative decoding, so
-        it always takes the direct path).
+        target-verify position (it takes the direct path below).
         """
-        if not self.enable_prefetch or num_newest != 1:
+        if not self.enable_prefetch:
             return self._maybe_green_swap_in(
                 req_pool_indices,
                 compressed_seq_lens,
                 top_k_result,
                 layer_id,
                 num_newest=num_newest,
+                probe_plan=probe_plan,
             )
 
         num_reqs = req_pool_indices.size(0)
+        # num_newest == 1 is ambiguous between plain decode and verify
+        # position 0 (both pass 1): under speculation (num_draft_tokens > 1)
+        # the target only runs TARGET_VERIFY forwards, so route to the verify
+        # path; without speculation there are no verify calls at all.
+        if num_newest != 1 or self.num_draft_tokens > 1:
+            return self._verify_swap_in(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result,
+                layer_id,
+                num_newest,
+                num_reqs,
+            )
+
         if self._is_shared_index_layer[layer_id]:
             # Skip layer: wait for its prefetched copy; the anchor's slot table
             # applies (shared index + lockstep buffers).
@@ -2090,6 +2764,62 @@ class HiSparseCoordinator:
                 for skip_layer in group:
                     self._run_copy_only_kernel(num_reqs, skip_layer)
                     self._prefetch_events[self._prefetch_slot[skip_layer]].record(
+                        self.prefetch_stream
+                    )
+        return anchor_locs
+
+    def _verify_swap_in(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        num_newest: int,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """MTP target-verify swap-in for one (layer, position) call.
+
+        The caller (dsa_backend's verify branch) invokes this per layer and per
+        draft position p = num_newest-1 (p = 0 passes num_newest=1, same as
+        decode — swap_in_selected_pages routes on num_draft_tokens).
+        Anchors run the fused kernel per position (synchronously -- their own
+        attention needs the rows) recording per-position plans; the last
+        position's call issues the whole group's multi-position copies on the
+        prefetch stream. Skip layers wait for their group's copies and return
+        the anchor's stashed per-position slot table (lockstep layout).
+        """
+        assert self.num_draft_tokens > 1, "verify swap-in without draft tokens"
+        p = num_newest - 1
+        if self._is_shared_index_layer[layer_id]:
+            slot = self._prefetch_slot[layer_id]
+            # Each position's call waits its own copy event; the layer's
+            # attention runs after the last call, hence after all of them.
+            self._prefetch_events_v[p][slot].wait(device_module.current_stream())
+            return self._verify_slot_table[p][:num_reqs]
+
+        group = self._prefetch_groups.get(layer_id)
+        anchor_locs = self._run_swap_in_kernel(
+            req_pool_indices,
+            compressed_seq_lens,
+            top_k_result,
+            layer_id,
+            record_plan=group is not None,
+            num_newest=num_newest,
+            plan_slot=p,
+        )
+        # Stash this position's slot table before the next position's kernel
+        # overwrites top_k_device_locs_buffer (skip layers replay it).
+        self._verify_slot_table[p][:num_reqs].copy_(anchor_locs)
+        if group:
+            # Fork after every position: position p's plan is complete, its
+            # copies can overlap the anchor's remaining position kernels. The
+            # per-position plans are disjoint (a token missed by position p is
+            # a hit for every later position), so the copies are independent.
+            self.prefetch_stream.wait_stream(device_module.current_stream())
+            with device_module.stream(self.prefetch_stream):
+                for skip_layer in group:
+                    self._run_copy_only_kernel(num_reqs, skip_layer, plan_slot=p)
+                    self._prefetch_events_v[p][self._prefetch_slot[skip_layer]].record(
                         self.prefetch_stream
                     )
         return anchor_locs
