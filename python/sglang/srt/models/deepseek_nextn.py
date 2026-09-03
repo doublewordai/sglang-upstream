@@ -361,6 +361,26 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
         )
+        # Draft attention window (length-agnostic drafter conditioning,
+        # OWL 2510.07535 / LongSpec 2502.17421 / Windowed-MTP 2607.21535):
+        # restrict THIS DRAFT model's indexer candidates to the union of the
+        # first `sink` positions and the most recent `window` positions. Only
+        # the NextN (draft) model sets this; the target model's indexers never
+        # do, so the verify path is untouched. Keys stay roped at their true
+        # positions (RoPE is translation-invariant), so the kept keys' scores
+        # are unchanged — this only changes WHICH keys the drafter may attend,
+        # i.e. accepted-token sets change only through acceptance.
+        _draft_window = get_spec().speculative_draft_window_size
+        if _draft_window:
+            _idx = getattr(self.model.decoder, "indexer", None)
+            if _idx is not None:
+                _idx.draft_window = int(_draft_window)
+                _idx.draft_sink = int(get_spec().speculative_draft_attn_sink or 0)
+            else:
+                logger.warning(
+                    "--speculative-draft-window-size set but the NextN draft "
+                    "layer has no DSA indexer; ignoring."
+                )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

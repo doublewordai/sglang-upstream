@@ -768,6 +768,114 @@ class HiSparseCoordinator:
         self._mirror_degraded[req.req_pool_idx] = False
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
+    def _pp4sf_dump_decode_kv(self, req: Req, start: int, end: int, phase: int) -> None:
+        """pp4-spec-fix: dump received KV (host pool, index-K, draft) for a request."""
+        import json as J
+        import os as O
+
+        if O.environ.get("SGLANG_PP4SF_DEBUG", "0") != "1":
+            return
+        key = "_pp4sf_n%d" % phase
+        if getattr(self, key, 0) >= 12:
+            return
+        if req.rid.startswith("HEALTH_CHECK") or len(req.origin_input_ids) < 4:
+            return
+        try:
+            idx = req.req_pool_idx
+            ps = int(self.page_size)
+            n_tok = min(int(end), 2 * ps + 8)
+            host_slots = self.req_to_host_pool[idx, :n_tok].to(torch.int64).cpu()
+            logical = self.req_to_token_pool.req_to_token[idx, :n_tok].to(torch.int64).cpu()
+            out = {
+                "pp4sf": "dec", "phase": phase, "rid": req.rid, "n_tok": n_tok, "ps": ps,
+                "host_slots": host_slots.tolist(), "tok_locs": logical.tolist(),
+                "adopted": int(start), "main": {}, "index_k": {},
+                "draft_hostpg": None, "draft_logical": None,
+            }
+            import traceback as TB
+            mp = self.mem_pool_host
+            kvs = mp.kv_buffer
+            is_list = isinstance(kvs, list)
+            layer_num = len(kvs) if is_list else int(kvs.shape[0])
+
+            def _host_page(lid, hp):
+                if is_list:
+                    return kvs[lid][hp].reshape(-1)
+                return kvs[lid, hp * ps : (hp + 1) * ps].reshape(-1)
+
+            def _b(x):
+                if x.dtype != torch.uint8:
+                    x = x.view(torch.uint8)
+                return x.reshape(-1).tolist()[:16]
+
+            def _s(x):
+                if x.dtype != torch.uint8:
+                    x = x.view(torch.uint8)
+                return int(x.sum().item())
+
+            n_pg = max(1, min(2, n_tok // ps))
+            try:
+                for lid in range(layer_num):
+                    pages = []
+                    for pg in range(n_pg):
+                        hp = int(host_slots[pg * ps]) // ps
+                        row = _host_page(lid, hp)
+                        rb = row.view(torch.uint8) if row.dtype != torch.uint8 else row
+                        stride = rb.numel() // ps
+                        pages.append({
+                            "sum": _s(row),
+                            "toks": [rb[j * stride : j * stride + 16].tolist() for j in range(2)],
+                        })
+                    out["main"][lid] = pages
+            except Exception:
+                out["main_err"] = TB.format_exc().splitlines()[-1]
+            try:
+                pool = self.mem_pool_device
+                ikc = getattr(pool, "index_key_cache", None)
+                if ikc is not None and getattr(ikc, "buffer", None) is not None:
+                    for i in range(pool.layer_num):
+                        buf = ikc.buffer[i]
+                        if buf is None or buf.numel() == 0:
+                            continue
+                        pages = []
+                        for pg in range(n_pg):
+                            lp = int(logical[pg * ps]) // ps
+                            if lp >= buf.shape[0]:
+                                out.setdefault("index_k_note", []).append(
+                                    [i + int(pool.start_layer), int(buf.shape[0])])
+                                continue
+                            row = buf[lp].cpu()
+                            pages.append({"sum": _s(row), "toks": [_b(row)]})
+                        if pages:
+                            out["index_k"][i + int(pool.start_layer)] = pages
+            except Exception:
+                out["index_k_err"] = TB.format_exc().splitlines()[-1]
+            if self.draft_pool is not None:
+              try:
+                dps = int(getattr(self.draft_pool, "page_size", 1))
+                dh, dl = {}, {}
+                n_dpg = max(1, min(2, (n_tok + dps - 1) // dps))
+                for i in range(self.draft_pool.layer_num):
+                    buf = self.draft_pool.kv_buffer[i]
+                    ph, pl = [], []
+                    for pg in range(n_dpg):
+                        hp = int(host_slots[min(pg * dps, n_tok - 1)]) // dps
+                        lp = int(logical[min(pg * dps, n_tok - 1)])
+                        rh = buf[hp : hp + dps].cpu() if hp + dps <= buf.shape[0] else buf[hp : hp + 1].cpu()
+                        rl = buf[lp : lp + dps].cpu() if lp + dps <= buf.shape[0] else buf[lp : lp + 1].cpu()
+                        ph.append({"sum": _s(rh), "toks": [_b(rh[j]) for j in range(min(4, rh.shape[0]))]})
+                        pl.append({"sum": _s(rl), "toks": [_b(rl[j]) for j in range(min(4, rl.shape[0]))]})
+                    dh[i] = ph
+                    dl[i] = pl
+                out["draft_hostpg"] = {"ps": dps, "main": dh}
+                out["draft_logical"] = {"ps": dps, "main": dl}
+              except Exception:
+                out["draft_err"] = TB.format_exc().splitlines()[-1]
+            setattr(self, key, getattr(self, key, 0) + 1)
+            logger.warning("PP4SF " + J.dumps(out))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("PP4SF dec-dump-failed %s", repr(e))
+
     def remap_draft_kv_from_host_rows(self, req: Req) -> None:
         """pd/mtp-hisparse: move the transferred draft-layer KV to its logical locs.
 
@@ -791,6 +899,7 @@ class HiSparseCoordinator:
             int(self.req_to_host_pool_allocated_len[idx]),
             self.host_token_len(req.kv.kv_allocated_len),
         )
+        self._pp4sf_dump_decode_kv(req, start, end, 0)
         if end <= start:
             return
         host_rows = self.req_to_host_pool[idx, start:end].to(torch.int64)
@@ -803,6 +912,7 @@ class HiSparseCoordinator:
                 buf = buf.view(torch.uint8)
             staged = buf.index_select(0, host_rows)
             buf.index_copy_(0, logical, staged)
+        self._pp4sf_dump_decode_kv(req, start, end, 1)
         if envs.SGLANG_MTP_DEBUG.get():
             logger.info(
                 "HiSparse: remapped draft KV rows [%d, %d) host %s -> logical %s "
@@ -2669,6 +2779,48 @@ class HiSparseCoordinator:
                     )
         return anchor_locs
 
+
+    def _pp4sf_dump_at_verify(
+        self,
+        req_pool_indices: torch.Tensor,
+        layer_id: int,
+        p: int,
+    ) -> None:
+        """pp4-spec-fix: dump draft + target pool rows at the first verify calls."""
+        import json as J
+        import os as O
+
+        if O.environ.get("SGLANG_PP4SF_DEBUG", "0") != "1":
+            return
+        n_call = getattr(self, "_pp4sf_vcall", 0)
+        if n_call >= 400:
+            return
+        try:
+            self._pp4sf_vcall = n_call + 1
+            idxs = req_pool_indices[:2].tolist()
+            out = {"pp4sf": "verify", "call": n_call, "layer": int(layer_id), "p": int(p),
+                   "req_idx": idxs, "draft": {}, "target": {}, "draft_pg": {}, "locs": {}}
+            for ridx in idxs:
+                locs = self.req_to_token_pool.req_to_token[ridx, :8].to(torch.int64)
+                out["locs"][str(ridx)] = locs.tolist()
+                d, t = [], []
+                if self.draft_pool is not None:
+                    buf = self.draft_pool.kv_buffer[0]
+                    d = [int(buf[int(l)].view(torch.uint8).sum().item()) for l in locs]
+                    pg = self.req_to_token_pool.req_to_token[ridx, :64].to(torch.int64)
+                    out["draft_pg"][str(ridx)] = int(
+                        buf.index_select(0, pg).view(torch.uint8).sum().item()
+                    )
+                pool = self.mem_pool_device
+                for lid in [pool.start_layer, pool.end_layer - 1]:
+                    buf = pool.kv_buffer[lid - pool.start_layer]
+                    t.append([int(buf[int(l)].view(torch.uint8).sum().item()) for l in locs])
+                out["draft"][str(ridx)] = d
+                out["target"][str(ridx)] = t
+            logger.warning("PP4SF " + J.dumps(out))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("PP4SF verify-dump-failed %s", repr(e))
+
     def _verify_swap_in(
         self,
         req_pool_indices: torch.Tensor,
@@ -2691,6 +2843,7 @@ class HiSparseCoordinator:
         """
         assert self.num_draft_tokens > 1, "verify swap-in without draft tokens"
         p = num_newest - 1
+        self._pp4sf_dump_at_verify(req_pool_indices, layer_id, p)
         if self._is_shared_index_layer[layer_id]:
             slot = self._prefetch_slot[layer_id]
             # Each position's call waits its own copy event; the layer's
