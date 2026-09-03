@@ -768,6 +768,12 @@ class Envs:
     # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
     # hugetlb mmap failure, THP coverage below ~98%).
     SGLANG_HUGEPAGE_STRICT = EnvBool(False)
+    # Pools smaller than this many bytes stay on base pages even when
+    # SGLANG_HUGEPAGE_SIZE is set (v16-memory-plan sizing: only the large
+    # decode hisparse host pool is hugetlb-backed; hicache/shadow pools on
+    # base pages). The register-size fix makes small hugetlb pools pin fine,
+    # so this is tunable; default keeps the v16 behavior (32 GiB).
+    SGLANG_HUGEPAGE_MIN_BYTES = EnvInt(32 * (1 << 30))
     # Disable transparent hugepages for the whole engine process tree at init
     # (prctl PR_SET_THP_DISABLE, inherited by children). Stops khugepaged/
     # kcompactd churn on non-pool host allocations while the pools themselves

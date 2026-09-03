@@ -196,6 +196,89 @@ def test_strict_rejects_unknown_size():
             alloc_mmap((1024,), torch.uint8)
 
 
+def _alloc_and_register(n_bytes: int, min_bytes: int) -> torch.Tensor:
+    """Engine path: HostTensorAllocator + alloc_with_host_register."""
+    from sglang.srt.mem_cache.pool_host.common import (
+        HostTensorAllocator,
+        alloc_with_host_register,
+    )
+
+    with (
+        envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+        envs.SGLANG_HUGEPAGE_STRICT.override(True),
+        envs.SGLANG_HUGEPAGE_MIN_BYTES.override(min_bytes),
+    ):
+        return alloc_with_host_register(
+            (n_bytes,), torch.uint8, "cpu", pin_memory=True,
+            allocator=HostTensorAllocator(),
+        )
+
+
+def test_hugetlb_register_exact_indexer_size():
+    """The 3,574,813,696 B indexer-pool byte count failed cudaHostRegister
+    deterministically at every placement before the register-size fix
+    (v16-memory-plan: 19 placements). With the page-rounded register it must
+    pin through the engine path."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    try:
+        t = _alloc_and_register(3_574_813_696, 0)
+    except OSError as e:
+        pytest.skip(f"2 MiB hugetlbfs unavailable: {e}")
+    sm = _smaps_entry(_ptr_of(t))
+    assert int(sm["MMUPageSize:"].split()[0]) * 1024 == 2 * MIB, sm
+    assert getattr(t, "_sglang_mmap_alloc_bytes", 0) >= 3_574_813_696
+    assert _pattern_roundtrip(t)
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+    _cuda_host_unregister(t)
+
+
+def test_hugetlb_register_exact_staging_decode_size():
+    """The staging-2 C8b decode host pool: (78, 1664064, 1, 656) uint8 =
+    85,146,826,752 B -- the exact byte count whose cudaHostRegister failure
+    (rc=1 invalid argument, 8 ladder attempts x 2 boots) blocked the v16
+    hugetlb arm on nid0111xx. The page-rounded register must pin it."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+    dims = (78, 1_664_064, 1, 656)
+    assert dims[0] * dims[1] * dims[2] * dims[3] == 85_146_826_752
+    try:
+        t = _alloc_and_register(85_146_826_752, 0)
+    except OSError as e:
+        pytest.skip(f"2 MiB hugetlbfs unavailable: {e}")
+    sm = _smaps_entry(_ptr_of(t))
+    assert int(sm["MMUPageSize:"].split()[0]) * 1024 == 2 * MIB, sm
+    assert getattr(t, "_sglang_mmap_alloc_bytes", 0) >= 85_146_826_752
+    # bit-exact by construction: only pinning changed; spot-check the tensor
+    v = t.view(torch.uint8).flatten()
+    v[:1024] = torch.arange(1024, dtype=torch.uint8)
+    assert v[1023].item() == 1023
+    _cuda_host_unregister(t)
+
+
+def test_hugetlb_default_gate_small_pool_stays_base():
+    """Default SGLANG_HUGEPAGE_MIN_BYTES (32 GiB) keeps small pools on base
+    pages even with SGLANG_HUGEPAGE_SIZE=2MB (v16 sizing behavior)."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    from sglang.srt.mem_cache.pool_host.common import (
+        HostTensorAllocator,
+        alloc_with_host_register,
+        _cuda_host_unregister,
+    )
+
+    with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"), envs.SGLANG_HUGEPAGE_STRICT.override(True):
+        t = alloc_with_host_register(
+            (1 * GIB,), torch.uint8, "cpu", pin_memory=True,
+            allocator=HostTensorAllocator(),
+        )
+    sm = _smaps_entry(_ptr_of(t))
+    assert int(sm["MMUPageSize:"].split()[0]) * 1024 == mmap.PAGESIZE, sm
+    _cuda_host_unregister(t)
+
+
 def test_non_strict_unknown_size_falls_back():
     with envs.SGLANG_HUGEPAGE_SIZE.override("3MB"), envs.SGLANG_HUGEPAGE_STRICT.override(False):
         t = alloc_mmap((1024,), torch.uint8)
