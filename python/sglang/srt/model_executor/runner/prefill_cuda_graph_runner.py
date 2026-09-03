@@ -686,7 +686,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             cfg, getattr(lm, "start_layer", 0)
                         )
                     except Exception:
-                        self._pp_needs_topk = False
+                        # Present-but-unneeded is harmless (the share state only
+                        # reads the initial topk at skip layers); absent-but-
+                        # needed breaks capture. Default to present.
+                        self._pp_needs_topk = True
         if not self._pp_needs_input:
             return None
         slots = self._pp_input_slots.get(num_tokens)
