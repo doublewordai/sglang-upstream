@@ -239,6 +239,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -3334,6 +3335,18 @@ class Scheduler(
         # Reserve the union swap-in scratch (freed at staging admission).
         self.hisparse_coordinator.register_extend_scratch(req.req_pool_idx, scratch)
         self.local_extend_queue.pop(0)
+        # Record prefill stats for logging after forward (normally built by
+        # PrefillAdder; minimal equivalent for the single-req local extend).
+        batch.prefill_stats = PrefillStats(
+            log_input_tokens=delta,
+            log_hit_tokens=prefix_len,
+            log_device_hit_tokens=prefix_len,
+            new_token_ratio=self.new_token_ratio_tracker.current,
+            num_running_reqs=QueueCount.from_reqs(
+                self.running_batch.reqs, self.enable_priority_scheduling
+            ),
+            num_new_seqs=1,
+        )
         req.time_stats.set_forward_entry_time()
         if self.wlp_trace:
             logger.info(
