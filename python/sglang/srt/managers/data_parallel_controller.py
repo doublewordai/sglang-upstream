@@ -254,6 +254,18 @@ class DataParallelController:
         self.rank_free_admission = (
             os.environ.get("SGLANG_RANK_FREE_ADMISSION") == "1"
         )
+        # v2 (ask-first): a holder snapshot older than this forces an
+        # engine-side probe even when the snapshot says the holder is fine
+        # (a pinning burst between refreshes must not wedge the turn).
+        try:
+            self.rank_free_admission_max_snapshot_age = float(
+                os.environ.get(
+                    "SGLANG_RANK_FREE_ADMISSION_MAX_SNAPSHOT_AGE", "5.0"
+                )
+            )
+        except ValueError:
+            self.rank_free_admission_max_snapshot_age = 5.0
+        self._kvu_adopted_rid: Optional[str] = None
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
             self.max_dp_size - self.launch_dp_size
@@ -999,17 +1011,25 @@ class DataParallelController:
         return host, self.rank_migration_port_base + rank
 
     def _rank_free_admission(self, req: Req, holder: Optional[int], target: int) -> int:
-        """kv-unit: a session that does not fit its holder rank is placed on
-        a rank that can host it, instead of waiting on the holder's full pool.
-
-        The quantity that governs placement is the HOST tier's
-        free+evictable tokens against the request's whole prompt length: a
-        rank that must (re)host the session needs the full context resident
-        (pushed, restored from L3, or re-prefilled), so "the holder can host
-        it" means free+evictable >= prompt. Fail-open: when no rank can host
-        the session the request stays on the affinity path (the fast,
-        attributed refusal for that case belongs to the allocator-level
-        invariant, not to placement).
+        """kv-unit v2 (ask-first): a session that does not fit its holder rank
+        is placed on a rank that can host it, instead of waiting on the
+        holder's full pool - with the engine, not the snapshot, as the source
+        of truth:
+        - the load snapshot only PRE-FILTERS (and a stale holder snapshot
+          forces a probe, so a pinning burst between refreshes cannot wedge
+          the turn);
+        - a holder probe (lock-free export_meta) keeps a session the holder
+          actually holds - even mid-park-write, when its locked pages read as
+          neither free nor evictable - on its holder, where the engine's own
+          admission owns the delta;
+        - the chosen bounce target is CONFIRMED by the migration plane's own
+          adopt (capacity-checked for pushes; L3-restore targets additionally
+          need honest FREE tokens, since evictable can include imported-latent
+          mass the load path cannot reclaim), with fall-through to the next
+          candidate on refusal.
+        Fail-open: when nothing is confirmed the request stays on the affinity
+        path (the fast, attributed refusal for that case belongs to the
+        allocator-level invariant, not to placement).
         """
         if not self.rank_free_admission or holder is None:
             return target
@@ -1026,8 +1046,40 @@ class DataParallelController:
                 + self.dp_budget.host_pool_evictable_tokens[r]
             )
 
+        def fre(r: int) -> int:
+            return self.dp_budget.host_pool_free_tokens[r]
+
+        ts = self.dp_budget.last_timestamp[holder]
+        age = (time.time() - ts) if ts > 0 else 0.0
+        stale = (
+            0.0 < age <= 60.0
+            and age > self.rank_free_admission_max_snapshot_age
+        )
+
         holder_cap = cap(holder)
-        if holder_cap >= need:
+        if holder_cap >= need and not stale:
+            return target
+        # ask-first: the snapshot is a hint; the holder's engine is the truth.
+        # A session the holder actually holds (even mid-park-write, when its
+        # pages are locked and read as neither free nor evictable) is never
+        # bounced away - the engine's own admission owns its delta.
+        held = self._kvu_holder_holds(req, holder)
+        if held is True:
+            logger.info(
+                "[rank-free-admission] rid=%s len=%d holder=dp%d HOLDS the session "
+                "(snapshot free+evictable=%d%s); engine admission owns the delta",
+                req.rid,
+                need,
+                holder,
+                holder_cap,
+                ", snapshot stale" if stale else "",
+            )
+            return target
+        if held is None and holder_cap >= need:
+            return target  # probe failed; snapshot says the holder is fine
+        if held is False and holder_cap >= need:
+            # holder can host but no longer holds the session; affinity's
+            # re-prefill is today's behavior and the snapshot sees room - stay.
             return target
         cands = [r for r in self._active_workers if r != holder and cap(r) >= need]
         if not cands:
@@ -1042,19 +1094,94 @@ class DataParallelController:
                 need,
             )
             return target
-        new_target = max(cands, key=lambda r: (cap(r), -self._rank_load(r)))
+        # restore-safety: a target that must re-host from L3 needs honest FREE
+        # tokens (evictable can include imported-latent mass the load path
+        # cannot reclaim); a push target is capacity-checked by the agent.
+        cands.sort(key=lambda r: (-(fre(r) >= need), -cap(r), self._rank_load(r)))
+        for cand in cands:
+            ok, reason = self._kvu_adopt_preview(req, holder, cand)
+            if ok:
+                self._kvu_adopted_rid = req.rid
+                logger.info(
+                    "[rank-free-admission] rid=%s len=%d holder=dp%d cannot host "
+                    "(free+evictable=%d < %d) -> dp%d (push confirmed, free=%d)",
+                    req.rid, need, holder, holder_cap, need, cand, fre(cand),
+                )
+                return cand
+            if "host prefix" in reason or "holds nothing" in reason:
+                if fre(cand) >= need:
+                    self._kvu_adopted_rid = req.rid
+                    logger.info(
+                        "[rank-free-admission] rid=%s len=%d holder=dp%d lost the "
+                        "session (free+evictable=%d < %d) -> dp%d (L3 restore, "
+                        "free=%d)",
+                        req.rid, need, holder, holder_cap, need, cand, fre(cand),
+                    )
+                    return cand
+                logger.info(
+                    "[rank-free-admission] rid=%s dp%d skipped for restore "
+                    "(free=%d < %d; evictable may be un-reclaimable)",
+                    req.rid, cand, fre(cand), need,
+                )
+                continue
+            logger.info(
+                "[rank-free-admission] rid=%s dp%d refused (%s); trying next",
+                req.rid, cand, reason[:80],
+            )
         logger.info(
-            "[rank-free-admission] rid=%s len=%d holder=dp%d cannot host "
-            "(free+evictable=%d < %d) -> dp%d (free+evictable=%d)",
-            req.rid,
-            need,
-            holder,
-            holder_cap,
-            need,
-            new_target,
-            cap(new_target),
+            "[rank-free-admission] rid=%s len=%d no candidate confirmed; "
+            "staying on the affinity path",
+            req.rid, need,
         )
-        return new_target
+        return target
+
+    def _kvu_holder_holds(self, req: Req, holder: int) -> Optional[bool]:
+        """Engine-side probe: does the holder rank host this session's prefix?
+        Uses the migration agent's lock-free export_meta (export + release);
+        True/False, or None when the probe itself failed."""
+        if self.rank_migration_port_base is None:
+            return None
+        try:
+            from sglang.srt.managers.session_migration import tcp_rpc
+
+            resp = tcp_rpc(
+                self._migration_addr(holder),
+                {
+                    "op": "export_meta",
+                    "tokens": req.input_ids,
+                },
+                timeout=10.0,
+            )
+            if resp.get("ok"):
+                return int(resp.get("n_pages", 0)) > 0
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[rank-free-admission] holder probe failed: %s",
+                str(e).splitlines()[0][:120],
+            )
+            return None
+
+    def _kvu_adopt_preview(self, req: Req, holder: int, cand: int):
+        """Confirm a bounce target with the migration plane's own adopt:
+        ok=True (push done, capacity validated) or (False, reason)."""
+        try:
+            from sglang.srt.managers.session_migration import tcp_rpc
+
+            resp = tcp_rpc(
+                self._migration_addr(cand),
+                {
+                    "op": "adopt",
+                    "tokens": req.input_ids,
+                    "holder": self._migration_addr(holder),
+                    "req_id": req.rid,
+                    "timeout": self.rank_migration_timeout,
+                },
+                timeout=self.rank_migration_timeout + 30,
+            )
+            return bool(resp.get("ok")), str(resp.get("error") or resp.get("reason") or "")
+        except Exception as e:  # noqa: BLE001
+            return False, str(e).splitlines()[0][:120]
 
     def _maybe_migrate_session(
         self, req: Req, keys: List[int], holder: int, target: int
@@ -1064,6 +1191,13 @@ class DataParallelController:
         (possibly test-forced) target rank. Failures fall back to a plain
         dispatch (the target simply re-prefills)."""
         if self.rank_migration_port_base is None:
+            return target
+        if (
+            self.rank_free_admission
+            and self._kvu_adopted_rid == req.rid
+        ):
+            # kv-unit v2: the adopt already ran inside _rank_free_admission
+            # (ask-first); a second push would duplicate the transfer.
             return target
         ranks, matched = self.prefix_index.longest_match(keys)
         warm = matched >= self.prefix_affinity_threshold * len(req.input_ids)
