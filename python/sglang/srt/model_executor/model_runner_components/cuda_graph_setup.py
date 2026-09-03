@@ -367,13 +367,19 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
-    # lane prefill-graphs: with pipeline parallelism the layer list keeps
-    # placeholder (None) entries for other stages and model_config.
+    # lane prefill-graphs: with pipeline parallelism the layer list spans the
+    # full model (placeholder modules for other stages) and model_config.
     # num_hidden_layers is the global count — comparing against either
-    # disables BCG for every PP>1 rig. Compare against the count of real
-    # (materialized) local layers instead.
+    # disables BCG for every PP>1 rig. Compare against the count of layers
+    # the counting walk recognizes (real decoder layers for this stage).
     local_real_layers = sum(
-        1 for lyr in layer_model.layers if lyr is not None
+        1
+        for lyr in layer_model.layers
+        if hasattr(lyr, "self_attn")
+        or hasattr(lyr, "attn")
+        or hasattr(lyr, "linear_attn")
+        or hasattr(lyr, "attention")
+        or hasattr(lyr, "mixer")
     )
     if len(model_runner.attention_layers) < local_real_layers:
         # TODO(yuwei): support Non-Standard GQA
