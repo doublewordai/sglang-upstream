@@ -475,12 +475,34 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
             captured_step()
         torch.cuda.current_stream().wait_stream(warm)
         torch.cuda.synchronize()
+        # Reset the warmup's mutations and bring BOTH stacks back to the
+        # canonical pre-step state (admission + verify slot mapping, exactly
+        # like the eager test's per-step prep).
         for stack in (self.sync, self.prefetch):
             stack.reset()
             for req in reqs:
                 idx = stack.req_to_token_pool.alloc([req])
                 self.assertIsNotNone(idx)
                 self._admit(stack, req, FILL_LEN)
+        new_rpi = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, device="cuda"
+        )
+        rpi.copy_(new_rpi)  # the graph reads this tensor at replay time
+        sls = torch.tensor(seq_lens, dtype=torch.int64, device="cuda")
+        for stack in (self.sync, self.prefetch):
+            per_req = [
+                self._alloc_step_tokens(stack, req, seq_lens[i], N_POS)
+                for i, req in enumerate(reqs)
+            ]
+            out_cache_loc = torch.cat(per_req, dim=0).to("cuda")
+            stack.coordinator.map_verify_locs_to_buffer(
+                sls, out_cache_loc, new_rpi, sls.cpu(), new_rpi.cpu(), N_POS
+            )
+            # The warmup fetched rows into the prefetch stack's device pool;
+            # scrub BOTH pools to a finite sentinel so unwritten rows compare equal and any
+            # row a step does not rewrite is visibly the sentinel on both sides.
+            for lid in range(LAYER_NUM):
+                stack.device_pool.kv_buffer[lid].fill_(-777.0)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -506,6 +528,70 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
                     ),
                     f"graph step {step}: device KV differs at layer {lid}",
                 )
+
+
+
+
+class TestResolveSpecGate(unittest.TestCase):
+    """SGLANG_HISPARSE_SPEC_PREFETCH gating of resolve_shared_index_layers."""
+
+    def _config(self):
+        from sglang.srt.configs.model_config import dsa_layer_skips_topk
+
+        cfg = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM"],
+            index_topk=2048,
+            num_hidden_layers=8,
+            index_topk_pattern=["C", "S", "S", "S"] * 2,
+            index_topk_freq=1,
+            cli_factor=1,
+        )
+        assert any(
+            dsa_layer_skips_topk(cfg, i) for i in range(8)
+        ), "test config must produce a sharing pattern"
+        return cfg
+
+    def _resolve(self, cfg, **kw):
+        from sglang.srt.managers.hisparse_coordinator import (
+            resolve_shared_index_layers,
+        )
+
+        return resolve_shared_index_layers(
+            hf_text_config=cfg, pp_size=kw.get("pp_size", 1),
+            is_speculative=kw.get("is_speculative", True),
+        )
+
+    def test_spec_default_on(self):
+        import os
+
+        os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+        self.assertTrue(any(self._resolve(self._config())))
+
+    def test_spec_flag_zero_fallback(self):
+        import os
+
+        os.environ["SGLANG_HISPARSE_SPEC_PREFETCH"] = "0"
+        try:
+            self.assertIsNone(self._resolve(self._config()))
+        finally:
+            os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+
+    def test_decode_default_on(self):
+        import os
+
+        os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+        self.assertTrue(any(self._resolve(self._config(), is_speculative=False)))
+
+    def test_pp_off(self):
+        import os
+
+        os.environ["SGLANG_HISPARSE_SPEC_PREFETCH"] = "1"
+        try:
+            self.assertIsNone(
+                self._resolve(self._config(), pp_size=4, is_speculative=False)
+            )
+        finally:
+            os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
 
 
 if __name__ == "__main__":

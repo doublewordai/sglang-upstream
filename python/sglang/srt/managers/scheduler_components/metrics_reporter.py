@@ -215,6 +215,14 @@ class SchedulerMetricsReporter:
             self.stats.hisparse_host_pool_wait_events = int(
                 getattr(prealloc_q, "host_pool_wait_events", 0)
             )
+            wait_since = getattr(prealloc_q, "_host_pool_wait_since", None)
+            if wait_since:
+                now = time.monotonic()
+                self.stats.hisparse_host_pool_wait_age_s = max(
+                    now - t for t in wait_since.values()
+                )
+            else:
+                self.stats.hisparse_host_pool_wait_age_s = 0.0
         except (AttributeError, TypeError):
             pass
 

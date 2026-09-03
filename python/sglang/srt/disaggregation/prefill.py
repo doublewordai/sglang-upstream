@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_memory,
     get_parallel,
     get_schedule,
 )

@@ -152,6 +152,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
+        # prefill-pool-degrade: host-pool pressure state (see
+        # _execute_kv_backup for the degrade ladder and /get_server_info
+        # for the exposed counters).
+        self.host_pool_write_skips = 0
+        self.host_pool_write_skip_tokens = 0
+        self.host_pool_force_evicted_tokens = 0
+        self._last_write_through_skip_log_ts = 0.0
+        self._host_pool_exhausted = False
+        self._eviction_depth = 0
+
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
         self.enable_session_radix_cache = params.enable_session_radix_cache
@@ -537,6 +547,17 @@ class UnifiedRadixCache(BasePrefixCache):
         return result.is_dropped
 
     def _evict_components(
+        self,
+        request_by_type: dict[ComponentType, int],
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        self._eviction_depth += 1
+        try:
+            self._evict_components_impl(request_by_type, tracker)
+        finally:
+            self._eviction_depth -= 1
+
+    def _evict_components_impl(
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
@@ -1184,6 +1205,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if host_indices is None:
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+            self._host_pool_exhausted = False
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
@@ -1204,12 +1226,110 @@ class UnifiedRadixCache(BasePrefixCache):
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
+            # Degrade ladder: a full host pool must degrade, never die.
+            # 1a) evict LRU host rows of device-evicted nodes;
+            # 1b) reap completed-but-unpolled write-through acks (releases
+            #     their locks -> host rows become evictable), retry 1a;
+            # 1c) force-evict LRU retained prefixes (device demote + host
+            #     free; a later turn re-prefills them);
+            # 2)  skip the write-through (node stays device-only; request
+            #     outputs identical, prefix just not retained on host).
+            # The scheduler rejects new admits (router-retryable 503) when
+            # the whole ladder cannot keep up (host_pool_exhausted).
+            # 1b/1c are skipped inside an eviction walk (write_back mode
+            # has its own drop-subtree degrade there).
+            freed = self.evict_host(needed)
+            if freed < needed and not self._eviction_walk_active():
+                self._reap_ready_write_through_acks()
+                freed = self.evict_host(needed - freed)
+                if freed < needed:
+                    freed += self._evict_retained_prefixes(needed - freed)
+            if freed < needed:
+                self._note_write_through_skip(node_id, kv_tokens, host_avail)
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
+        )
+
+    def _eviction_walk_active(self) -> bool:
+        """Whether a device-eviction walk is on the stack (re-entrancy guard
+        for the ladder's own evict() call)."""
+        return self._eviction_depth > 0
+
+    def _reap_ready_write_through_acks(self) -> None:
+        """Reap write-through acks whose D2H copy completed but were never
+        polled (e.g. an event loop without the HiCache poll). Lockstep-safe:
+        writing_check MIN-all_reduces the ready count across TP/PP ranks, so
+        every rank reaps the same acks in the same order."""
+        try:
+            self.writing_check()
+        except Exception:
+            logger.exception("HiCache: write-through ack reap failed; continuing")
+
+    def _evict_retained_prefixes(self, needed: int) -> int:
+        """Ladder 1c: force-evict LRU retained prefixes to free host space.
+
+        Demotes LRU device-resident backed-up leaves (device KV freed, host
+        row kept), then frees their host rows: the coldest prefixes leave the
+        cache entirely and a later turn re-prefills them. Bounded: stops once
+        `needed` host tokens are free or a pass makes no host progress
+        (everything left is locked / in-flight).
+        """
+        freed = 0
+        for mult in (1, 2, 4):
+            if freed >= needed:
+                break
+            avail_before = self.cache_controller.mem_pool_host.available_size()
+            self.evict(EvictParams(num_tokens=needed * mult))
+            freed_pass = self.evict_host(needed)
+            freed += freed_pass
+            if (
+                self.cache_controller.mem_pool_host.available_size()
+                <= avail_before
+                and freed_pass == 0
+            ):
+                break
+        if freed > 0:
+            self.host_pool_force_evicted_tokens += freed
+            self._host_pool_exhausted = False
+        return freed
+
+    def _note_write_through_skip(
+        self, node_id: NodeId, kv_tokens: int, host_avail: int
+    ) -> None:
+        """Ladder 2: skip the write-through, serve from device KV."""
+        self.host_pool_write_skips += 1
+        self.host_pool_write_skip_tokens += kv_tokens
+        self._host_pool_exhausted = True
+        now = time.monotonic()
+        if now - self._last_write_through_skip_log_ts >= 10.0:
+            self._last_write_through_skip_log_ts = now
+            logger.warning(
+                "HiCache: host pool full; write-through skipped for node %d "
+                "(need=%d tokens, free=%d, skips=%d, skip_tokens=%d, "
+                "force_evicted=%d) - serving from device",
+                node_id,
+                kv_tokens,
+                host_avail,
+                self.host_pool_write_skips,
+                self.host_pool_write_skip_tokens,
+                self.host_pool_force_evicted_tokens,
+            )
+
+    def host_pool_exhausted(self) -> bool:
+        """True when the host tier cannot retain anything (ladder exhausted).
+
+        The scheduler surfaces this so new admits are rejected with a
+        router-retryable error instead of accepting work that cannot be
+        retained. Cleared by any later successful backup or force eviction.
+        """
+        cc = self.cache_controller
+        if cc is None or self.host_pool_write_skips == 0:
+            return False
+        return self._host_pool_exhausted and (
+            cc.mem_pool_host.available_size() == 0
         )
 
     def _track_write_through_node(

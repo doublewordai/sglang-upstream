@@ -8,6 +8,8 @@ from functools import cached_property
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+from sglang.srt.boot_timeline import maybe_copy_weight_view_before_h2d
 from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -1338,6 +1340,7 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
+            loaded_weight = maybe_copy_weight_view_before_h2d(loaded_weight)
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
