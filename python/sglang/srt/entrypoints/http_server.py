@@ -19,6 +19,8 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+
+from sglang.srt.boot_timeline import mark
 import logging
 import os
 import ssl
@@ -2388,6 +2390,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            mark("warmup_begin")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
                     server_args=server_args,
@@ -2404,6 +2407,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     get_parallel().dp_size,
                 )
                 logger.info("End of disaggregation warmup")
+                mark("warmup_end")
             else:
                 logger.info(
                     "Disaggregation warmup failed (mode=%s), status codes: %s",
@@ -2483,6 +2487,7 @@ def _wait_and_warmup(
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
+    mark("server_ready")
 
     if server_args.delete_ckpt_after_loading:
         delete_directory(get_model().model_path)
@@ -2894,6 +2899,7 @@ def launch_server(
         if not get_serving().skip_server_warmup:
             _execute_server_warmup(server_args)
         logger.info("The server is fired up and ready to roll!")
+        mark("server_ready")
         if launch_callback is not None:
             launch_callback()
         scheduler_init_result.block_until_scheduler_exits()

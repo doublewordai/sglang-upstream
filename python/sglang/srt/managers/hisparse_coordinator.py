@@ -82,6 +82,19 @@ def resolve_shared_index_layers(
             pp_size,
         )
         return None
+    if is_speculative and not envs.SGLANG_HISPARSE_SPEC_PREFETCH.get():
+        # The MTP verify path's multi-position prefetch (one IO group per skip
+        # layer over the union of the draft positions' selections) is the
+        # DEFAULT (exact + measured-positive, 2.6-3.2x vs synchronous); this
+        # branch is the documented synchronous fallback, taken when
+        # SGLANG_HISPARSE_SPEC_PREFETCH=0. The decode path (num_draft_tokens
+        # == 1) is unaffected.
+        logger.info(
+            "HiSparse shared-index prefetch under speculative decoding "
+            "disabled via SGLANG_HISPARSE_SPEC_PREFETCH=0; using "
+            "synchronous swap-in."
+        )
+        return None
     if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
         logger.info(
             "HiSparse shared-index prefetch disabled via "
@@ -542,6 +555,11 @@ class HiSparseCoordinator:
         # N steps from commit_verify_tokens (outside the CUDA graph).
         self._miss_log_every = int(envs.SGLANG_HISPARSE_MISS_LOG.get())
         self._miss_log_seen = 0
+        # Debug guard: sample each step's swap-in selection and verify the
+        # distinct-positions invariant off-graph (see _run_swap_in_kernel).
+        self._debug_check_topk = bool(envs.SGLANG_DEBUG_HISPARSE_CHECK_TOPK.get())
+        self._debug_topk_stash = None
+        self._debug_topk_num_reqs = 0
         self._miss_src_v = None
         self._miss_dst_v = None
         self._miss_count_v = None
@@ -556,6 +574,56 @@ class HiSparseCoordinator:
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = self._make_io_stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
+
+        # MTP target-verify: one plan buffer set + slot-table stash per draft
+        # position (the verify page table is interleaved [bs*n, top_k], and each
+        # position has its own selection set and newest-token window). The
+        # anchor records position p's plan into slot p; the skip layers replay
+        # all positions' plans as one IO group on the prefetch stream.
+        # [mtp-speed 2026-09-03] restored verbatim from lane/hisparse-prefetch-spec:
+        # the merge into integration-0902 kept the _verify_swap_in users but
+        # dropped this allocation — spec boots died at decode graph capture with
+        # TypeError: 'NoneType' object is not subscriptable (line ~2099).
+        if self.num_draft_tokens > 1:
+            n_pos = self.num_draft_tokens
+            self._miss_src_v = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._miss_dst_v = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._miss_count_v = torch.zeros(
+                (n_pos, max_num_req_slots), dtype=torch.int32, device=self.device
+            )
+            # Slot tables returned to skip layers: the anchor's per-position
+            # top_k_device_locs, stashed on the compute stream right after each
+            # anchor kernel (top_k_device_locs_buffer is reused per position).
+            self._verify_slot_table = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            # Separate event set from the decode path: decode and verify graphs
+            # are distinct captures, and a shared event would couple them.
+            # One event per (skip-slot, draft position): the anchor forks the
+            # prefetch stream after EVERY position's kernel (position p's plan
+            # is complete then), so position p's copies overlap the anchor's
+            # remaining position kernels instead of waiting for the group's
+            # last plan (h2d-phase-overlap: the two host->device phases are
+            # independent per position; only plan(p) -> copy(p) is a real
+            # dependency). NOTE: this tree's _verify_swap_in uses the nested
+            # [p][slot] indexing with the per-position fork (the measured
+            # variant, -1.3..-7.6 ms/step vs the flat group-fork); mtp-speed's
+            # flat shape exists for trees whose _verify_swap_in group-forks.
+            # Do not mix shapes (mtp-speed b7797f3bd3).
+            self._prefetch_events_v = [
+                [device_module.Event() for _ in range(max_group_size)]
+                for _ in range(n_pos)
+            ]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
             "group(s), %d skip layer(s) of %d total%s.",
@@ -1121,6 +1189,7 @@ class HiSparseCoordinator:
                 seq_lens_cpu = pin_seq
             if req_pool_indices_cpu is None:
                 req_pool_indices_cpu = pin_req
+        self._log_verify_misses(seq_lens_cpu, req_pool_indices_cpu)
         self.wait_for_pending_backup()
         # Grow 1:1 buffers to cover the last new position; allocates the reserved
         # page for requests crossing device_buffer_size.
@@ -1240,6 +1309,52 @@ class HiSparseCoordinator:
         mapping[ghost_loc] = self.device_buffer_size + n
         self._ragged_ghost_loc = ghost_loc
         return ghost_loc
+
+    def _log_verify_misses(
+        self, seq_lens_cpu: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+    ) -> None:
+        """Diagnostics (SGLANG_HISPARSE_MISS_LOG=N / SGLANG_DEBUG_HISPARSE_CHECK_TOPK):
+        every N verify steps, log the per-position miss counts recorded by the
+        last anchor group's plans; with the topk check on, also verify the
+        distinct-positions invariant of the last swap-in selection."""
+        if self._debug_check_topk and self._debug_topk_stash is not None:
+            sel = self._debug_topk_stash[: self._debug_topk_num_reqs].cpu()
+            for r in range(sel.shape[0]):
+                row = sel[r].tolist()
+                seen, dups = set(), []
+                for t in row:
+                    if t < 0:
+                        continue
+                    if t in seen:
+                        dups.append(t)
+                    else:
+                        seen.add(t)
+                if dups:
+                    raise RuntimeError(
+                        "HiSparse swap-in selection contains duplicate positions "
+                        f"(req row {r}: {sorted(set(dups))[:8]}...); the fused "
+                        "kernel requires distinct positions per row "
+                        "(miss-compaction race)."
+                    )
+        if (
+            self._miss_log_every <= 0
+            or self._miss_count_v is None
+            or not self.enable_prefetch
+        ):
+            return
+        self._miss_log_seen += 1
+        if self._miss_log_seen % self._miss_log_every:
+            return
+        n_pos = self.num_draft_tokens
+        counts = self._miss_count_v[:, : seq_lens_cpu.numel()].to("cpu", non_blocking=False)
+        msg = "; ".join(
+            f"p{p}:[{' '.join(str(int(c)) for c in counts[p].tolist())}]" for p in range(n_pos)
+        )
+        logger.info(
+            "HiSparse verify miss counts (anchor plans, of top_k=%d): %s",
+            self.top_k,
+            msg,
+        )
 
     def commit_verify_tokens(
         self,
@@ -2169,6 +2284,16 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         if num_newest != 1:
             assert not self.is_dsv4_hisparse, "MTP verify swap-in: DSA hisparse only"
+        if self._debug_check_topk:
+            # Invariant (green-contexts finding): every row of top_k_result must
+            # contain DISTINCT token positions. The kernel's miss compaction
+            # assumes miss_offset < my_token_idx; duplicate positions clobber a
+            # pending scratch read (inter-warp race, run-to-run divergence).
+            # Production top-k is distinct by construction; this debug guard
+            # (SGLANG_DEBUG_HISPARSE_CHECK_TOPK=1) samples the last call's
+            # selection per step and raises if the invariant is violated.
+            self._debug_topk_stash = top_k_result.detach()
+            self._debug_topk_num_reqs = num_reqs
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
@@ -2176,15 +2301,32 @@ class HiSparseCoordinator:
             else load_cache_to_device_buffer_mla
         )
         plan_only = self._wide_gather
-        plan = (
-            dict(
-                miss_src=self._miss_src[:num_reqs],
-                miss_dst=self._miss_dst[:num_reqs],
-                miss_count=self._miss_count[:num_reqs],
+        # Route on plan_slot: decode (plan_slot=None, incl. decode wide-gather)
+        # records into the shared decode plan buffers; each MTP verify position
+        # records into its own _v[plan_slot] buffers (positions' plans are
+        # replayed independently on the prefetch stream -- a shared buffer
+        # would let the next position's kernel overwrite a plan that an
+        # in-flight prefetch copy is still reading).
+        if plan_slot is None:
+            plan = (
+                dict(
+                    miss_src=self._miss_src[:num_reqs],
+                    miss_dst=self._miss_dst[:num_reqs],
+                    miss_count=self._miss_count[:num_reqs],
+                )
+                if record_plan or plan_only
+                else {}
             )
-            if record_plan or plan_only
-            else {}
-        )
+        else:
+            plan = (
+                dict(
+                    miss_src=self._miss_src_v[plan_slot][:num_reqs],
+                    miss_dst=self._miss_dst_v[plan_slot][:num_reqs],
+                    miss_count=self._miss_count_v[plan_slot][:num_reqs],
+                )
+                if record_plan or plan_only
+                else {}
+            )
         if probe_plan is not None:
             # The probe's plan buffers override the anchor/wide-gather plan
             # (same recorded data, different destination tensors).
@@ -2211,7 +2353,7 @@ class HiSparseCoordinator:
             **({} if self.is_dsv4_hisparse else {"num_newest": num_newest}),
         )
         if plan_only and not self.skip_io:
-            self._run_wide_copy_kernel(num_reqs, layer_id)
+            self._run_wide_copy_kernel(num_reqs, layer_id, plan_slot=plan_slot)
         return top_k_indices
 
     def _wide_copy_blocks(self, num_reqs: int) -> int:
@@ -2223,14 +2365,25 @@ class HiSparseCoordinator:
         wanted = (num_reqs * self.top_k + warps_per_block - 1) // warps_per_block
         return min(wanted, 4 * self._sm_count)
 
-    def _run_wide_copy_kernel(self, num_reqs: int, layer_id: int) -> None:
+    def _run_wide_copy_kernel(
+        self, num_reqs: int, layer_id: int, plan_slot=None
+    ) -> None:
         """Copy this layer's recorded miss plan host->device with a
         full-GPU-grid gather (warp per planned row; see lanes/gather for why
-        the C2C link needs the whole grid at small batch)."""
+        the C2C link needs the whole grid at small batch). plan_slot selects
+        the draft position's plan buffer (MTP verify)."""
+        if plan_slot is None:
+            miss_src = self._miss_src[:num_reqs]
+            miss_dst = self._miss_dst[:num_reqs]
+            miss_count = self._miss_count[:num_reqs]
+        else:
+            miss_src = self._miss_src_v[plan_slot][:num_reqs]
+            miss_dst = self._miss_dst_v[plan_slot][:num_reqs]
+            miss_count = self._miss_count_v[plan_slot][:num_reqs]
         copy_cache_planned_wide_mla(
-            miss_src=self._miss_src[:num_reqs],
-            miss_dst=self._miss_dst[:num_reqs],
-            miss_count=self._miss_count[:num_reqs],
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
             num_real_reqs=self.num_real_reqs,
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
@@ -2238,20 +2391,39 @@ class HiSparseCoordinator:
             num_blocks=self._wide_copy_blocks(num_reqs),
         )
 
-    def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
+    def _run_copy_only_kernel(
+        self, num_reqs: int, skip_layer: int, plan_slot: Optional[int] = None
+    ) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
-        (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        (IO-only; the anchor's slot table stays valid -- lockstep layout).
+        plan_slot selects the draft position's plan buffer (MTP verify);
+        None replays the decode plan."""
+        if plan_slot is None:
+            miss_src = self._miss_src[:num_reqs]
+            miss_dst = self._miss_dst[:num_reqs]
+            miss_count = self._miss_count[:num_reqs]
+        else:
+            miss_src = self._miss_src_v[plan_slot][:num_reqs]
+            miss_dst = self._miss_dst_v[plan_slot][:num_reqs]
+            miss_count = self._miss_count_v[plan_slot][:num_reqs]
         if self._wide_gather and not self.skip_io:
-            self._run_wide_copy_kernel(num_reqs, skip_layer)
+            copy_cache_planned_wide_mla(
+                miss_src=miss_src,
+                miss_dst=miss_dst,
+                miss_count=miss_count,
+                num_real_reqs=self.num_real_reqs,
+                host_cache=self.mem_pool_host.kv_buffer[skip_layer],
+                device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
+                item_size_bytes=self.item_size_bytes,
+                num_blocks=self._wide_copy_blocks(num_reqs),
+            )
             return
         num_blocks = self._prefetch_copy_blocks
         if self._rightsize_copy_grid:
             # Size the grid by bytes: one CTA per 64 KiB of worst-case miss
             # bytes, capped at the SM count.  The kernel warp-strides the
-            # flattened (request, miss) space, so any grid is byte-identical;
-            # the fixed 4-CTA grid measured 43.5 GB/s vs 141 GB/s right-sized
-            # at b=16 x 2048-row plans on the mk-batch-curve rig (GH200,
-            # 2026-09-03), byte-identical outputs verified.
+            # flattened (request, miss) space, so any grid is byte-identical
+            # (lanes/mk-batch-curve).
             worst_bytes = num_reqs * self.top_k * self.item_size_bytes
             num_blocks = min((worst_bytes + 65535) // 65536, self._sm_count)
         copy_cache_planned_mla(
@@ -2266,6 +2438,7 @@ class HiSparseCoordinator:
             is_dsv4_layout=self.is_dsv4_hisparse,
             skip_io=self.skip_io,
         )
+
 
     def _maybe_green_swap_in(
         self,
@@ -2324,7 +2497,7 @@ class HiSparseCoordinator:
         skip layers' copies; skip layers just wait. num_newest > 1 is an MTP
         target-verify position (it takes the direct path below).
         """
-        if not self.enable_prefetch or num_newest != 1:
+        if not self.enable_prefetch:
             return self._maybe_green_swap_in(
                 req_pool_indices,
                 compressed_seq_lens,
@@ -2402,7 +2575,9 @@ class HiSparseCoordinator:
         p = num_newest - 1
         if self._is_shared_index_layer[layer_id]:
             slot = self._prefetch_slot[layer_id]
-            self._prefetch_events_v[slot].wait(device_module.current_stream())
+            # Each position's call waits its own copy event; the layer's
+            # attention runs after the last call, hence after all of them.
+            self._prefetch_events_v[p][slot].wait(device_module.current_stream())
             return self._verify_slot_table[p][:num_reqs]
 
         group = self._prefetch_groups.get(layer_id)
@@ -2418,17 +2593,16 @@ class HiSparseCoordinator:
         # Stash this position's slot table before the next position's kernel
         # overwrites top_k_device_locs_buffer (skip layers replay it).
         self._verify_slot_table[p][:num_reqs].copy_(anchor_locs)
-        if group and num_newest == self.num_draft_tokens:
-            # All positions' plans are recorded: fork once and issue one
-            # multi-position IO group per skip layer. The per-position copies
-            # are independent (a token missed by position p is a hit for every
-            # other position, so each planned row belongs to exactly one plan).
+        if group:
+            # Fork after every position: position p's plan is complete, its
+            # copies can overlap the anchor's remaining position kernels. The
+            # per-position plans are disjoint (a token missed by position p is
+            # a hit for every later position), so the copies are independent.
             self.prefetch_stream.wait_stream(device_module.current_stream())
             with device_module.stream(self.prefetch_stream):
                 for skip_layer in group:
-                    for q in range(self.num_draft_tokens):
-                        self._run_copy_only_kernel(num_reqs, skip_layer, plan_slot=q)
-                    self._prefetch_events_v[self._prefetch_slot[skip_layer]].record(
+                    self._run_copy_only_kernel(num_reqs, skip_layer, plan_slot=p)
+                    self._prefetch_events_v[p][self._prefetch_slot[skip_layer]].record(
                         self.prefetch_stream
                     )
         return anchor_locs

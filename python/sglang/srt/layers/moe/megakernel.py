@@ -100,17 +100,22 @@ class MegakernelMoE(FusedMoE):
         self._kernel = None
 
     def prepare_megakernel_weights(self) -> None:
+        from sglang.srt.boot_timeline import mark
+
+        mark("mk_prep_begin", prefix=getattr(self, "prefix", ""))
         """Called from Fp8MoEMethod.process_weights_after_loading: interleave gate/up rows in
         place (see megakernel.weights) and bring up the shared transport and kernel."""
         from megakernel import interleave_gate_up_inplace
 
         interleave_gate_up_inplace(self.w13_weight.data, self.w13_weight_scale_inv.data)
+        mark("mk_interleave_done", prefix=getattr(self, "prefix", ""))
         w2_scale = self.w2_weight_scale_inv.data
         if w2_scale.dtype != torch.float32 or not w2_scale.is_contiguous():
             self.w2_weight_scale_inv.data = w2_scale.contiguous().float()
         self._kernel = _get_kernel(
             self.hidden_size, self.top_k, self.num_local_experts, self.intermediate_size_per_partition
         )
+        mark("mk_kernel_ready", prefix=getattr(self, "prefix", ""))
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         assert self._kernel is not None, "prepare_megakernel_weights() must run after weight loading"

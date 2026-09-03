@@ -6,6 +6,8 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
+
+from sglang.srt.boot_timeline import mark, wrap_weights_iterator
 import concurrent.futures
 import dataclasses
 import fnmatch
@@ -1016,6 +1018,8 @@ class DefaultModelLoader(BaseModelLoader):
             and not quant_config.is_checkpoint_nvfp4_serialized
         )
         is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        weights = wrap_weights_iterator(weights)
+        mark("weights_apply_begin")
         if is_mxfp8:
             weights = (
                 (
@@ -1052,6 +1056,8 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+        mark("weights_apply_end")
+        mark("post_load_weights_begin")
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -1062,6 +1068,7 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+        mark("post_load_weights_end")
 
 
 class LayeredModelLoader(DefaultModelLoader):
