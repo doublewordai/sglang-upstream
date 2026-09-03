@@ -2419,4 +2419,52 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
+                    if (
+                        envs.SGLANG_MTP_DEBUG.get()
+                        and not getattr(self, "_mtp_dbg_draft_logged", False)
+                    ):
+                        self._mtp_dbg_draft_logged = True
+                        try:
+                            self._mtp_debug_draft_probe(req)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("MTP_DEBUG draft probe failed: %s", e)
             self.waiting_queue.extend(transferred_reqs)
+
+    def _mtp_debug_draft_probe(self: Scheduler, req: Req) -> None:
+        """mtp-debug lane: where did the draft layer's prompt KV land?
+
+        Under hisparse the PD transfer writes every layer (target latent AND
+        draft) at the decode arm's *host row* indices; the draft model reads
+        its pool at *logical* locs. Log both slices' magnitudes to confirm.
+        """
+        coord = self.hisparse_coordinator
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
+        )
+        if draft_pool is None:
+            logger.warning("MTP_DEBUG draft probe: no draft pool")
+            return
+        idx = req.req_pool_idx
+        n = min(int(coord.req_to_host_pool_allocated_len[idx].item()), 8)
+        if n == 0:
+            logger.warning("MTP_DEBUG draft probe: no host rows allocated")
+            return
+        host_rows = coord.req_to_host_pool[idx, :n].to(torch.int64)
+        logical = self.req_to_token_pool.req_to_token[idx, :n].to(torch.int64)
+        kbuf = draft_pool.get_key_buffer(0)
+        host_vals = kbuf[host_rows]
+        logical_vals = kbuf[logical]
+        logger.warning(
+            "MTP_DEBUG draft probe rid=%s n=%d host_rows=%s logical=%s "
+            "| |draft[host]| sum=%.4f | |draft[logical]| sum=%.4f "
+            "(same rows: %s)",
+            req.rid,
+            n,
+            host_rows.tolist(),
+            logical.tolist(),
+            host_vals.float().abs().sum().item(),
+            logical_vals.float().abs().sum().item(),
+            bool(torch.equal(host_rows, logical)),
+        )
