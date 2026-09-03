@@ -489,6 +489,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Draft attention window (length-agnostic drafter conditioning):
+        # propagate --speculative-draft-window-size to the DRAFT's backend
+        # instances only (the target's backends are separate objects and never
+        # see this). Used by DeepseekSparseAttnBackend._cal_indexer_k_start_end
+        # to clamp the draft's extend-path indexer candidate range; the
+        # decode/verify-adjacent paged path is masked in the draft model's
+        # Indexer (see DeepseekV3ForCausalLMNextN.__init__).
+        _draft_window = get_spec().speculative_draft_window_size
+        if _draft_window:
+            for _bk in (self.draft_attn_backend, self.draft_extend_attn_backend):
+                if _bk is None:
+                    continue
+                _targets = (
+                    _bk.attn_backends
+                    if hasattr(_bk, "attn_backends")
+                    else [_bk]
+                )
+                for _b in _targets:
+                    if hasattr(_b, "draft_attn_window"):
+                        _b.draft_attn_window = int(_draft_window)
+
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None

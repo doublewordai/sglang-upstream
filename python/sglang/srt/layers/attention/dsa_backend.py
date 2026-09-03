@@ -414,6 +414,14 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        # Draft attention window (see dsa_indexer.Indexer.draft_window): set ONLY
+        # on the draft worker's backend instances (eagle_worker_v2), never the
+        # target's. Restricts the draft's extend-path indexer candidates to the
+        # most recent W keys per query. The sink range is not expressible in the
+        # contiguous [ks, ke) mechanism (noted limitation; positions < W keep
+        # their full local context, which includes any sink rows, and the
+        # decode/verify-adjacent paged path applies the full sink+window mask).
+        self.draft_attn_window: Optional[int] = None
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -1479,6 +1487,13 @@ class DeepseekSparseAttnBackend(
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
+        if self.draft_attn_window:
+            # Draft attention window: clamp each query's candidate range to the
+            # last W keys (see dsa_indexer.Indexer.draft_window). ks is the
+            # request's flattened-KV start; ke is one past each query's own
+            # position, so ke - W is the window's left edge (clamped by ks for
+            # short sequences).
+            ks = torch.maximum(ks, ke - int(self.draft_attn_window))
         if bs_idx is not None:
             assert can_dsa_prefill_cp_round_robin_split(forward_batch)
             split_per_token = (
