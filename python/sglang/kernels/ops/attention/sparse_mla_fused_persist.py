@@ -477,10 +477,8 @@ def default_cfg(b: int) -> dict:
     at Hc=64."""
     if b <= 1:
         hc, p = 16, 32
-    elif b <= 2:
-        hc, p = 16, 16
     elif b <= 4:
-        hc, p = 64, 16
+        hc, p = 64, 32
     elif b <= 8:
         hc, p = 64, 16
     elif b <= 16:
