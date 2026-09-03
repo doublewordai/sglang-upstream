@@ -588,6 +588,11 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+
+    # Opt-in for the MTP verify path's multi-position shared-index prefetch
+    # (union swap-in per skip layer). Default False: speculative decoding keeps
+    # the synchronous per-position swap-in; the decode path stays default-on.
+    SGLANG_HISPARSE_SPEC_PREFETCH = EnvBool(False)
     # Diagnostic: log HiSparse verify-step miss counts (per draft position,
     # last anchor group's plans) every N verify steps; 0 = off.
     SGLANG_HISPARSE_MISS_LOG = EnvInt(0)

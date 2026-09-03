@@ -80,6 +80,18 @@ def resolve_shared_index_layers(
             pp_size,
         )
         return None
+    if is_speculative and not envs.SGLANG_HISPARSE_SPEC_PREFETCH.get():
+        # The MTP verify path's multi-position prefetch (one IO group per skip
+        # layer over the union of the draft positions' selections) is opt-in:
+        # default remains the pre-lane synchronous per-position swap-in so
+        # integration behavior is unchanged until the flag is set. The decode
+        # path (num_draft_tokens == 1) keeps the default-on upstream behavior.
+        logger.info(
+            "HiSparse shared-index prefetch under speculative decoding is "
+            "off by default; set SGLANG_HISPARSE_SPEC_PREFETCH=1 to enable "
+            "the multi-position verify prefetch. Using synchronous swap-in."
+        )
+        return None
     if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
         logger.info(
             "HiSparse shared-index prefetch disabled via "

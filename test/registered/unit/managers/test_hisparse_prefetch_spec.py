@@ -532,3 +532,63 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolveSpecGate(unittest.TestCase):
+    """SGLANG_HISPARSE_SPEC_PREFETCH gating of resolve_shared_index_layers."""
+
+    def _config(self):
+        from sglang.srt.configs.model_config import dsa_layer_skips_topk
+
+        cfg = SimpleNamespace(
+            num_hidden_layers=8,
+            index_topk_pattern=[False, True, True, True] * 2,
+            index_topk_freq=1,
+            cli_factor=1,
+        )
+        assert any(
+            dsa_layer_skips_topk(cfg, i) for i in range(8)
+        ), "test config must produce a sharing pattern"
+        return cfg
+
+    def _resolve(self, cfg, **kw):
+        from sglang.srt.managers.hisparse_coordinator import (
+            resolve_shared_index_layers,
+        )
+
+        return resolve_shared_index_layers(
+            hf_text_config=cfg, pp_size=kw.get("pp_size", 1),
+            is_speculative=kw.get("is_speculative", True),
+        )
+
+    def test_spec_off_by_default(self):
+        import os
+
+        os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+        self.assertIsNone(self._resolve(self._config()))
+
+    def test_spec_flag_enables(self):
+        import os
+
+        os.environ["SGLANG_HISPARSE_SPEC_PREFETCH"] = "1"
+        try:
+            self.assertTrue(any(self._resolve(self._config())))
+        finally:
+            os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+
+    def test_decode_default_on(self):
+        import os
+
+        os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+        self.assertTrue(any(self._resolve(self._config(), is_speculative=False)))
+
+    def test_pp_off(self):
+        import os
+
+        os.environ["SGLANG_HISPARSE_SPEC_PREFETCH"] = "1"
+        try:
+            self.assertIsNone(
+                self._resolve(self._config(), pp_size=4, is_speculative=False)
+            )
+        finally:
+            os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
