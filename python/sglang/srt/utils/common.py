@@ -2535,12 +2535,21 @@ def set_prometheus_multiproc_dir():
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
-def add_prometheus_middleware(app):
+def add_prometheus_middleware(app, load_snapshot_collector=None):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(registry)
+    mp_collector = multiprocess.MultiProcessCollector()
+    if load_snapshot_collector is not None:
+        # The all-ranks collector wraps the multiprocess collector (it emits
+        # the per-rank families itself for remote-node ranks and filters the
+        # duplicates out of the multiprocess exposition), so only it is
+        # registered. See observability/metrics_collector.py.
+        load_snapshot_collector.attach_multiprocess_collector(mp_collector)
+        registry.register(load_snapshot_collector)
+    else:
+        registry.register(mp_collector)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
 
     # Workaround for 307 Redirect for /metrics

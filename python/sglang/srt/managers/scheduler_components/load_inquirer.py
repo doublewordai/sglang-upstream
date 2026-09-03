@@ -263,6 +263,10 @@ class SchedulerLoadInquirer:
 
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
+            tp_rank=int(self.ps.tp_rank),
+            pp_rank=int(self.ps.pp_rank),
+            moe_ep_rank=int(self.ps.moe_ep_rank),
+            node_rank=int(getattr(self.server_args, "node_rank", 0) or 0),
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
