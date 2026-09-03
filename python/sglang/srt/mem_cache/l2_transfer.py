@@ -79,15 +79,10 @@ class L2TransferEngine:
         with device_module.stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
-            bulk, loop = self._split_bulk(transfers, "supports_bulk_backup")
-            for transfer in bulk:
-                transfer.host_pool.backup_from_device_bulk(
-                    transfer.device_pool,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                    self.io_backend,
-                )
-            for transfer in loop:
+            # NOTE: bulk dispatch for D2H lives inside
+            # MLATokenToKVPoolHost.backup_from_device_all_layer (the hisparse
+            # coordinator also calls it directly, bypassing this engine).
+            for transfer in transfers:
                 transfer.host_pool.backup_from_device_all_layer(
                     transfer.device_pool,
                     transfer.host_indices,

@@ -441,11 +441,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     break
 
         # remainder rows (not covered by an eligible joint run) -> AOT kernel
+        # (vectorized: find_joint_runs tiles [0, n) exactly, so the flat
+        # per-run eligibility expanded by run lengths IS the per-position mask)
         rem_mask = torch.ones(host_cpu.numel(), dtype=torch.bool)
-        for j in range(h_starts.numel()):
-            if bool(seg_mask[j]):
-                p = int(positions[j])
-                rem_mask[p : p + int(lens[j])] = False
+        if h_starts.numel() > 0 and int(lens.sum()) == host_cpu.numel():
+            rem_mask = ~torch.repeat_interleave(seg_mask, lens)
         rem_pos = rem_mask.nonzero().flatten()
         if rem_pos.numel() > 0:
             rem_h = host_cpu[rem_pos].to(device_pool.device, non_blocking=True)
@@ -634,6 +634,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return device_pool.data_ptrs, device_pool.kv_buffer
 
     def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        # Bulk dispatch lives HERE (not only in L2TransferEngine) because the
+        # hisparse coordinator's staging/eager backups call this method
+        # directly, bypassing the engine. Flag off or unsupported -> the
+        # original kernel path, unchanged.
+        from sglang.srt.environ import envs
+
+        if (
+            envs.SGLANG_HICACHE_BULK_COPY.get()
+            and io_backend == "kernel"
+            and self.supports_bulk_backup
+            # tiny ops (hisparse eager per-step backup: 1-8 tokens) keep the
+            # kernel path: the index .cpu() sync would cost more than the copy
+            and host_indices.numel() >= bulk_copy.BULK_MIN_TOKENS
+        ):
+            return self.backup_from_device_bulk(
+                device_pool, host_indices, device_indices, io_backend
+            )
+        return self._backup_from_device_all_layer_kernel(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def _backup_from_device_all_layer_kernel(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         host_indices = self.maybe_dcp_kernel_indices(host_indices)

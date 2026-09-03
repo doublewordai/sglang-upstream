@@ -40,8 +40,12 @@ BULK_STAGING_BYTES = 512 * 1024 * 1024
 # Maximum segments submitted per cudaMemcpyBatchAsync call.
 BULK_MAX_SEGMENTS_PER_CALL = 16384
 # Runs shorter than this (bytes) go to the fallback kernel instead of the
-# batched CE (sub-32KB segments sustain < 10 GB/s and submission dominates).
-BULK_MIN_SEGMENT_BYTES = 32 * 1024
+# batched CE: measured batched-CE rates are ~29-47 GB/s at 32-41 KB segments
+# (WORSE than the AOT kernel's 35-47), ~72-75 at 128 KB, 154-160 at ~800 KB,
+# and roofline (414 H2D / 170 D2H) at >= 8 MB. 128 KB keeps page-granular
+# random runs on the (unchanged) kernel path — no regression — while any
+# multi-page joint run rides the CE.
+BULK_MIN_SEGMENT_BYTES = 128 * 1024
 
 
 class _CudaMemLocation(ctypes.Structure):
@@ -262,3 +266,8 @@ def chunk_runs(
                 torch.tensor(acc_o, dtype=torch.int64),
                 total,
             )
+
+
+# Ops smaller than this (tokens) keep the per-row kernel path even when the
+# bulk flag is on (the index .cpu() sync costs more than the copy).
+BULK_MIN_TOKENS = 64
