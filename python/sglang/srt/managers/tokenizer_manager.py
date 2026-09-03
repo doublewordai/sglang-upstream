@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
 import json
 import logging
 import os
@@ -814,6 +815,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
+                    # The rendered prompt (obj.text) can be megabytes at long
+                    # contexts and is never read after tokenization; drop it
+                    # so requests that stay in flight (or parked behind a
+                    # backpressured dispatch socket) do not pin a full copy
+                    # for their whole lifetime.
+                    obj.text = None
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1876,6 +1883,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
+                        tmp_obj.text = None  # see generate_request: not read after tokenization
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -2195,6 +2203,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self._periodic_gc_loop))
+        )
+
+    async def _periodic_gc_loop(self):
+        """Collect cyclic garbage on a fixed cadence.
+
+        Each request's tokenization allocates hundreds of thousands of small
+        objects; the small amount of cyclic garbage a request leaves behind
+        pins pymalloc arenas until a generation-2 collection eventually runs,
+        so frontend RSS ratchets upward between (rare) automatic collections.
+        Measured in production: ~1.2 MB retained per request, released only
+        in bulk every ~hour; a saturated system went 7 h without a release
+        and reached 47 GB. A fixed-interval full collection bounds the
+        pinned-arena buildup; the post-warmup gc.freeze() keeps the static
+        heap out of the scan so the collect is cheap.
+        """
+        interval = envs.SGLANG_FRONTEND_GC_INTERVAL_S.get()
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            t0 = time.perf_counter()
+            gc.collect()
+            logger.debug(
+                "frontend periodic gc.collect took %.3fs",
+                time.perf_counter() - t0,
+            )
 
     async def handle_loop(self):
         """The event loop that handles requests"""
