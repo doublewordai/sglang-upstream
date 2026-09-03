@@ -120,6 +120,7 @@ def resolve_layer_indices(
     model_config: ModelConfig,
     is_draft_worker: bool,
     spec_algorithm: SpeculativeAlgorithm,
+    allow_pp_mtp: bool = False,
 ) -> ModelLayerInfo:
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
     # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -142,6 +143,9 @@ def resolve_layer_indices(
         spec_algorithm=spec_algorithm,
         num_effective_layers=num_effective_layers,
         model_num_layers=model_num_layers,
+        pp_start_layer=pp_range.start_layer,
+        pp_end_layer=pp_range.end_layer,
+        allow_pp_mtp=allow_pp_mtp,
     )
 
     return ModelLayerInfo(
@@ -196,15 +200,30 @@ def _assert_pp_mtp_compat(
     spec_algorithm: SpeculativeAlgorithm,
     num_effective_layers: int,
     model_num_layers: int,
+    pp_start_layer: Optional[int] = None,
+    pp_end_layer: Optional[int] = None,
+    allow_pp_mtp: bool = False,
 ) -> None:
-    assert (
+    if (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
         )
-    ), "PP is not compatible with MTP models."
+    ):
+        return
+    # PP-split MTP target model (PD prefill arm): allowed only when the PP
+    # split never includes the NextN draft layers -- they are loaded by the
+    # draft worker on the LAST stage, not by any target stage. The default
+    # get_pp_indices split uses config.num_hidden_layers, which excludes the
+    # NextN layers, so this holds by construction; assert it anyway.
+    assert allow_pp_mtp, "PP is not compatible with MTP models."
+    assert pp_end_layer is not None and pp_end_layer <= model_num_layers, (
+        f"PP layer range [{pp_start_layer}, {pp_end_layer}) overlaps the MTP "
+        f"draft layers (model_num_layers={model_num_layers}); the NextN "
+        "layers must stay outside every target PP stage."
+    )
 
 
 def adjust_hybrid_swa_layer_ids(

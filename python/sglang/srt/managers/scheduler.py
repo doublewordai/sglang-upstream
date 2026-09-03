@@ -325,9 +325,11 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.pool_aging import maybe_log_pool_aging
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -928,6 +930,23 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # PP + speculative decoding (prefill arm only, enforced in
+        # check_server_args): the EAGLE draft layer consumes the target's
+        # final hidden states, which exist only on the LAST pipeline stage.
+        # Earlier stages run plain target extends and forward hidden states
+        # as today; they must not build a draft worker, a draft KV pool, or
+        # register draft KV data pointers with the transfer backend.
+        if (
+            self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            assert self.server_args.disaggregation_mode == "prefill", (
+                "PP + speculative decoding is only supported on the prefill arm"
+            )
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding. It builds its draft
         # from this process's own config: what differs for the draft — the
         # target's context length, the draft load format, its attention backend
@@ -1022,8 +1041,10 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
-        # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        # Dispatch the model worker. Under PP+spec (prefill arm) only the
+        # last stage has a draft worker; earlier stages drive the plain
+        # target worker (with pp_proxy_tensors threading).
+        if self.draft_worker is None:
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1350,9 +1371,16 @@ class Scheduler(
             # remaps it to logical locs at admission (admit_request_direct).
             self.hisparse_coordinator.draft_pool = draft_token_to_kv_pool
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.draft_worker is not None
+            and self.spec_algorithm.carries_draft_hidden_states()
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
+            # worker, so a single accessor covers both shapes. Under PP+spec
+            # only the last stage has a draft worker; earlier stages use the
+            # 16-fp32 padding layout and never send the spec aux components
+            # (see KVArgs.aux_send_spec_bufs), so the layout mismatch with the
+            # decode side is never exercised.
             draft_runner = self.draft_worker.draft_worker.draft_runner
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
@@ -1773,6 +1801,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -1817,6 +1846,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -2784,10 +2814,24 @@ class Scheduler(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if cold_trace_enabled():
+                cold_trace(
+                    "pf_bootstrap_add",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    input_len=len(req.origin_input_ids),
+                )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
+                if cold_trace_enabled():
+                    cold_trace(
+                        "dec_prealloc_add",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        input_len=len(req.origin_input_ids),
+                    )
             else:
                 req.time_stats.set_retract_time()
         else:
@@ -3050,43 +3094,43 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        # PD speculative padding (lane/adaptive-spec): requests transitioning
-        # staging->decode carry no draft state yet. Fabricate zeroed spec
-        # extras so the relay stash and the spec worker both see shape-valid
-        # state: zero topk_p -> zero confidence -> verify_len=1 (anchor-only,
-        # i.e. a plain decode step for the first round), dummy draft tokens
-        # that are never accepted. Without this, a bonus-only payload crashes
-        # FutureMap.stash (topk_p None) and breaks batch uniformity.
-        if self.spec_algorithm.is_eagle():
-            topk = get_spec().speculative_eagle_topk or 1
-            payload = RelayPayload(
-                bonus_tokens=last_tokens,
+        if self.spec_algorithm.is_none():
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+        else:
+            # Spec-v2: the prefill round already relayed the FULL draft payload
+            # (RelayPayload.from_draft_input in _relay_forward_payload); a
+            # bonus-only re-stash would clobber it -- and crash FutureMap.stash,
+            # which reads payload.topk_p under need_topk. Instead attach a
+            # resolve shell (mirroring PD-decode admission in
+            # eagle_disaggregation.py): future_indices lets the first decode
+            # round's resolve_forward_inputs gather the relayed payload
+            # (topk_p/topk_index/bonus/hidden_states/dsa seed) by
+            # req_pool_indices. Zeros are placeholders; resolve overwrites
+            # every field it gathers.
+            from sglang.srt.model_executor.forward_batch_info import (
+                CaptureHiddenMode,
+            )
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            topk = self.server_args.speculative_eagle_topk or 1
+            spec_info = EagleDraftInput(
                 topk_p=torch.zeros(
                     (len(reqs), topk), dtype=torch.float32, device=device
                 ),
                 topk_index=torch.zeros(
                     (len(reqs), topk), dtype=torch.int64, device=device
                 ),
-                hidden_states=torch.zeros(
-                    (len(reqs), self.model_config.hidden_size),
-                    dtype=self.model_config.dtype,
-                    device=device,
-                ),
+                bonus_tokens=last_tokens.to(torch.int32),
             )
-        else:
-            payload = RelayPayload(bonus_tokens=last_tokens)
-        self.future_map.stash(batch.req_pool_indices, payload)
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            spec_info.future_indices = batch.req_pool_indices
+            spec_info.future_dsa_topk_indices_available = (
+                self.future_map.dsa_topk_indices_buf is not None
+            )
+            batch.spec_info = spec_info
         batch.input_ids = None
-
-        if self.spec_algorithm.is_eagle():
-            # Unified hisparse flow: the batch needs a spec_info for the spec
-            # worker; future-indices mode resolves the (zero-padded) state from
-            # the relay. On the PD decode arm transferred requests bypass this
-            # builder (admit_request_direct), so this is unified-rig only.
-            batch.spec_info = EagleDraftInput(
-                bonus_tokens=last_tokens,
-                future_indices=batch.req_pool_indices,
-            )
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -3525,6 +3569,9 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled() and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in can_run_list:
+                cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -3895,12 +3942,16 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
-            elif not batch.spec_algorithm.is_none():
+            elif not batch.spec_algorithm.is_none() and self.draft_worker is not None:
                 # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
+                # future_map relay / on_publish). PP stages without a draft
+                # worker (all but the last, under PP+spec) take the plain
+                # path below so pp_proxy_tensors keep flowing between stages.
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3918,11 +3969,9 @@ class Scheduler(
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                # Plain path: non-spec everywhere, and PP+spec stages without
+                # a draft worker. pp_proxy_tensors is None when not PP.
+                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
@@ -4437,6 +4486,23 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        if (
+            self.enable_hisparse
+            and self.hisparse_coordinator is not None
+            and hasattr(self, "disagg_decode_prealloc_queue")
+        ):
+            # Host-pool backpressure: per-rank HiSparse host KV pool state so
+            # routers/ops can see the admission constraint (free host tokens).
+            host_pool = self.hisparse_coordinator.mem_pool_host
+            ret["hisparse_host_pool"] = {
+                "free_tokens": int(host_pool.available_size()),
+                "total_tokens": int(host_pool.size),
+                "page_size": int(host_pool.page_size),
+                "prealloc_wait_events": int(
+                    self.disagg_decode_prealloc_queue.host_pool_wait_events
+                ),
+            }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

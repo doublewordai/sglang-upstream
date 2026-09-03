@@ -709,6 +709,27 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
+        elif hasattr(lm_head, "lm_head_fp8_weight"):
+            # SGLANG_LM_HEAD_FP8: blockwise-fp8 LM head, weight quantized at
+            # load time by UnquantizedEmbeddingMethod.process_weights_after_loading.
+            # Same GEMM family (per-token-group-128 quant + DeepGEMM/CUTLASS
+            # w8a8 block-fp8) as every other fp8 GEMM in this model. NOT
+            # bit-exact vs the bf16 matmul it replaces (error characterized
+            # in grace-1m lanes/lm-head-gemm). Attn-TP>1 heads whose per-rank
+            # vocab shard is not block-128 aligned are never quantized, so
+            # this branch is not taken for them.
+            from sglang.srt.layers.quantization.fp8_utils import (
+                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            )
+
+            if not hidden_states.is_contiguous():
+                hidden_states = hidden_states.contiguous()
+            logits = deepgemm_w8a8_block_fp8_linear_with_fallback(
+                hidden_states,
+                lm_head.lm_head_fp8_weight,
+                [128, 128],
+                lm_head.lm_head_fp8_scale,
+            )
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):

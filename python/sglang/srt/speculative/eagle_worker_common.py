@@ -474,6 +474,29 @@ def _compact_accept_to_front(
     return out
 
 
+def maybe_commit_verify_tokens(
+    batch: ScheduleBatch,
+    batch_result: "GenerationBatchResult",
+    target_worker: "TpModelWorker",
+) -> None:
+    """pd/mtp-hisparse: back up the accepted tokens' KV to host rows before the
+    reserved buffer slots are reused by the next verify step.
+
+    Called AFTER the draft-extend launch: the backup needs accept_lens on the
+    host (a blocking D2H on this round's verify output); here it overlaps the
+    draft-extend GPU work rather than idling the GPU between the verify and
+    draft-extend graph replays."""
+    coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
+    if coord is not None and not batch.forward_mode.is_idle():
+        coord.commit_verify_tokens(
+            batch.seq_lens,
+            batch_result.accept_lens,
+            batch.req_pool_indices,
+            batch.seq_lens_cpu,
+            getattr(batch, "req_pool_indices_cpu", None),
+        )
+
+
 def run_eagle_verify(
     batch: ScheduleBatch,
     *,
@@ -632,18 +655,21 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
-    new_seq_lens = batch.seq_lens + accept_lens
-    # pd/mtp-hisparse: back up the accepted tokens' KV to host rows before the
-    # reserved buffer slots are reused by the next verify step.
+    # pd/mtp-hisparse: fence the sample output NOW (the queue still holds only
+    # the verify forward + sample; the draft-extend launch comes later in the
+    # caller). The hisparse commit's pinned D2H gates on this event so its CPU
+    # read is NOT stream-ordered behind the draft-extend kernels.
     coord = getattr(target_worker.model_runner, "hisparse_coordinator", None)
-    if coord is not None and not batch.forward_mode.is_idle():
-        coord.commit_verify_tokens(
-            batch.seq_lens,
-            accept_lens,
-            batch.req_pool_indices,
-            batch.seq_lens_cpu,
-            getattr(batch, "req_pool_indices_cpu", None),
-        )
+    if coord is not None:
+        coord.record_verify_sample_done()
+    new_seq_lens = batch.seq_lens + accept_lens
+    # pd/mtp-hisparse: the accepted tokens' KV backup moved AFTER the
+    # draft-extend launch (maybe_commit_verify_tokens, called by the workers)
+    # so its blocking accept_lens D2H overlaps draft-extend GPU work instead of
+    # stalling the scheduler thread between the verify and draft-extend
+    # launches. Ordering is unchanged: the backup is enqueued on
+    # decode_backup_stream and the next round's map_verify_locs_to_buffer gates
+    # the verify KV writes on wait_for_pending_backup().
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
