@@ -590,16 +590,14 @@ class HiSparseCoordinator:
             )
             # Separate event set from the decode path: decode and verify graphs
             # are distinct captures, and a shared event would couple them.
-            # One event per (skip-slot, draft position): the anchor forks the
-            # prefetch stream after EVERY position's kernel (position p's plan
-            # is complete then), so position p's copies overlap the anchor's
-            # remaining position kernels instead of waiting for the group's
-            # last plan (h2d-phase-overlap: the two host->device phases are
-            # independent per position; only plan(p) -> copy(p) is a real
-            # dependency).
+            # FLAT (one event per skip-slot), matching this tree's
+            # _verify_swap_in (integration merge resolution): the anchor forks
+            # the prefetch stream after the LAST position's plan and records
+            # each skip slot's event once, after that layer's all-position
+            # copies. (The lane/hisparse-prefetch-spec head instead uses nested
+            # per-(position, slot) events for finer overlap; do not mix shapes.)
             self._prefetch_events_v = [
-                [device_module.Event() for _ in range(max_group_size)]
-                for _ in range(n_pos)
+                device_module.Event() for _ in range(max_group_size)
             ]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
