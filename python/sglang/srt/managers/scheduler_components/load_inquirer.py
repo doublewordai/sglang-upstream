@@ -165,7 +165,11 @@ class SchedulerLoadInquirer:
                         )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
-        elif self.disaggregation_mode in (DisaggregationMode.PREFILL, None):
+        elif self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.NULL,
+            None,
+        ):
             # prefill-pool-degrade: the hicache host pool is the retention
             # constraint on a prefill arm; without this the snapshot reports
             # host_free_tok=0 unconditionally (staging C10B showed all-zero
