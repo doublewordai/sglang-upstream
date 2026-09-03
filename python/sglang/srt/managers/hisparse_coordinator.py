@@ -556,6 +556,51 @@ class HiSparseCoordinator:
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = self._make_io_stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
+        # MTP target-verify: one plan buffer set + slot-table stash per draft
+        # position (the verify page table is interleaved [bs*n, top_k], and each
+        # position has its own selection set and newest-token window). The
+        # anchor records position p's plan into slot p; the skip layers replay
+        # all positions' plans as one IO group on the prefetch stream.
+        # [mtp-speed 2026-09-03] restored verbatim from lane/hisparse-prefetch-spec:
+        # the merge into integration-0902 kept the _verify_swap_in users but
+        # dropped this allocation — spec boots died at decode graph capture with
+        # TypeError: 'NoneType' object is not subscriptable (line ~2099).
+        if self.num_draft_tokens > 1:
+            n_pos = self.num_draft_tokens
+            self._miss_src_v = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._miss_dst_v = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._miss_count_v = torch.zeros(
+                (n_pos, max_num_req_slots), dtype=torch.int32, device=self.device
+            )
+            # Slot tables returned to skip layers: the anchor's per-position
+            # top_k_device_locs, stashed on the compute stream right after each
+            # anchor kernel (top_k_device_locs_buffer is reused per position).
+            self._verify_slot_table = torch.zeros(
+                (n_pos, max_num_req_slots, self.top_k),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            # Separate event set from the decode path: decode and verify graphs
+            # are distinct captures, and a shared event would couple them.
+            # One event per (skip-slot, draft position): the anchor forks the
+            # prefetch stream after EVERY position's kernel (position p's plan
+            # is complete then), so position p's copies overlap the anchor's
+            # remaining position kernels instead of waiting for the group's
+            # last plan (h2d-phase-overlap: the two host->device phases are
+            # independent per position; only plan(p) -> copy(p) is a real
+            # dependency).
+            self._prefetch_events_v = [
+                [device_module.Event() for _ in range(max_group_size)]
+                for _ in range(n_pos)
+            ]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
             "group(s), %d skip layer(s) of %d total%s.",
