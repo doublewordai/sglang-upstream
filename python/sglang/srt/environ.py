@@ -1565,6 +1565,11 @@ class Envs:
     # lane/indexer-prologue: keep the Hadamard inside the fused DSA indexer
     # prologue kernels (production arithmetic).
     SGLANG_DSA_INDEXER_FUSION_KEEP_HADAMARD = EnvBool(False)
+    # lane/decode-glue-fusion: fused decode-layer glue kernels (default off)
+    SGLANG_DECODE_GLUE_FUSE_NORM_QUANT = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_MOE_EPILOGUE = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_ROUTER = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_KV_EPILOGUE = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel
