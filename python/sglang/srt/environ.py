@@ -725,6 +725,16 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # device-pool-degrade lane (2026-09-03): back-pressure bound on in-flight
+    # handover pages (device KV held by finished prompts awaiting the PD KV
+    # transfer). Those pages are unreclaimable until the transfer completes,
+    # so a transfer-path stall grows them without bound and wedges the device
+    # pool (the 13:28Z outage: full_available_size=0 + full_evictable_size_=0).
+    # Fraction of the device token pool; above it the prefill arm stops
+    # admitting NEW cold work (queued, not dropped; running chunks continue)
+    # until the in-flight set drains. Default 0.0 = off (experiment-gated;
+    # threshold calibrated from prefill-oom-1328's per-category page data).
+    SGLANG_PDHO_INFLIGHT_FRACTION = EnvFloat(0.0)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
