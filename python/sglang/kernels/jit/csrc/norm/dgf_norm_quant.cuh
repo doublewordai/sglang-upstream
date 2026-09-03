@@ -209,7 +209,8 @@ struct DGFNormQuantKernel {
     TensorMatcher({T, kK}).with_strides({Sr, 1}).with_dtype<bf16_t>().with_device(device).verify(residual);
     auto Sx = SymbolicSize{"stride_x"};
     TensorMatcher({T, kK}).with_strides({Sx, 1}).with_dtype<bf16_t>().with_device(device).verify(x);
-    TensorMatcher({T, kK}).with_dtype<bf16_t>().with_device(device).verify(shared);
+    auto Ss = SymbolicSize{"stride_shared"};
+    TensorMatcher({T, kK}).with_strides({Ss, 1}).with_dtype<bf16_t>().with_device(device).verify(shared);
     TensorMatcher({kK}).with_dtype<bf16_t>().with_device(device).verify(weight);
     TensorMatcher({T, kK}).with_dtype<fp8_e4m3_t>().with_device(device).verify(out_q);
     TensorMatcher({kK / 128, t_pad4}).with_dtype<fp32_t>().with_device(device).verify(out_s_col);
