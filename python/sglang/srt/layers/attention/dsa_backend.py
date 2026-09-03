@@ -807,9 +807,11 @@ class DeepseekSparseAttnBackend(
         req_id = torch.searchsorted(incl, rows, right=True)
         valid = rows < incl[-1]
         safe_req = req_id.clamp(max=bs - 1)
-        starts = incl.gather(0, (safe_req - 1).clamp(min=0)) - verify_lens_64[
-            safe_req
-        ]
+        # start of request i is incl[i-1] (inclusive cumsum), NOT
+        # incl[i-1] - vl[i]: the old form double-subtracted vl[i] and made
+        # within = true_within + vl[i] (OOB page-table gathers at tier >= 48
+        # capture; silently wrong metadata at any bs >= 2).
+        starts = incl.gather(0, (safe_req - 1).clamp(min=0))
         starts = torch.where(safe_req > 0, starts, torch.zeros_like(starts))
         within = torch.where(valid, rows - starts, torch.zeros_like(rows))
         return req_id, within, valid
