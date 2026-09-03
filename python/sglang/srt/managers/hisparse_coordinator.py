@@ -293,6 +293,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._backup_log_fh = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -354,11 +355,19 @@ class HiSparseCoordinator:
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
-        self._skip_first_backup = [False] * max_num_req_slots
-        # Store-degradation-rollback: set when a host-pool backup
-        # allocation failed for this request; freezes its mirror
-        # watermark so the mirror stays a clean prefix.
-        self._mirror_degraded = [False] * max_num_req_slots
+        # CPU bool tensor (not a list) so the decode-step clear/check is one
+        # gather/scatter instead of a per-request Python loop (hiccup-3).
+        self._skip_first_backup = torch.zeros(
+            max_num_req_slots, dtype=torch.bool
+        )
+        # Store-degradation-rollback (host-pool-backpressure): set when a
+        # host-pool backup allocation failed for this request; freezes its
+        # mirror watermark so the mirror stays a clean prefix. CPU bool
+        # tensor for the same reason as _skip_first_backup — the decode
+        # backup mask excludes frozen requests with one gather.
+        self._mirror_degraded = torch.zeros(
+            max_num_req_slots, dtype=torch.bool
+        )
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -1282,23 +1291,32 @@ class HiSparseCoordinator:
             self._fast_backup_previous_token(seq_lens, req_pool_indices)
             return
 
-        # Build the list of batch positions that need a host backup.
+        # Build the mask of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio == 0:
-                backup_indices.append(i)
-
-        if not backup_indices:
+        # Vectorised (hiccup-3): one CPU-tensor pass instead of a per-request
+        # Python loop; this runs on the scheduler critical path before the
+        # per-step DP all_gather, where the loop cost 1.4-2.1 ms under load.
+        # Same set, same order (ascending batch position), same flag clears.
+        skip = self._skip_first_backup[req_pool_indices_cpu]
+        self._skip_first_backup[req_pool_indices_cpu] = False
+        backup_mask = ((seq_lens_cpu - 1) % self.compress_ratio == 0) & ~skip
+        # Store-degradation-rollback (host-pool-backpressure): a request whose
+        # mirror watermark is frozen never backs up again — a later successful
+        # alloc would advance the watermark past rows that were never backed
+        # up (a mirror hole). The finish flush heals the range in one alloc.
+        backup_mask &= ~self._mirror_degraded[req_pool_indices_cpu]
+        if not bool(backup_mask.any()):
             return
 
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
+        backup_indices_cpu = torch.where(backup_mask)[0]
+        # One ASYNC pinned H2D for the batch-position indices. The previous
+        # torch.tensor(..., device=self.device) was a blocking pageable H2D:
+        # under the overlap scheduler it cudaStreamSynchronize'd the schedule
+        # stream against the previous step's still-running forward (measured
+        # 0.5-2.9 ms/step on the rig; the per-step stall inside prepare_for_decode).
+        backup_indices_gpu = (
+            backup_indices_cpu.pin_memory().to(self.device, non_blocking=True)
         )
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
@@ -1314,48 +1332,69 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        host_locs_list = []
-        keep_rows = []
-        for k, i in enumerate(backup_indices):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._mirror_degraded[req_idx]:
-                # Watermark frozen by an earlier backup allocation
-                # failure; finish-flush repairs what it can.
-                continue
-            start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            try:
-                host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                    self.req_to_host_pool,
-                    self.req_to_host_pool_allocated_len,
-                    req_idx,
-                    start_pos,
-                    1,
-                )
-            except HostPoolExhaustedError:
-                # Store-degradation-rollback: warn, skip, freeze
-                # this request's mirror watermark — never kill the
-                # decode step for a save failure. A hole is
-                # impossible: the failed page never advances
-                # req_to_host_pool_allocated_len.
-                self._mirror_degraded[req_idx] = True
-                logger.warning(
-                    "HiSparse: host pool full during decode backup "
-                    "(req_idx=%d, pos=%d) — mirror watermark frozen "
-                    "at %d; the finished request's cache will shorten",
-                    req_idx,
-                    start_pos,
-                    int(self.req_to_host_pool_allocated_len[req_idx]),
-                )
-                continue
-            host_locs_list.append(host_locs)
-            keep_rows.append(k)
-        if not host_locs_list:
-            return
-        host_locs = torch.cat(host_locs_list)
-        device_locs = device_locs[
-            torch.tensor(keep_rows, dtype=torch.long, device=device_locs.device)
-        ]
+        backup_req_indices_cpu = req_pool_indices_cpu[backup_indices_cpu]
+        start_pos_cpu = (seq_lens_cpu[backup_indices_cpu] - 1) // (
+            self.compress_ratio
+        ) - 1
+        try:
+            host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                backup_req_indices_cpu,
+                start_pos_cpu,
+                1,
+            )
+        except HostPoolExhaustedError:
+            # Store-degradation-rollback (host-pool-backpressure), rare path:
+            # the host pool went full inside the batch alloc. The batch call
+            # allocates per request in order, so requests it already
+            # satisfied re-enter the scalar path below needing no new pages
+            # (idempotent); for the requests that cannot be backed up, warn +
+            # skip + freeze the mirror watermark — never kill the decode step
+            # for a save failure. A hole is impossible: the failed page never
+            # advances req_to_host_pool_allocated_len, and the finish flush
+            # heals the range in one alloc.
+            host_locs_list = []
+            keep_rows = []
+            for k in range(int(backup_req_indices_cpu.numel())):
+                req_idx = int(backup_req_indices_cpu[k])
+                try:
+                    host_locs_list.append(
+                        self.mem_pool_host.alloc_paged_token_slots(
+                            self.req_to_host_pool,
+                            self.req_to_host_pool_allocated_len,
+                            req_idx,
+                            int(start_pos_cpu[k]),
+                            1,
+                        )
+                    )
+                    keep_rows.append(k)
+                except HostPoolExhaustedError:
+                    self._mirror_degraded[req_idx] = True
+                    logger.warning(
+                        "HiSparse: host pool full during decode backup "
+                        "(req_idx=%d, pos=%d) — mirror watermark frozen "
+                        "at %d; the finished request's cache will shorten",
+                        req_idx,
+                        int(start_pos_cpu[k]),
+                        int(self.req_to_host_pool_allocated_len[req_idx]),
+                    )
+            if not host_locs_list:
+                return
+            host_locs = torch.cat(host_locs_list)
+            keep_rows_t = torch.tensor(keep_rows, dtype=torch.long)
+            device_locs = device_locs[keep_rows_t.to(device_locs.device)]
+            # Keep the (measurement-only) backup log consistent: idx/host/dev
+            # must all describe the surviving subset.
+            backup_indices_cpu = backup_indices_cpu[keep_rows_t]
 
+        self._backup_log(
+            len(seq_lens_cpu),
+            backup_indices_cpu.tolist(),
+            host_locs,
+            device_locs,
+            req_pool_indices_cpu,
+        )
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
@@ -1378,6 +1417,30 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+
+    def _backup_log(self, bs, backup_indices, host_locs, device_locs, req_pool_indices_cpu):
+        """Measurement-only (hiccup-3): log every eager-backup call's rows."""
+        import json as _json
+
+        path = envs.SGLANG_HISPARSE_BACKUP_LOG.get()
+        if not path:
+            return
+        if self._backup_log_fh is None:
+            self._backup_log_fh = open(path, "a", buffering=1)
+        self._backup_log_fh.write(
+            _json.dumps(
+                {
+                    "bs": int(bs),
+                    "idx": [int(i) for i in backup_indices],
+                    "host": host_locs.tolist(),
+                    "dev": device_locs.tolist(),
+                    "alloc": self.req_to_host_pool_allocated_len[
+                        req_pool_indices_cpu
+                    ].tolist(),
+                }
+            )
+            + "\n"
+        )
 
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
