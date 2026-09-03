@@ -1519,7 +1519,7 @@ class Envs:
     # sgl_kernel fast_topk_v2 on decode/verify shapes (row_starts is None,
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
-    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(True)
     # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
     # persistent launch with in-kernel grid barriers reading each row once
     # (plus a small sample and a rare fg-equivalent fallback re-read),
