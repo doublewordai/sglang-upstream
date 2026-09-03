@@ -1370,6 +1370,10 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Frontend (tokenizer manager) periodic full-gc interval in seconds.
+    # Bounds the pymalloc arenas pinned by per-request cyclic garbage; <=0
+    # disables the periodic collection.
+    SGLANG_FRONTEND_GC_INTERVAL_S = EnvInt(600)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
