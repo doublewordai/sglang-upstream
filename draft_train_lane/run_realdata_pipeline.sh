@@ -80,11 +80,16 @@ srun --overlap --jobid="$HOLDER" -N1 -n1 -w "$TRAIN_NODE" --gres=gpu:4 \
   || { echo TRAIN-FAILED; tail -30 $LOGS/pipe-train.out; exit 1; }
 tail -3 $LOGS/pipe-train.out
 
-# ---------- 5. export ----------
+# ---------- 5. export (GPU step for fast fp8 dequant/requant) ----------
 phase "export"
-~/sglang-venv/bin/python $LANE/export_draft.py --weights-dir $LANE/draft_weights \
-  --ft $LANE/runs/real/draft_finetuned.pt --out $LANE/export_trained_real \
-  > $LOGS/pipe-export.out 2>&1 || { echo EXPORT-FAILED; exit 1; }
+srun --overlap --jobid="$HOLDER" -N1 -n1 -w "$TRAIN_NODE" --gres=gpu:4 \
+  --cpus-per-task=16 --input=none bash -c "
+    export T_WITH_EP=1; source $S/runs/glm-isambard/U-uccl-send-abort/scripts/env-U.sh >/dev/null 2>&1
+    export PYTHONDONTWRITEBYTECODE=1; cd $LANE
+    CUDA_VISIBLE_DEVICES=0 ~/sglang-venv/bin/python $LANE/export_draft.py \
+      --weights-dir $LANE/draft_weights --ft $LANE/runs/real/draft_finetuned.pt \
+      --out $LANE/export_trained_real
+  " > $LOGS/pipe-export.out 2>&1 || { echo EXPORT-FAILED; tail -20 $LOGS/pipe-export.out; exit 1; }
 tail -2 $LOGS/pipe-export.out
 
 # ---------- 6. M4 A/B ----------
