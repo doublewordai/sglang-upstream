@@ -143,6 +143,9 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
         )
 
 
+_REGISTER_RETRY_SPACERS: list = []
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,
@@ -153,11 +156,45 @@ def alloc_with_host_register(
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    cudaHostRegister on hugepage-backed pools fails intermittently with
+    cudaErrorInvalidValue depending on where the kernel placed the mapping
+    (v16-memory-plan rig: identical boots fail/pass; a fixed VA fails
+    deterministically). When a hugepage mode is active, retry the whole
+    alloc+register with a small VA spacer between attempts so the kernel
+    hands out a different placement each try.
     """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
-        _cuda_host_register(buffer)
-    return buffer
+    import gc
+    import mmap as _mmap
+
+    from sglang.srt.environ import envs
+
+    hugepage_mode = bool((envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip())
+    attempts = 8 if hugepage_mode else 1
+    for i in range(attempts):
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
+        if not pin_memory:
+            return buffer
+        try:
+            _cuda_host_register(buffer)
+            return buffer
+        except RuntimeError as e:
+            if i == attempts - 1:
+                raise
+            logger.warning(
+                "cudaHostRegister failed on hugepage pool (attempt %d/%d): %s; "
+                "retrying with a VA spacer",
+                i + 1,
+                attempts,
+                str(e)[:120],
+            )
+            del buffer
+            gc.collect()
+            # Shift the kernel's mmap placement: a small anonymous mapping
+            # takes the top of the freed hole, so the next pool mapping
+            # lands at a different address.
+            _REGISTER_RETRY_SPACERS.append(_mmap.mmap(-1, (2 + i * 4) * 1024 * 1024))
+    raise RuntimeError("unreachable")
 
 
 def alloc_with_pin_memory(
