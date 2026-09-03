@@ -1544,7 +1544,7 @@ class Envs:
     # Prefill-shaped PAGED DSA top-k: use the single-pass JIT kernel
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
-    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(True)
     # lane/pagetable-gather: in the chunked-mqa PAGED prefill top-k path,
     # pass the per-step page table to the 1-pass kernel whole plus a per-row
     # table-row map (row_to_page) instead of materializing
