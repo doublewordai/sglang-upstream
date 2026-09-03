@@ -135,6 +135,15 @@ def _run_kernel(
     return out
 
 
+def _make_plan(num_reqs: int, top_k: int):
+    """Empty miss-plan buffers for RecordMissPlan swap-in calls."""
+    return (
+        torch.zeros((num_reqs, top_k), dtype=torch.int64, device=DEVICE),
+        torch.zeros((num_reqs, top_k), dtype=torch.int32, device=DEVICE),
+        torch.zeros((num_reqs,), dtype=torch.int32, device=DEVICE),
+    )
+
+
 def _make_state(
     device_buffer_locs_rows: list[list[int]],
     device_buffer_tokens_rows: list[list[int]],

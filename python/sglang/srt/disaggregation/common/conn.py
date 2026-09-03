@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -277,6 +278,75 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+        if disaggregation_mode == DisaggregationMode.DECODE:
+            prewarm_addrs = os.environ.get(
+                "SGLANG_DISAGGREGATION_PREFILL_BOOTSTRAP_ADDRS", ""
+            )
+            if prewarm_addrs.strip():
+                threading.Thread(
+                    target=self._prewarm_bootstrap_connections,
+                    args=(prewarm_addrs,),
+                    daemon=True,
+                ).start()
+
+    def _prewarm_bootstrap_connections(self, addrs: str) -> None:
+        """Establish decode->prefill bootstrap connections at engine boot.
+
+        The first ZMQ PUSH message on a fresh connection to a prefill rank
+        port is delivered ~1 s late (first-flow SYN loss -> one TCP RTO),
+        which lands on the first cold request of every new decode->prefill
+        pair (e.g. after a generation handover). Creating the connections
+        (and registering KV args) here moves that cost off the request path.
+        """
+        import time as _time
+
+        from sglang.srt.disaggregation.utils import (
+            KVClassType,
+            TransferBackend,
+            get_kv_class,
+        )
+
+        for addr in [a.strip() for a in addrs.split(",") if a.strip()]:
+            for _attempt in range(120):
+                if self.try_ensure_parallel_info(addr):
+                    break
+                _time.sleep(5)  # prefill engines may still be booting
+            else:
+                logger.warning(
+                    f"[prewarm] could not fetch prefill info from {addr}; skipping"
+                )
+                continue
+            # Gate on the prefill arm actually serving: registering KV args
+            # drives add_remote_agent (UCCL CXI endpoint handshake) on the
+            # prefill, which times out if the prefill agent is not ready yet.
+            for _attempt in range(120):
+                try:
+                    r = requests.get(f"http://{addr}/health", timeout=5)
+                    if r.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                _time.sleep(5)
+            else:
+                logger.warning(f"[prewarm] prefill {addr} never became healthy; skipping")
+                continue
+            _time.sleep(20)  # margin for the prefill NIXL/UCCL agent init
+            for _attempt in range(3):
+                try:
+                    receiver_class = get_kv_class(
+                        TransferBackend(self.server_args.disaggregation_transfer_backend),
+                        KVClassType.RECEIVER,
+                    )
+                    rx = receiver_class(mgr=self, bootstrap_addr=addr, bootstrap_room=None)
+                    rx.init(0)  # fetch bootstrap infos + register KV args (warms ZMQ)
+                    rx.clear()
+                    self.addr_to_rooms_tracker[addr].discard(None)
+                    logger.info(f"[prewarm] bootstrap connections to {addr} established")
+                    break
+                except Exception as e:
+                    logger.warning(f"[prewarm] failed to warm {addr} (attempt {_attempt+1}): {e}")
+                    _time.sleep(30)
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:

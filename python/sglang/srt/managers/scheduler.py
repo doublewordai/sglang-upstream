@@ -208,6 +208,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -239,6 +240,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -295,6 +297,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -323,9 +326,11 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.pool_aging import maybe_log_pool_aging
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -563,6 +568,18 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+
+        # warm-local-prefill (lane warm-local-prefill): decode-rank local
+        # extends of warm-turn appends. Requests whose rid carries the
+        # "WLP-" marker (set by the bench client / future router hook) take
+        # the local extend path when the retention match is good and the new
+        # span is small; everything else keeps the PD path.
+        self.local_extend_queue: List[Req] = []
+        self._wlp_enable_env = envs.SGLANG_WLP_ENABLE.get()
+        self.wlp_max_new_tokens = envs.SGLANG_WLP_MAX_NEW_TOKENS.get()
+        self.wlp_min_match_frac = envs.SGLANG_WLP_MIN_MATCH_FRAC.get()
+        self.wlp_allow_cold = envs.SGLANG_WLP_ALLOW_COLD.get()
+        self.wlp_trace = envs.SGLANG_WLP_TRACE.get()
 
         if (
             get_disagg().disaggregation_mode == "decode"
@@ -926,6 +943,23 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # PP + speculative decoding (prefill arm only, enforced in
+        # check_server_args): the EAGLE draft layer consumes the target's
+        # final hidden states, which exist only on the LAST pipeline stage.
+        # Earlier stages run plain target extends and forward hidden states
+        # as today; they must not build a draft worker, a draft KV pool, or
+        # register draft KV data pointers with the transfer backend.
+        if (
+            self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            assert self.server_args.disaggregation_mode == "prefill", (
+                "PP + speculative decoding is only supported on the prefill arm"
+            )
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding. It builds its draft
         # from this process's own config: what differs for the draft — the
         # target's context length, the draft load format, its attention backend
@@ -1020,8 +1054,10 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
-        # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        # Dispatch the model worker. Under PP+spec (prefill arm) only the
+        # last stage has a draft worker; earlier stages drive the plain
+        # target worker (with pp_proxy_tensors threading).
+        if self.draft_worker is None:
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1189,6 +1225,21 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Adaptive small chunking (--chunked-prefill-size-small): while a
+        # short or warm request waits, chunked prefills advance in small
+        # chunks so the waiting request can join the next prefill step.
+        self.chunked_prefill_size_small = get_schedule().chunked_prefill_size_small
+        if self.chunked_prefill_size_small is not None and (
+            self.chunked_prefill_size is None
+            or self.chunked_prefill_size_small <= 0
+            or self.chunked_prefill_size_small >= self.chunked_prefill_size
+        ):
+            logger.warning(
+                f"--chunked-prefill-size-small={self.chunked_prefill_size_small} "
+                f"is ignored (chunked prefill must be enabled and its size "
+                f"{self.chunked_prefill_size} must be larger); using fixed chunks."
+            )
+            self.chunked_prefill_size_small = None
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1324,10 +1375,25 @@ class Scheduler(
             if self.draft_worker is not None
             else None
         )
+        if (
+            self.hisparse_coordinator is not None
+            and draft_token_to_kv_pool is not None
+        ):
+            # pd/mtp-hisparse: the draft pool is appended to the PD transfer's
+            # layer list but receives at host-row indices; the coordinator
+            # remaps it to logical locs at admission (admit_request_direct).
+            self.hisparse_coordinator.draft_pool = draft_token_to_kv_pool
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.draft_worker is not None
+            and self.spec_algorithm.carries_draft_hidden_states()
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
+            # worker, so a single accessor covers both shapes. Under PP+spec
+            # only the last stage has a draft worker; earlier stages use the
+            # 16-fp32 padding layout and never send the spec aux components
+            # (see KVArgs.aux_send_spec_bufs), so the layout mismatch with the
+            # decode side is never exercised.
             draft_runner = self.draft_worker.draft_worker.draft_runner
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
@@ -1660,9 +1726,29 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
+            "hicache_host_pool_tokens": self._get_hicache_host_pool_tokens(),
         }
 
         return result_dict
+
+    def _get_hicache_host_pool_tokens(self) -> Optional[int]:
+        """Token capacity of this rank's hierarchical-cache host tier, if any.
+
+        A fixed --hicache-size buys a host tier whose token capacity depends
+        on the per-token host bytes of this rank's layer set, on PP-group
+        synchronization and on page alignment, so only this process knows it
+        once the pool is allocated. The DP controller sizes its prefix
+        affinity index from this value; see
+        retained_tokens_per_device_token in data_parallel_controller.
+        """
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        size = getattr(host_pool, "size", None)
+        if size is None:
+            return None
+        try:
+            return int(size)
+        except (TypeError, ValueError):
+            return None
 
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
@@ -1728,6 +1814,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -1772,6 +1859,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -2450,10 +2538,17 @@ class Scheduler(
                 )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
-                # Invalid request for disaggregated mode
+                # Invalid request for disaggregated mode. Exception: WLP-marked
+                # requests take the warm-local extend path on the decode arm —
+                # no bootstrap room, no transfer.
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not (
+                        self.wlp_enable
+                        and recv_req.rid is not None
+                        and recv_req.rid.startswith("WLP-")
+                    )
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -2739,12 +2834,34 @@ class Scheduler(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if cold_trace_enabled():
+                cold_trace(
+                    "pf_bootstrap_add",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    input_len=len(req.origin_input_ids),
+                )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
-            if not is_retracted:
-                req.time_stats.set_decode_prealloc_queue_entry_time()
+            if self._wlp_try_local_extend(req):
+                req.time_stats.set_wait_queue_entry_time()
+            elif req.finished_reason is not None:
+                # WLP-marked but ineligible: already aborted above (the
+                # marker is a decode-only dispatch contract; nothing will
+                # bootstrap it). Do not enqueue it into the PD path.
+                pass
             else:
-                req.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+                if not is_retracted:
+                    req.time_stats.set_decode_prealloc_queue_entry_time()
+                    if cold_trace_enabled():
+                        cold_trace(
+                            "dec_prealloc_add",
+                            rid=req.rid,
+                            room=req.bootstrap_room,
+                            input_len=len(req.origin_input_ids),
+                        )
+                else:
+                    req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -3005,9 +3122,42 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        if self.spec_algorithm.is_none():
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+        else:
+            # Spec-v2: the prefill round already relayed the FULL draft payload
+            # (RelayPayload.from_draft_input in _relay_forward_payload); a
+            # bonus-only re-stash would clobber it -- and crash FutureMap.stash,
+            # which reads payload.topk_p under need_topk. Instead attach a
+            # resolve shell (mirroring PD-decode admission in
+            # eagle_disaggregation.py): future_indices lets the first decode
+            # round's resolve_forward_inputs gather the relayed payload
+            # (topk_p/topk_index/bonus/hidden_states/dsa seed) by
+            # req_pool_indices. Zeros are placeholders; resolve overwrites
+            # every field it gathers.
+            from sglang.srt.model_executor.forward_batch_info import (
+                CaptureHiddenMode,
+            )
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            topk = self.server_args.speculative_eagle_topk or 1
+            spec_info = EagleDraftInput(
+                topk_p=torch.zeros(
+                    (len(reqs), topk), dtype=torch.float32, device=device
+                ),
+                topk_index=torch.zeros(
+                    (len(reqs), topk), dtype=torch.int64, device=device
+                ),
+                bonus_tokens=last_tokens.to(torch.int32),
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            spec_info.future_indices = batch.req_pool_indices
+            spec_info.future_dsa_topk_indices_available = (
+                self.future_map.dsa_topk_indices_buf is not None
+            )
+            batch.spec_info = spec_info
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -3163,6 +3313,179 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    # ------------------------------------------------------------------
+    # warm-local-prefill (lane warm-local-prefill)
+    # ------------------------------------------------------------------
+
+    @property
+    def wlp_enable(self) -> bool:
+        """Warm-local-prefill is active (env on + hisparse + decode arm)."""
+        return (
+            self._wlp_enable_env
+            and self.enable_hisparse
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        )
+
+    def _wlp_try_local_extend(self, req: Req, is_retracted: bool = False) -> bool:
+        """Eligibility gate for the warm-local extend path.
+
+        Requires: the feature on, the "WLP-" rid marker (bench client /
+        router hook), the decode radix retention matching a good page-aligned
+        head of the prompt, and a new span within budget. On success the
+        request is matched + locked and parked in ``local_extend_queue``;
+        the caller skips the PD prealloc queue.
+        """
+        if not self.wlp_enable or is_retracted:
+            return False
+        if not req.rid.startswith("WLP-"):
+            return False
+        if req.finished_reason is not None:
+            return False
+        if not hasattr(self.tree_cache, "retained_prefix_len"):
+            return False
+
+        input_len = len(req.origin_input_ids)
+        req.init_next_round_input(self.tree_cache)
+        prefix_indices = req.prefix_indices
+        # Adopt only the head whose host rows the tree owns (mirror of the
+        # PD path's _match_prefix_and_lock trim).
+        keep = self.tree_cache.retained_prefix_len(prefix_indices)
+        if keep < len(prefix_indices):
+            prefix_indices = prefix_indices[:keep]
+        prefix_len = len(prefix_indices)
+        delta = input_len - prefix_len
+        if prefix_len == 0:
+            cold_ok = self.wlp_allow_cold and req.last_node is None
+            eligible = cold_ok and 0 < delta <= min(
+                self.wlp_max_new_tokens, self.chunked_prefill_size
+            )
+        else:
+            eligible = (
+                req.last_node is not None
+                and prefix_len >= self.wlp_min_match_frac * input_len
+                and 0 < delta <= min(self.wlp_max_new_tokens, self.chunked_prefill_size)
+            )
+        if not eligible:
+            if self.wlp_trace:
+                logger.info(
+                    "WLP reject rid=%s input=%d prefix=%d delta=%d",
+                    req.rid,
+                    input_len,
+                    prefix_len,
+                    delta,
+                )
+            # The WLP- marker is the router's decode-only dispatch contract:
+            # no prefill arm will ever bootstrap this request. Fail loudly
+            # instead of parking it in the PD prealloc queue forever.
+            prepare_abort(req, "WLP: request not eligible for local extend")
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid), req
+            )
+            return False
+
+        # Hold the admission lock for the duration of the extend; released by
+        # the normal finish/insert path (cache_finished_req dec_lock_ref),
+        # exactly like the PD path's prealloc lock.
+        if req.last_node is not None:
+            self.tree_cache.inc_lock_ref(req.last_node)
+        req.prefix_indices = prefix_indices
+        req.cache_protected_len = prefix_len
+        req.wlp_adopted_len = prefix_len
+        self.local_extend_queue.append(req)
+        if self.wlp_trace:
+            logger.info(
+                "WLP accept rid=%s input=%d prefix=%d delta=%d",
+                req.rid,
+                input_len,
+                prefix_len,
+                delta,
+            )
+        return True
+
+    def _wlp_build_extend_batch(self) -> Optional[ScheduleBatch]:
+        """Form a single-request local extend batch (one chunk, eager).
+
+        Returns None (request stays queued, retried next tick) when the
+        hisparse device pool cannot fit the delta + swap-in scratch + the
+        post-extend decode buffer, or the logical pool / req slots are full.
+        """
+        # Drop aborted entries at the head.
+        while self.local_extend_queue:
+            if self.local_extend_queue[0].finished_reason is not None:
+                self._wlp_release_queued(self.local_extend_queue.pop(0))
+            else:
+                break
+        if not self.local_extend_queue:
+            return None
+        req = self.local_extend_queue[0]
+
+        prefix_len = len(req.prefix_indices)
+        delta = len(req.origin_input_ids) - prefix_len
+        page = self.page_size
+        need_delta = ((delta + page - 1) // page + 1) * page
+        scratch = min(
+            prefix_len, self.hisparse_coordinator.top_k + 2 * delta + page
+        )
+        buffer = self.hisparse_coordinator.padded_buffer_size
+        avail = (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+        if avail < need_delta + scratch + buffer:
+            return None
+        if self.token_to_kv_pool_allocator.logical_available_size() < need_delta:
+            return None
+        if self.req_to_token_pool.available_size() <= 0:
+            return None
+        if len(self.running_batch.reqs) >= self.max_running_requests:
+            return None
+
+        req.set_extend_range(prefix_len, len(req.origin_input_ids))
+        batch = ScheduleBatch.init_new(
+            [req],
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        batch.prepare_for_extend()
+        # Seed the req's host-row table with the tree's retained rows for the
+        # adopted prefix (mirror of the PD path's adopt in _pre_alloc), now
+        # that req_pool_idx exists.
+        self.hisparse_coordinator.adopt_prefix(req, req.prefix_indices)
+        # Reserve the union swap-in scratch (freed at staging admission).
+        self.hisparse_coordinator.register_extend_scratch(req.req_pool_idx, scratch)
+        self.local_extend_queue.pop(0)
+        # Record prefill stats for logging after forward (normally built by
+        # PrefillAdder; minimal equivalent for the single-req local extend).
+        batch.prefill_stats = PrefillStats(
+            log_input_tokens=delta,
+            log_hit_tokens=prefix_len,
+            log_device_hit_tokens=prefix_len,
+            new_token_ratio=self.new_token_ratio_tracker.current,
+            num_running_reqs=QueueCount.from_reqs(
+                self.running_batch.reqs, self.enable_priority_scheduling
+            ),
+            num_new_seqs=1,
+        )
+        req.time_stats.set_forward_entry_time()
+        if self.wlp_trace:
+            logger.info(
+                "WLP extend start rid=%s prefix=%d delta=%d scratch=%d",
+                req.rid,
+                prefix_len,
+                delta,
+                scratch,
+            )
+        return batch
+
+    def _wlp_release_queued(self, req: Req) -> None:
+        """Release a queued local-extend request that never ran (abort)."""
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
+            req.last_node = None
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3189,6 +3512,38 @@ class Scheduler(
                 )
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _adaptive_chunk_small_waiting(self) -> bool:
+        """True if a short or warm request is waiting in the local queue.
+
+        Short: at most 16384 new (uncached) tokens. Warm: prefix cache hit of
+        at least 90%. Long prompts need a radix match to classify; the result
+        is cached on the request and refreshed every 64 scheduler steps (the
+        matched prefix can grow while the request waits).
+        """
+        short_new_tokens = 16384
+        warm_prefix_ratio = 0.9
+        reclassify_interval = 64
+        for req in self.waiting_queue:
+            fill_len = len(req.origin_input_ids) + len(req.output_ids)
+            if fill_len <= short_new_tokens:
+                return True
+            state = getattr(req, "_adaptive_chunk_prefix_state", None)
+            if (
+                state is None
+                or self.forward_ct - state[0] >= reclassify_interval
+            ):
+                match_prefix_for_req(self.tree_cache, req)
+                hit = int(req.num_matched_prefix_tokens)
+                req._adaptive_chunk_prefix_state = (self.forward_ct, hit)
+            else:
+                hit = state[1]
+            if (
+                fill_len - hit <= short_new_tokens
+                or hit >= warm_prefix_ratio * fill_len
+            ):
+                return True
+        return False
 
     def _get_new_batch_prefill_raw(
         self,
@@ -3255,6 +3610,26 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # Adaptive small chunking: while a short/warm request waits, cap how
+        # far any chunked prefill advances this step; the remaining chunk
+        # budget lets the waiting request join this step's prefill batch.
+        chunked_req_chunk_cap = None
+        if self.chunked_prefill_size_small is not None:
+            small_waiting = self._adaptive_chunk_small_waiting()
+            if small_waiting:
+                chunked_req_chunk_cap = min(
+                    self.chunked_prefill_size_small, chunked_prefill_size
+                )
+            logger.debug(
+                "[adaptive-chunk] small_waiting=%s chunk_budget=%d "
+                "chunked_req_cap=%s waiting_queue=%d chunked_req_inflight=%s",
+                small_waiting,
+                chunked_prefill_size,
+                chunked_req_chunk_cap,
+                len(self.waiting_queue),
+                self.chunked_req is not None,
+            )
+
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
         attn_backend = self.tp_worker.model_runner.attn_backend
@@ -3280,6 +3655,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            chunked_req_chunk_cap=chunked_req_chunk_cap,
         )
 
         if self.chunked_req is not None:
@@ -3394,6 +3770,9 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled() and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in can_run_list:
+                cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -3557,8 +3936,29 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
-            for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and get_disagg().disaggregation_decode_retraction_backup
+                == "rebootstrap"
+            ):
+                # True retraction: the retracted KV was freed outright (no
+                # backup), so the request re-enters through the PD
+                # rebootstrap -- the original prefill worker recomputes the
+                # prefix KV and transfers it back over a fresh bootstrap, and
+                # the already-emitted boundary token is replayed on the decode
+                # side. Mirrors the retract-mode weight-update path
+                # (pause_generation), minus the pause/hold: the engine keeps
+                # serving the surviving requests while this one waits in the
+                # preallocation queue.
+                for req in retracted_reqs:
+                    if req.output_ids:
+                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    req.pd_rebootstrap_in_progress = True
+                    req.time_stats.set_retract_time()
+                    self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+            else:
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -3764,12 +4164,16 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
-            elif not batch.spec_algorithm.is_none():
+            elif not batch.spec_algorithm.is_none() and self.draft_worker is not None:
                 # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
+                # future_map relay / on_publish). PP stages without a draft
+                # worker (all but the last, under PP+spec) take the plain
+                # path below so pp_proxy_tensors keep flowing between stages.
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3787,11 +4191,9 @@ class Scheduler(
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                # Plain path: non-spec everywhere, and PP+spec stages without
+                # a draft worker. pp_proxy_tensors is None when not PP.
+                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
@@ -4590,6 +4992,20 @@ class Scheduler(
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+
+            # Abort warm-local-prefill requests waiting in the local extend
+            # queue (they hold a radix admission lock but no other resource).
+            if self.local_extend_queue:
+                remaining_local = []
+                for req in self.local_extend_queue:
+                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                        self._wlp_release_queued(req)
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            AbortReq(rid=req.rid), req
+                        )
+                    else:
+                        remaining_local.append(req)
+                self.local_extend_queue = remaining_local
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:

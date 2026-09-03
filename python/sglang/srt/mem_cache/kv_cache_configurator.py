@@ -93,8 +93,12 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
-    if is_draft_worker or memory_config.enable_hierarchical_cache:
+    if is_draft_worker:
         return False
+    if memory_config.enable_hierarchical_cache:
+        # Opt-in: elide shared-index layers on the hicache (prefill) arm too.
+        # The host DSAIndexerPoolHost compacts to non-skip layers to match.
+        return envs.SGLANG_DSA_ELIDE_PREFILL_HICACHE.get()
     if envs.SGLANG_DSA_ELIDE_SHARED_INDEX_K.get():
         return True
     return (
@@ -296,6 +300,12 @@ class KVCacheConfigurator:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        try:
+            from sglang.srt.utils.memory_snapshot import memsnap_phase
+
+            memsnap_phase("after_pools")
+        except Exception:
+            pass
 
         return KVCacheConfigResult(
             max_total_num_tokens=sizes.max_total_num_tokens,

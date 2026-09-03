@@ -36,6 +36,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -496,12 +497,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
+        kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            if hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        if self.draft_token_to_kv_pool is not None:
+            # Draft (NextN) layers sit at global ids [num_hidden_layers, ...):
+            # register them so PP prefill stages pair their subset of layers
+            # (target stage layers + the draft layer on the LAST stage) by
+            # layer id instead of positionally.
+            draft_num = len(draft_kv_data_ptrs)
+            num_hidden_layers = self.scheduler.model_config.num_hidden_layers
+            kv_layer_ids += list(
+                range(num_hidden_layers, num_hidden_layers + draft_num)
+            )
+        kv_args.kv_layer_ids = kv_layer_ids
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -838,6 +849,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
+                cold_trace(
+                    "dec_handshake_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
@@ -1161,6 +1177,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 continue
 
+            _pa_t0 = time.perf_counter()
             try:
                 dst_kv_indices = self._pre_alloc(
                     decode_req.req,
@@ -1178,6 +1195,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 self._note_host_pool_wait(0)
                 continue
+            if cold_trace_enabled():
+                cold_trace(
+                    "dec_prealloc_alloc",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                    dt_ms=(time.perf_counter() - _pa_t0) * 1000,
+                    input_len=origin_input_len,
+                    prefix_len=prefix_len,
+                    total_prefix_len=total_prefix_len,
+                )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1382,6 +1409,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            cold_trace(
+                "dec_metadata_sent",
+                rid=decode_req.req.rid,
+                room=decode_req.req.bootstrap_room,
+                dst_tokens=len(kv_indices),
+                dst_pages=len(page_indices),
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2315,6 +2349,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                cold_trace(
+                    "dec_kv_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
@@ -2496,6 +2535,36 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
+        # warm-local-prefill: transition staged local extends into decode
+        # (mirror of the normal scheduler's hisparse block in
+        # get_next_batch_to_run), then run at most one local extend as its
+        # own eager step. The extend step replaces this iteration's decode
+        # step (separate-step design: decode keeps its CUDA graphs; the
+        # co-resident decodes stall for the extend chunk's duration).
+        if self.enable_hisparse:
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if len(ready_reqs) > 0:
+                new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                # The PD-prebuilt running batch carries multimodal_inputs as a
+                # per-req list; _build_hisparse_decode_batch leaves it None and
+                # merge_batch concatenates the two. Align the shapes.
+                if new_batch.multimodal_inputs is None:
+                    new_batch.multimodal_inputs = [None] * len(ready_reqs)
+                if running_batch.is_empty():
+                    running_batch = new_batch
+                else:
+                    running_batch.merge_batch(new_batch)
+                running_batch.hisparse_coordinator = self.hisparse_coordinator
+                running_batch.batch_is_full = False
+
+            if self.wlp_enable and self.chunked_req is None:
+                extend_batch = self._wlp_build_extend_batch()
+                if extend_batch is not None:
+                    set_schedule_time_batch(extend_batch)
+                    return NextBatchPlan(
+                        batch_to_run=extend_batch, running_batch=running_batch
+                    )
+
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None
@@ -2559,6 +2628,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled():
+            for req in can_run_list:
+                cold_trace("dec_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
@@ -2607,4 +2679,52 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
+                    if (
+                        envs.SGLANG_MTP_DEBUG.get()
+                        and not getattr(self, "_mtp_dbg_draft_logged", False)
+                    ):
+                        self._mtp_dbg_draft_logged = True
+                        try:
+                            self._mtp_debug_draft_probe(req)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("MTP_DEBUG draft probe failed: %s", e)
             self.waiting_queue.extend(transferred_reqs)
+
+    def _mtp_debug_draft_probe(self: Scheduler, req: Req) -> None:
+        """mtp-debug lane: where did the draft layer's prompt KV land?
+
+        Under hisparse the PD transfer writes every layer (target latent AND
+        draft) at the decode arm's *host row* indices; the draft model reads
+        its pool at *logical* locs. Log both slices' magnitudes to confirm.
+        """
+        coord = self.hisparse_coordinator
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
+        )
+        if draft_pool is None:
+            logger.warning("MTP_DEBUG draft probe: no draft pool")
+            return
+        idx = req.req_pool_idx
+        n = min(int(coord.req_to_host_pool_allocated_len[idx].item()), 8)
+        if n == 0:
+            logger.warning("MTP_DEBUG draft probe: no host rows allocated")
+            return
+        host_rows = coord.req_to_host_pool[idx, :n].to(torch.int64)
+        logical = self.req_to_token_pool.req_to_token[idx, :n].to(torch.int64)
+        kbuf = draft_pool.get_key_buffer(0)
+        host_vals = kbuf[host_rows]
+        logical_vals = kbuf[logical]
+        logger.warning(
+            "MTP_DEBUG draft probe rid=%s n=%d host_rows=%s logical=%s "
+            "| |draft[host]| sum=%.4f | |draft[logical]| sum=%.4f "
+            "(same rows: %s)",
+            req.rid,
+            n,
+            host_rows.tolist(),
+            logical.tolist(),
+            host_vals.float().abs().sum().item(),
+            logical_vals.float().abs().sum().item(),
+            bool(torch.equal(host_rows, logical)),
+        )

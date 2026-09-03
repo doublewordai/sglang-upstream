@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ClearPrefixAffinityIndexReq,
     ElasticScaleUpdateReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -203,8 +204,10 @@ class DataParallelController:
 
         # 0 = size the index to the KV capacity, known once the workers report
         # max_total_num_tokens (_size_prefix_index_to_kv_capacity). With the
-        # hierarchical cache the host tier (hicache_ratio x device) is what a
-        # rank retains, as every device page is written through to it.
+        # hierarchical cache the host tier (hicache_ratio x device, or the
+        # token capacity bought by a fixed hicache_size GB, reported by the
+        # scheduler) is what a rank retains, as every device page is written
+        # through to it.
         self.prefix_index_blocks_arg = (
             server_args.dp_prefix_affinity_max_blocks_per_rank
         )
@@ -217,6 +220,9 @@ class DataParallelController:
             max_blocks_per_rank=self.prefix_index_blocks_arg or (1 << 15),
         )
         self.prefix_affinity_threshold = server_args.dp_prefix_affinity_threshold
+        self.prefix_affinity_abs_floor_tokens = (
+            server_args.dp_prefix_affinity_abs_floor_tokens
+        )
         self.prefix_affinity_max_imbalance = (
             server_args.dp_prefix_affinity_max_imbalance
         )
@@ -397,6 +403,10 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ClearPrefixAffinityIndexReq,
+                    self.handle_clear_prefix_affinity_index,
+                ),
                 (
                     ElasticScaleUpdateReq,
                     lambda msg: self.add_elastic_workers(
@@ -778,6 +788,11 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        # Token capacity of the hierarchical-cache host tier this rank
+        # allocated (None when there is none); see _size_prefix_index_to_kv_capacity.
+        self.hicache_host_pool_tokens = scheduler_info[0].get(
+            "hicache_host_pool_tokens"
+        )
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
@@ -789,6 +804,27 @@ class DataParallelController:
         retained = int(
             self.max_total_num_tokens * self.retained_tokens_per_device_token
         )
+        if (
+            self.server_args.enable_hierarchical_cache
+            and self.server_args.hicache_size > 0
+        ):
+            # A fixed --hicache-size sizes the host tier in bytes; the token
+            # capacity it buys depends on the per-token host bytes of this
+            # rank's layer set, PP-group synchronization and page alignment,
+            # none of which are known until the scheduler allocates the pool.
+            # It therefore reports the capacity in the init handshake, and the
+            # index is sized to the host tier actually allocated instead of
+            # the device pool alone (retained_tokens_per_device_token cannot
+            # express this as a ratio).
+            if self.hicache_host_pool_tokens:
+                retained = max(retained, int(self.hicache_host_pool_tokens))
+            else:
+                logger.warning(
+                    "--hicache-size %s GB is set but the scheduler did not "
+                    "report a hierarchical host pool token capacity; sizing "
+                    "the prefix-affinity index to the device pool only.",
+                    self.server_args.hicache_size,
+                )
         blocks = max(1, retained // self.prefix_index.block_tokens)
         self.prefix_index.set_max_blocks_per_rank(blocks)
 
@@ -884,7 +920,28 @@ class DataParallelController:
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
         if target < self.dp_budget.dp_size:
             self.dp_budget.total_requests[target] += 1
-        self.prefix_index.record(rank=target, keys=keys)
+        # A warmup/health request is served normally but must not enter the
+        # index: its KV is evicted from the radix cache within minutes of boot,
+        # while an index entry never ages on an idle rank. Recording one
+        # 262k-token warmup inflated one decode rank's footprint_tokens for a
+        # whole production day and starved it of all traffic (dp1 in gen0/gen1).
+        if not getattr(req, "is_warmup", False):
+            self.prefix_index.record(rank=target, keys=keys)
+
+    def handle_clear_prefix_affinity_index(
+        self, _req: ClearPrefixAffinityIndexReq
+    ) -> None:
+        """Drop every index entry, e.g. when the server warmup completes so
+        boot-time warmup traffic cannot pin the per-rank footprints used for
+        new-session placement. Requests can also opt out individually with
+        is_warmup=True (GenerateReqInput)."""
+        dropped = self.prefix_index.clear()
+        logger.info(
+            "prefix_affinity index cleared after warmup (dropped %d entries; "
+            "footprints now %s)",
+            dropped,
+            [self.prefix_index.footprint_tokens(r) for r in self._active_workers],
+        )
 
     def _rank_load(self, rank: int) -> int:
         """Ranks activated beyond the launch dp_size have no budget slot yet
@@ -915,10 +972,26 @@ class DataParallelController:
         """The least-loaded rank among those sharing the longest prefix match,
         or None when the match is too short or that rank is too far ahead of
         the least-loaded one (the same rule sgl-router's cache-aware policy
-        applies across workers)."""
+        applies across workers).
+
+        ""Too short" is relative (dp_prefix_affinity_threshold fraction of the
+        prompt) OR absolute (dp_prefix_affinity_abs_floor_tokens): a turn that
+        appends a large new span — a tool result or a paste — drops its match
+        fraction below the threshold while still matching tens of thousands of
+        cached tokens. Bouncing such a turn recomputes the cached span on both
+        PD arms and fragments the session across ranks, so an absolutely large
+        match stays affine; the imbalance guard below still bounds the skew."""
         ranks, matched_tokens = self.prefix_index.longest_match(keys)
         ranks = [r for r in ranks if r in self._active_workers]
-        if not ranks or matched_tokens < self.prefix_affinity_threshold * input_len:
+        if not ranks:
+            return None
+        if (
+            matched_tokens < self.prefix_affinity_threshold * input_len
+            and (
+                self.prefix_affinity_abs_floor_tokens <= 0
+                or matched_tokens < self.prefix_affinity_abs_floor_tokens
+            )
+        ):
             return None
         target = self._least_loaded_rank(ranks)
         least = self._least_loaded_rank(self._active_workers)
@@ -943,7 +1016,15 @@ def retained_tokens_per_device_token(server_args: ServerArgs) -> float:
     its KV in a host pool of host_to_device_ratio x the device pool and its
     radix cache retains into that pool; a hierarchical cache writes every
     device page through to a host tier of hicache_ratio x the device pool.
-    Without either, the device pool is all a rank retains."""
+    Without either, the device pool is all a rank retains.
+
+    A hierarchical cache sized by --hicache-size (bytes) cannot be reduced to
+    a ratio here: the host tier's token capacity depends on the per-token
+    host bytes of the rank's layer set, on PP-group synchronization and on
+    page alignment, all known only to the scheduler once its pools are
+    allocated. The scheduler reports that capacity in its init handshake and
+    _size_prefix_index_to_kv_capacity sizes the index from it; this
+    function's hierarchical branch covers only ratio-based sizing."""
     if server_args.enable_hisparse:
         return max(1.0, float(parse_hisparse_config(server_args).host_to_device_ratio))
     if server_args.enable_hierarchical_cache and server_args.hicache_size == 0:
