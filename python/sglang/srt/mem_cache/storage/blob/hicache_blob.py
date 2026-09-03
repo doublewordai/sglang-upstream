@@ -783,6 +783,7 @@ class HiCacheBlob(HiCacheStorage):
         buf = self._aligned_buffer(total)
         mv = memoryview(buf)
         tmp = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             header = self._pack_header(num_pages, geos, poolset, page_keys)
             mv[:HEADER_SIZE] = bytes(header)
@@ -816,7 +817,7 @@ class HiCacheBlob(HiCacheStorage):
                 os.remove(tmp)
             except OSError:
                 pass
-            return fail, 0
+            return "fail", 0
 
     def _write_transfers(
         self, transfers: List[PoolTransfer], extra_info
