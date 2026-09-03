@@ -645,6 +645,15 @@ class Envs:
     # is b x 960 threads (<= 5 SMs), so SM isolation buys nothing there while
     # the fork/join adds latency; on by default would change step timing.
     SGLANG_HISPARSE_SWAPIN_GREEN_CTX = EnvBool(False)
+    # Defer the decode hisparse map/eager-backup chain (map_last_loc_to_buffer)
+    # from prepare_for_decode to the forward launch (run_batch), i.e. past the
+    # per-step DP-attention metadata all_gather. A rank still running that chain
+    # is a straggler entering the collective; every other rank then waits in
+    # c10d::Work::wait with its GPU idle (the synchronized 8-12 ms decode
+    # stalls; see lanes hiccup/hiccup-2). Default off.
+    SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
+    # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
+    SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.

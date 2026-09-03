@@ -4045,6 +4045,11 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # Flush the deferred hisparse map/backup chain (if the deferral flag
+        # stashed one in prepare_for_decode) BEFORE any forward work: this is
+        # past the per-step DP-attention all_gather but ahead of every reader
+        # of the hisparse mappings / host rows (swap-in).
+        batch.flush_deferred_hisparse_map()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()

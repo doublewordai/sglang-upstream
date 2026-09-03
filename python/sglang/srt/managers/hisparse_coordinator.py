@@ -292,6 +292,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._backup_log_fh = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -353,7 +354,11 @@ class HiSparseCoordinator:
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
-        self._skip_first_backup = [False] * max_num_req_slots
+        # CPU bool tensor (not a list) so the decode-step clear/check is one
+        # gather/scatter instead of a per-request Python loop (hiccup-3).
+        self._skip_first_backup = torch.zeros(
+            max_num_req_slots, dtype=torch.bool
+        )
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -1247,23 +1252,27 @@ class HiSparseCoordinator:
             self._fast_backup_previous_token(seq_lens, req_pool_indices)
             return
 
-        # Build the list of batch positions that need a host backup.
+        # Build the mask of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio == 0:
-                backup_indices.append(i)
-
-        if not backup_indices:
+        # Vectorised (hiccup-3): one CPU-tensor pass instead of a per-request
+        # Python loop; this runs on the scheduler critical path before the
+        # per-step DP all_gather, where the loop cost 1.4-2.1 ms under load.
+        # Same set, same order (ascending batch position), same flag clears.
+        skip = self._skip_first_backup[req_pool_indices_cpu]
+        self._skip_first_backup[req_pool_indices_cpu] = False
+        backup_mask = ((seq_lens_cpu - 1) % self.compress_ratio == 0) & ~skip
+        if not bool(backup_mask.any()):
             return
 
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
+        backup_indices_cpu = torch.where(backup_mask)[0]
+        # One ASYNC pinned H2D for the batch-position indices. The previous
+        # torch.tensor(..., device=self.device) was a blocking pageable H2D:
+        # under the overlap scheduler it cudaStreamSynchronize'd the schedule
+        # stream against the previous step's still-running forward (measured
+        # 0.5-2.9 ms/step on the rig; the per-step stall inside prepare_for_decode).
+        backup_indices_gpu = (
+            backup_indices_cpu.pin_memory().to(self.device, non_blocking=True)
         )
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
@@ -1279,20 +1288,25 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        host_locs_list = []
-        for i in backup_indices:
-            req_idx = int(req_pool_indices_cpu[i])
-            start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
-                1,
-            )
-            host_locs_list.append(host_locs)
-        host_locs = torch.cat(host_locs_list)
+        backup_req_indices_cpu = req_pool_indices_cpu[backup_indices_cpu]
+        start_pos_cpu = (seq_lens_cpu[backup_indices_cpu] - 1) // (
+            self.compress_ratio
+        ) - 1
+        host_locs = self.mem_pool_host.alloc_paged_token_slots_batch(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            backup_req_indices_cpu,
+            start_pos_cpu,
+            1,
+        )
 
+        self._backup_log(
+            len(seq_lens_cpu),
+            backup_indices_cpu.tolist(),
+            host_locs,
+            device_locs,
+            req_pool_indices_cpu,
+        )
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
@@ -1315,6 +1329,30 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+
+    def _backup_log(self, bs, backup_indices, host_locs, device_locs, req_pool_indices_cpu):
+        """Measurement-only (hiccup-3): log every eager-backup call's rows."""
+        import json as _json
+
+        path = envs.SGLANG_HISPARSE_BACKUP_LOG.get()
+        if not path:
+            return
+        if self._backup_log_fh is None:
+            self._backup_log_fh = open(path, "a", buffering=1)
+        self._backup_log_fh.write(
+            _json.dumps(
+                {
+                    "bs": int(bs),
+                    "idx": [int(i) for i in backup_indices],
+                    "host": host_locs.tolist(),
+                    "dev": device_locs.tolist(),
+                    "alloc": self.req_to_host_pool_allocated_len[
+                        req_pool_indices_cpu
+                    ].tolist(),
+                }
+            )
+            + "\n"
+        )
 
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
