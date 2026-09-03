@@ -285,6 +285,10 @@ class HiSparseCoordinator:
         self._d2h_pinned = None
         self._verify_sample_done = None
         self.ack_staging_queue: List[HiSparseAct] = []
+        # warm-local-prefill: req_pool_idx -> device slot tensor for the
+        # extend union swap-in (registered at batch build, freed at staging).
+        self._extend_scratch: dict = {}
+        self.wlp_trace = envs.SGLANG_WLP_TRACE.get()
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -451,11 +455,20 @@ class HiSparseCoordinator:
             ),
         )
 
-    def admit_request_into_staging(self, req: Req) -> None:
+    def admit_request_into_staging(self, req: Req, adopted_len: int = 0) -> None:
+        """Back up freshly computed KV to the host pool, then stage the request.
+
+        With ``adopted_len > 0`` (warm-local-prefill path), the first
+        ``adopted_len`` tokens are a retained prefix whose host rows already
+        exist (adopted via :meth:`adopt_prefix`): only the delta
+        ``[adopted_len, extend_range.end)`` gets new host pages and a device->
+        host backup.
+        """
         req.hisparse_staging = True
 
+        prefill_start = adopted_len
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
+            req.req_pool_idx, prefill_start : req.extend_range.end
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -463,13 +476,13 @@ class HiSparseCoordinator:
             )
         )
 
-        prefill_len = len(device_indices)
+        prefill_len = adopted_len + len(device_indices)
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
             req.req_pool_idx,
-            0,
-            prefill_len,
+            self.host_token_len(prefill_start),
+            self.host_token_len(prefill_len) - self.host_token_len(prefill_start),
         )
 
         start_event = device_module.Event()
@@ -488,6 +501,11 @@ class HiSparseCoordinator:
                 host_indices.record_stream(self.write_staging_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
+
+        # The extend scratch (union swap-in slots) is no longer needed: the
+        # forward pass that consumed it has completed (this runs from batch
+        # result processing, after the forward's copy_done sync).
+        self.free_extend_scratch(req.req_pool_idx)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
@@ -743,11 +761,40 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
+            # warm-local-prefill: alloc_device_buffer assumes the staging
+            # path's contiguous-from-zero layout; correct the content map for
+            # an adopted prefix (slot j holds token prefix_len + j).
+            adopted = int(getattr(req, "wlp_adopted_len", 0) or 0)
+            if adopted > 0:
+                self._fixup_wlp_buffer_tokens(req, adopted)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
+
+    def _fixup_wlp_buffer_tokens(self, req: Req, prefix_len: int) -> None:
+        """Correct the device-buffer content map after a warm-local extend.
+
+        ``alloc_device_buffer`` seeds ``req_device_buffer_tokens`` with
+        ``arange`` ("slot j holds token j"), which is only true for the
+        staging path where the whole prompt was just prefilled from zero.
+        After a warm-local extend the buffer holds the delta's device slots:
+        slot j holds token ``prefix_len + j`` for ``j < min(delta, alloc)``;
+        any remaining slots are empty.
+        """
+        idx = req.req_pool_idx
+        allocated_len = int(req.kv.kv_allocated_len)
+        delta = allocated_len - prefix_len
+        alloc_size = int(self.req_device_buffer_size[idx])
+        n = max(0, min(int(delta), alloc_size))
+        if n > 0:
+            toks = self._device_buffer_arange_i32[:n] + prefix_len
+            self.req_device_buffer_tokens[:, idx, :n] = toks
+        if n < self.device_buffer_size:
+            self.req_device_buffer_tokens[
+                :, idx, n : self.device_buffer_size
+            ] = -1
 
     def map_last_loc_to_buffer(
         self,
@@ -1367,6 +1414,133 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
+    # ------------------------------------------------------------------
+    # warm-local-prefill: extend-time union swap-in (host pages -> scratch)
+    # ------------------------------------------------------------------
+
+    def register_extend_scratch(self, req_pool_idx: int, max_slots: int) -> torch.Tensor:
+        """Reserve hisparse device slots for one warm-local extend's union
+        swap-in. Freed by :meth:`free_extend_scratch` at staging admission
+        (or abort). Returns the slot tensor."""
+        assert req_pool_idx not in self._extend_scratch, (
+            f"extend scratch already registered for req {req_pool_idx}"
+        )
+        page = self.page_size
+        need = (int(max_slots) + page - 1) // page * page
+        locs = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(need)
+        if locs is None:
+            raise RuntimeError(
+                f"WLP: extend scratch alloc failed (need {need} device slots)"
+            )
+        self._extend_scratch[req_pool_idx] = locs
+        return locs
+
+    def free_extend_scratch(self, req_pool_idx: int) -> None:
+        locs = self._extend_scratch.pop(req_pool_idx, None)
+        if locs is not None and locs.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(locs)
+
+    def _grow_extend_scratch(self, req_pool_idx: int, min_slots: int) -> torch.Tensor:
+        """Grow the registered scratch to at least ``min_slots`` slots."""
+        locs = self._extend_scratch[req_pool_idx]
+        have = int(locs.numel())
+        if have >= min_slots:
+            return locs
+        page = self.page_size
+        need = (min_slots - have + page - 1) // page * page
+        extra = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(need)
+        if extra is None:
+            raise RuntimeError(
+                f"WLP: extend scratch grow failed (have {have}, need {min_slots})"
+            )
+        locs = torch.cat([locs, extra])
+        self._extend_scratch[req_pool_idx] = locs
+        return locs
+
+    def extend_swap_in_page_table(
+        self,
+        req_pool_indices: torch.Tensor,
+        topk_positions: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        translated: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Build the extend attention page table when the matched prefix is
+        host-resident (retained).
+
+        ``topk_positions``: (num_queries, top_k) per-query selected positions
+        (-1 padded). ``translated``: the PAGED-transform page table (logical
+        slot per selection). For selections in the retained prefix
+        (position < prefix_len) the KV lives in host pages: the union of those
+        positions across the chunk's queries is loaded into the extend
+        scratch for this layer and the table points at the scratch slots;
+        delta selections translate through the device mapping as usual.
+        Selection order per query is preserved, so the attention kernel sees
+        the same index sequence the prefill arm's device-resident path sees.
+        """
+        num_reqs = int(req_pool_indices.numel())
+        if num_reqs != 1:
+            raise NotImplementedError(
+                "warm-local-prefill extend supports single-request batches "
+                f"(got {num_reqs})"
+            )
+        r = int(req_pool_indices[0].item())
+        prefix_len = int(prefix_lens[0].item())
+
+        pos = topk_positions.to(torch.int64)
+        valid = pos >= 0
+        pos_c = pos.clamp(min=0)
+        is_prefix = pos_c < prefix_len
+
+        flat = pos_c[valid & is_prefix].reshape(-1)
+        if flat.numel() > 0:
+            union = torch.unique(flat)  # sorted ascending
+            u = int(union.numel())
+            if self.wlp_trace and layer_id == 0:
+                mb = u * self.item_size_bytes / 1e6
+                logger.info(
+                    "WLP swapin rid_layer=0 prefix=%d union=%d c2c_mb=%.2f",
+                    prefix_len,
+                    u,
+                    mb,
+                )
+            locs = self._extend_scratch.get(r)
+            if locs is None or int(locs.numel()) < u:
+                locs = self._grow_extend_scratch(r, max(u, 1))
+            scratch = locs[:u]
+            host_rows = self.req_to_host_pool[r, union]
+            if not bool((host_rows >= 0).all()):
+                missing = union[(host_rows < 0).nonzero(as_tuple=True)[0][:8]]
+                raise AssertionError(
+                    f"WLP: req {r} layer {layer_id}: no host rows for prefix "
+                    f"positions {missing.tolist()} (prefix_len={prefix_len})"
+                )
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_rows,
+                scratch,
+                layer_id,
+                io_backend="kernel",
+            )
+            idx = torch.searchsorted(union, pos_c.reshape(-1)).reshape(pos.shape)
+            # searchsorted returns len(union) for positions past the union
+            # (delta selections); clamp before the gather -- those entries are
+            # discarded by the where-mask below but the gather still evaluates.
+            prefix_locs = scratch[idx.clamp(max=u - 1)]
+        else:
+            prefix_locs = None
+
+        trans_c = translated.to(torch.int64).clamp(min=0)
+        device_locs = self.mem_pool_device.translate_loc_to_hisparse_device(
+            trans_c
+        )
+        if prefix_locs is not None:
+            table = torch.where(valid & is_prefix, prefix_locs, device_locs)
+        else:
+            table = device_locs
+        table = torch.where(valid, table, -1)
+        return table.to(torch.int32)
+
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.
 
@@ -1381,21 +1555,44 @@ class HiSparseCoordinator:
         self.write_staging_stream.synchronize()
 
         prefill_len = req.extend_range.end
+        adopted = int(getattr(req, "wlp_adopted_len", 0) or 0)
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.req_pool_idx, adopted:prefill_len
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
-        # Free host memory that was allocated during admit_request_into_staging
-        host_indices = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
-        )
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        # Free host memory that was allocated during admit_request_into_staging.
+        # With an adopted (retained) prefix, rows [0, adopted) belong to the
+        # radix tree and must survive the abort.
+        if adopted > 0:
+            host_len = self.host_token_len(
+                int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
+            )
+            host_indices = self.req_to_host_pool[
+                req.req_pool_idx, self.host_token_len(adopted) : host_len
+            ]
+            host_indices = host_indices[host_indices >= 0]
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+            self.req_to_host_pool[
+                req.req_pool_idx, self.host_token_len(adopted) :
+            ] = -1
+            self.req_to_host_pool_allocated_len[req.req_pool_idx] = (
+                self.host_token_len(adopted)
+            )
+        else:
+            host_indices = self.mem_pool_host.allocated_host_indices(
+                self.req_to_host_pool,
+                req.req_pool_idx,
+                self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            )
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+            self.req_to_host_pool[req.req_pool_idx, :] = -1
+            self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        # Any extend scratch still registered for this req goes back to the
+        # device pool (the staging backup never consumed it).
+        self.free_extend_scratch(req.req_pool_idx)
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 

@@ -2384,6 +2384,10 @@ class DeepseekSparseAttnBackend(
                 # this step resolves via num_newest=p+1 (1:1 slots below
                 # device_buffer_size, reserved page above). Results are
                 # interleaved back to row order.
+                # (merge note, lane/warm-local-prefill: the target-verify
+                # check comes FIRST — a verify batch on a retained session
+                # must keep the per-position verify table, not the WLP
+                # extend union table; WLP extends are plain EXTEND mode.)
                 assert topk_indices is not None, (
                     "hisparse target-verify requires the indexer's topk "
                     "positions"
@@ -2432,12 +2436,43 @@ class DeepseekSparseAttnBackend(
                         else None,
                     )
             else:
-                # flash_mla_sparse_fwd / tilelang require int32 page indices.
-                page_table_1 = (
-                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                        page_table_1
-                    ).to(torch.int32)
+                has_retained_prefix = bool(
+                    forward_batch.extend_prefix_lens_cpu
+                    and any(forward_batch.extend_prefix_lens_cpu)
                 )
+                if has_retained_prefix:
+                    # warm-local-prefill: the matched prefix is host-resident
+                    # (retained); its selections need a union swap-in from host
+                    # pages. Rebuild the table from the raw positions: prefix
+                    # selections point at scratch slots holding the host bytes,
+                    # delta selections translate through the device mapping.
+                    if self.use_fused_topk:
+                        raise NotImplementedError(
+                            "WLP: fused topk is not supported on the "
+                            "retained-prefix extend path (set both arms to the "
+                            "unfused topk for exactness)"
+                        )
+                    if topk_indices is None:
+                        raise AssertionError(
+                            "WLP: extend with a retained prefix requires topk_indices"
+                        )
+                    padded_positions = self._pad_topk_indices(
+                        topk_indices, q_nope.shape[0]
+                    )
+                    page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        topk_positions=padded_positions,
+                        prefix_lens=forward_batch.extend_prefix_lens,
+                        translated=page_table_1,
+                        layer_id=layer.layer_id,
+                    )
+                else:
+                    # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                    page_table_1 = (
+                        self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                            page_table_1
+                        ).to(torch.int32)
+                    )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
