@@ -129,10 +129,15 @@ def init_torch_distributed(
         ):
             _prewarm_tp_lm_head_all_to_all()
 
+    # Draft runners measure locally: under PP+spec only the LAST stage
+    # builds a draft worker, and a world-group all_reduce there would
+    # misalign the PP stages' collective sequences (gloo size-mismatch
+    # abort). The draft's pre_model_load_memory is unused anyway (its pool
+    # configure takes the target-provided memory_pool_config branch).
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=(not is_draft_worker) and get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()

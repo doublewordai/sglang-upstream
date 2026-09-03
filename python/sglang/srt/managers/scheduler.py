@@ -213,6 +213,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -328,9 +329,11 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.pool_aging import maybe_log_pool_aging
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -931,6 +934,23 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # PP + speculative decoding (prefill arm only, enforced in
+        # check_server_args): the EAGLE draft layer consumes the target's
+        # final hidden states, which exist only on the LAST pipeline stage.
+        # Earlier stages run plain target extends and forward hidden states
+        # as today; they must not build a draft worker, a draft KV pool, or
+        # register draft KV data pointers with the transfer backend.
+        if (
+            self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            assert self.server_args.disaggregation_mode == "prefill", (
+                "PP + speculative decoding is only supported on the prefill arm"
+            )
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding. It builds its draft
         # from this process's own config: what differs for the draft — the
         # target's context length, the draft load format, its attention backend
@@ -1025,8 +1045,10 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
-        # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        # Dispatch the model worker. Under PP+spec (prefill arm) only the
+        # last stage has a draft worker; earlier stages drive the plain
+        # target worker (with pp_proxy_tensors threading).
+        if self.draft_worker is None:
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1194,6 +1216,21 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Adaptive small chunking (--chunked-prefill-size-small): while a
+        # short or warm request waits, chunked prefills advance in small
+        # chunks so the waiting request can join the next prefill step.
+        self.chunked_prefill_size_small = get_schedule().chunked_prefill_size_small
+        if self.chunked_prefill_size_small is not None and (
+            self.chunked_prefill_size is None
+            or self.chunked_prefill_size_small <= 0
+            or self.chunked_prefill_size_small >= self.chunked_prefill_size
+        ):
+            logger.warning(
+                f"--chunked-prefill-size-small={self.chunked_prefill_size_small} "
+                f"is ignored (chunked prefill must be enabled and its size "
+                f"{self.chunked_prefill_size} must be larger); using fixed chunks."
+            )
+            self.chunked_prefill_size_small = None
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1329,10 +1366,25 @@ class Scheduler(
             if self.draft_worker is not None
             else None
         )
+        if (
+            self.hisparse_coordinator is not None
+            and draft_token_to_kv_pool is not None
+        ):
+            # pd/mtp-hisparse: the draft pool is appended to the PD transfer's
+            # layer list but receives at host-row indices; the coordinator
+            # remaps it to logical locs at admission (admit_request_direct).
+            self.hisparse_coordinator.draft_pool = draft_token_to_kv_pool
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.draft_worker is not None
+            and self.spec_algorithm.carries_draft_hidden_states()
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
+            # worker, so a single accessor covers both shapes. Under PP+spec
+            # only the last stage has a draft worker; earlier stages use the
+            # 16-fp32 padding layout and never send the spec aux components
+            # (see KVArgs.aux_send_spec_bufs), so the layout mismatch with the
+            # decode side is never exercised.
             draft_runner = self.draft_worker.draft_worker.draft_runner
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
@@ -1667,9 +1719,29 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
+            "hicache_host_pool_tokens": self._get_hicache_host_pool_tokens(),
         }
 
         return result_dict
+
+    def _get_hicache_host_pool_tokens(self) -> Optional[int]:
+        """Token capacity of this rank's hierarchical-cache host tier, if any.
+
+        A fixed --hicache-size buys a host tier whose token capacity depends
+        on the per-token host bytes of this rank's layer set, on PP-group
+        synchronization and on page alignment, so only this process knows it
+        once the pool is allocated. The DP controller sizes its prefix
+        affinity index from this value; see
+        retained_tokens_per_device_token in data_parallel_controller.
+        """
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        size = getattr(host_pool, "size", None)
+        if size is None:
+            return None
+        try:
+            return int(size)
+        except (TypeError, ValueError):
+            return None
 
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
@@ -1735,6 +1807,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -1779,6 +1852,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
 
@@ -2746,10 +2820,24 @@ class Scheduler(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if cold_trace_enabled():
+                cold_trace(
+                    "pf_bootstrap_add",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    input_len=len(req.origin_input_ids),
+                )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
+                if cold_trace_enabled():
+                    cold_trace(
+                        "dec_prealloc_add",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        input_len=len(req.origin_input_ids),
+                    )
             else:
                 req.time_stats.set_retract_time()
         else:
@@ -3012,9 +3100,42 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        if self.spec_algorithm.is_none():
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+        else:
+            # Spec-v2: the prefill round already relayed the FULL draft payload
+            # (RelayPayload.from_draft_input in _relay_forward_payload); a
+            # bonus-only re-stash would clobber it -- and crash FutureMap.stash,
+            # which reads payload.topk_p under need_topk. Instead attach a
+            # resolve shell (mirroring PD-decode admission in
+            # eagle_disaggregation.py): future_indices lets the first decode
+            # round's resolve_forward_inputs gather the relayed payload
+            # (topk_p/topk_index/bonus/hidden_states/dsa seed) by
+            # req_pool_indices. Zeros are placeholders; resolve overwrites
+            # every field it gathers.
+            from sglang.srt.model_executor.forward_batch_info import (
+                CaptureHiddenMode,
+            )
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            topk = self.server_args.speculative_eagle_topk or 1
+            spec_info = EagleDraftInput(
+                topk_p=torch.zeros(
+                    (len(reqs), topk), dtype=torch.float32, device=device
+                ),
+                topk_index=torch.zeros(
+                    (len(reqs), topk), dtype=torch.int64, device=device
+                ),
+                bonus_tokens=last_tokens.to(torch.int32),
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            spec_info.future_indices = batch.req_pool_indices
+            spec_info.future_dsa_topk_indices_available = (
+                self.future_map.dsa_topk_indices_buf is not None
+            )
+            batch.spec_info = spec_info
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -3197,6 +3318,38 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _adaptive_chunk_small_waiting(self) -> bool:
+        """True if a short or warm request is waiting in the local queue.
+
+        Short: at most 16384 new (uncached) tokens. Warm: prefix cache hit of
+        at least 90%. Long prompts need a radix match to classify; the result
+        is cached on the request and refreshed every 64 scheduler steps (the
+        matched prefix can grow while the request waits).
+        """
+        short_new_tokens = 16384
+        warm_prefix_ratio = 0.9
+        reclassify_interval = 64
+        for req in self.waiting_queue:
+            fill_len = len(req.origin_input_ids) + len(req.output_ids)
+            if fill_len <= short_new_tokens:
+                return True
+            state = getattr(req, "_adaptive_chunk_prefix_state", None)
+            if (
+                state is None
+                or self.forward_ct - state[0] >= reclassify_interval
+            ):
+                match_prefix_for_req(self.tree_cache, req)
+                hit = int(req.num_matched_prefix_tokens)
+                req._adaptive_chunk_prefix_state = (self.forward_ct, hit)
+            else:
+                hit = state[1]
+            if (
+                fill_len - hit <= short_new_tokens
+                or hit >= warm_prefix_ratio * fill_len
+            ):
+                return True
+        return False
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3262,6 +3415,26 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # Adaptive small chunking: while a short/warm request waits, cap how
+        # far any chunked prefill advances this step; the remaining chunk
+        # budget lets the waiting request join this step's prefill batch.
+        chunked_req_chunk_cap = None
+        if self.chunked_prefill_size_small is not None:
+            small_waiting = self._adaptive_chunk_small_waiting()
+            if small_waiting:
+                chunked_req_chunk_cap = min(
+                    self.chunked_prefill_size_small, chunked_prefill_size
+                )
+            logger.debug(
+                "[adaptive-chunk] small_waiting=%s chunk_budget=%d "
+                "chunked_req_cap=%s waiting_queue=%d chunked_req_inflight=%s",
+                small_waiting,
+                chunked_prefill_size,
+                chunked_req_chunk_cap,
+                len(self.waiting_queue),
+                self.chunked_req is not None,
+            )
+
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
         attn_backend = self.tp_worker.model_runner.attn_backend
@@ -3287,6 +3460,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            chunked_req_chunk_cap=chunked_req_chunk_cap,
         )
 
         if self.chunked_req is not None:
@@ -3401,6 +3575,9 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled() and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in can_run_list:
+                cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -3771,12 +3948,16 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
-            elif not batch.spec_algorithm.is_none():
+            elif not batch.spec_algorithm.is_none() and self.draft_worker is not None:
                 # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
+                # future_map relay / on_publish). PP stages without a draft
+                # worker (all but the last, under PP+spec) take the plain
+                # path below so pp_proxy_tensors keep flowing between stages.
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3794,11 +3975,9 @@ class Scheduler(
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                # Plain path: non-spec everywhere, and PP+spec stages without
+                # a draft worker. pp_proxy_tensors is None when not PP.
+                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
@@ -4372,6 +4551,23 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        if (
+            self.enable_hisparse
+            and self.hisparse_coordinator is not None
+            and hasattr(self, "disagg_decode_prealloc_queue")
+        ):
+            # Host-pool backpressure: per-rank HiSparse host KV pool state so
+            # routers/ops can see the admission constraint (free host tokens).
+            host_pool = self.hisparse_coordinator.mem_pool_host
+            ret["hisparse_host_pool"] = {
+                "free_tokens": int(host_pool.available_size()),
+                "total_tokens": int(host_pool.size),
+                "page_size": int(host_pool.page_size),
+                "prealloc_wait_events": int(
+                    self.disagg_decode_prealloc_queue.host_pool_wait_events
+                ),
+            }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

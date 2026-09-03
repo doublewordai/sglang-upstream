@@ -15,6 +15,13 @@ suppress_noisy_warnings()
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    # THP discipline: nodes run THP=always and only the host pools opt out;
+    # disable THP for the whole engine process tree when asked (inherited by
+    # forked children). Explicit hugetlb pools are unaffected.
+    from sglang.srt.utils.thp import maybe_disable_thp
+
+    maybe_disable_thp()
+
     if server_args.encoder_only:
         # For encoder disaggregation
         if server_args.smg_grpc_mode or server_args.grpc_mode:

@@ -119,6 +119,7 @@ from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
 )
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     DPControllerReqTimeStats,
@@ -1149,6 +1150,14 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        if cold_trace_enabled():
+            cold_trace(
+                "sched_recv",
+                rid=self.rid,
+                room=self.bootstrap_room,
+                mode=self.time_stats.disagg_mode_str(),
+                input_len=len(self.origin_input_ids),
+            )
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.

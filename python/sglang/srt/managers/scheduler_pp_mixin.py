@@ -287,6 +287,11 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if (
+                        self.draft_worker is not None
+                        and result.next_draft_input is not None
+                    ):
+                        self.pp_last_rank_results[mb_id] = result
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -321,11 +326,26 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
-                        next_batch_result,
-                    )
+                    local_result = self.pp_last_rank_results[next_mb_id]
+                    if local_result is not None:
+                        # Last PP stage with spec: process the local result
+                        # (carries next_draft_input) instead of the relayed
+                        # dict; the ring relay still runs for the other
+                        # stages. copy_done gates the D2H copies enqueued on
+                        # the forward stream at launch.
+                        self.pp_last_rank_results[next_mb_id] = None
+                        if local_result.copy_done is not None:
+                            local_result.copy_done.synchronize()
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id],
+                            local_result,
+                        )
+                    else:
+                        d2h_event.synchronize()
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id],
+                            next_batch_result,
+                        )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
@@ -573,6 +593,14 @@ class SchedulerPPMixin:
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        # PP+spec (prefill arm): the last stage's local forward results carry
+        # next_draft_input (draft hidden states / DSA top-k for the aux
+        # transfer), which the ring-relayed output dict does not. Stash the
+        # local result per microbatch; it is consumed ~pp_size iterations
+        # later, exactly where the relayed result is processed.
+        self.pp_last_rank_results: List[Optional[GenerationBatchResult]] = [
+            None
+        ] * self.pp_loop_size
 
         self.send_req_work = []
         self.send_proxy_work = []

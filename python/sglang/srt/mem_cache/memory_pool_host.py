@@ -1107,7 +1107,26 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.target_layer_num = self._effective_host_layer_num()
+        # Shared-index elision: skip-topk layers have 0-row device buffers;
+        # the host layer dimension compacts to the non-skip layers so host
+        # bytes shrink by the same fraction and stay positionally aligned
+        # with packed_device_index_buffers.
+        self._skip_topk_layers = list(
+            getattr(device_pool, "skip_topk_layers", None) or []
+        )
+        if self._skip_topk_layers and len(self._skip_topk_layers) == (
+            device_pool.layer_num
+        ):
+            self._host_slot_of_layer = {}
+            _slot = 0
+            for _l in range(device_pool.layer_num):
+                if not self._skip_topk_layers[_l]:
+                    self._host_slot_of_layer[_l] = _slot
+                    _slot += 1
+            self.target_layer_num = _slot
+        else:
+            self._host_slot_of_layer = None
+            self.target_layer_num = self._effective_host_layer_num()
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
@@ -1197,6 +1216,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self.packed_device_index_buffers = [
             buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
         ]
+        if self._host_slot_of_layer is not None:
+            self.packed_device_index_buffers = [
+                b for b in self.packed_device_index_buffers if b.shape[0] > 0
+            ]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
             dtype=torch.uint64,
@@ -1274,6 +1297,25 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         return host_page_indices, device_page_indices
 
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        # Skip-topk layers own nothing on an elided pool.
+        if (
+            self._host_slot_of_layer is not None
+            and device_pool is self.device_pool
+            and 0 <= layer_id < len(self._skip_topk_layers)
+            and self._skip_topk_layers[layer_id]
+        ):
+            return False
+        return super()._is_device_layer_owned(device_pool, layer_id)
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        if (
+            self._host_slot_of_layer is not None
+            and layer_id in self._host_slot_of_layer
+        ):
+            return self._host_slot_of_layer[layer_id]
+        return super()._host_layer_index(layer_id, device_pool)
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1338,6 +1380,12 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        ids = super()._owned_device_layer_ids(device_pool)
+        if self._host_slot_of_layer is not None and device_pool is self.device_pool:
+            return [l for l in ids if not self._skip_topk_layers[l]]
+        return ids
+
     def _backup_from_device_per_layer(
         self,
         device_pool,
@@ -1348,6 +1396,8 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
+            return
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
