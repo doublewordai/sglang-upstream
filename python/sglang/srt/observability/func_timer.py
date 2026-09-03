@@ -32,6 +32,19 @@ def enable_func_timer():
     global enable_metrics, FUNC_LATENCY
     enable_metrics = True
 
+    if FUNC_LATENCY is not None:
+        # Already registered in this process. prometheus_client's default
+        # CollectorRegistry is process-global, so a second Histogram()
+        # with the same name raises DuplicateTimeseries. On multi-node
+        # servers the non-zero node ranks enable the timer from
+        # launch_dummy_health_check_server() and then again from the
+        # FastAPI app's lifespan when the engine falls through to the
+        # real HTTP server at scheduler exit; that second registration
+        # used to kill the task with "Application startup failed"
+        # (exit 3). The call is idempotent instead: keep the existing
+        # collector.
+        return
+
     FUNC_LATENCY = Histogram(
         "sglang:func_latency_seconds",
         "Function latency in seconds",

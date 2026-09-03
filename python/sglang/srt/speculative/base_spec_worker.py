@@ -58,6 +58,10 @@ class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+    # Per-step draft argmax probabilities [max_bs, num_steps] (adaptive verify
+    # confidence source; lane/adaptive-spec). Written by the draft chain path
+    # (draft_topk1_postprocess), read by EagleDraftWorker.draft().
+    _topk1_conf_prealloc: Optional[torch.Tensor] = None
 
     def __init__(self) -> None:
         self._specialized_graph_memory_usage: dict[str, float] = {}
@@ -142,6 +146,9 @@ class EagleDraftWorkerBase(ABC):
         self._topk1_score_indices_prealloc = torch.arange(
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
+        self._topk1_conf_prealloc = torch.zeros(
+            (max_bs, max(num_steps, 1)), dtype=torch.float32, device=self.device
+        )
 
 
 class BaseSpecWorker(ABC):

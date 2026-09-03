@@ -652,6 +652,10 @@ class ModelRunner:
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
+            allow_pp_mtp=(
+                self.server_args.pp_size > 1
+                and self.server_args.disaggregation_mode == "prefill"
+            ),
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
@@ -944,6 +948,16 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+        if envs.SGLANG_GLM_DSV3_BF16_SMALLM_GEMV.get():
+            # Post-load, pre-capture: build bf16 copies of the small decode
+            # projections (qkv_a + indexer wq_b/wk/weights_proj) for the
+            # dsv3_fused_a small-M GEMV path.
+            from sglang.srt.models.deepseek_v2 import (
+                materialize_bf16_smallm_weights,
+            )
+
+            materialize_bf16_smallm_weights(self.model)
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
@@ -1163,6 +1177,17 @@ class ModelRunner:
                 f"avail mem={after_avail_memory:.2f} GB, "
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
+
+        try:
+            from sglang.srt.utils.memory_snapshot import (
+                install_memsnap_hooks,
+                memsnap_phase,
+            )
+
+            install_memsnap_hooks(self, self.model)
+            memsnap_phase("after_weights")
+        except Exception:
+            pass
 
         report_online_quantization(model=self.model, server_args=self.server_args)
 
@@ -1509,6 +1534,13 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+
+        try:
+            from sglang.srt.utils.memory_snapshot import memsnap_forward_begin
+
+            memsnap_forward_begin(forward_batch)
+        except Exception:
+            pass
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
