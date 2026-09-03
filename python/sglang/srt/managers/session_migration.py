@@ -294,6 +294,14 @@ def _fingerprint(geoms: Dict[str, PoolGeom], page_size: int) -> dict:
 # --------------------------------------------------------------------------
 
 
+def segs_available(node, root) -> bool:
+    while node is not root:
+        if node.component_data[0].host_value is not None:
+            return True
+        node = node.parent
+    return False
+
+
 def export_session(
     tree_cache: Any,
     token_ids: List[int],
@@ -316,6 +324,24 @@ def export_session(
     node = mr.best_match_node
     node = core.node_by_id(node) if isinstance(node, int) else node
     root = core.root_node
+    if node is root or not segs_available(node, root):
+        try:
+            avail = tree_cache.cache_controller.mem_pool_host.available_size()
+        except Exception:  # noqa: BLE001
+            avail = -1
+        logger.info(
+            "[session-migration] export miss: best_node=%s key_len=%s backuped=%s "
+            "host_hit=%s device_hit=%s pool_avail=%s req_tokens=%d",
+            getattr(node, "id", None),
+            len(node.key) if node is not root else 0,
+            node.backuped if node is not root else None,
+            mr.host_hit_length,
+            len(mr.device_indices),
+            avail,
+            len(token_ids),
+        )
+    if node is root:
+        return None
     # Walk up from the best match collecting the contiguous backuped chain.
     # A node without host_value ends the chain: everything below it cannot be
     # exported (its pages are missing), so drop the deeper segments.
