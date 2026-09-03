@@ -303,6 +303,9 @@ class HiSparseCoordinator:
         # warm-local-prefill: req_pool_idx -> device slot tensor for the
         # extend union swap-in (registered at batch build, freed at staging).
         self._extend_scratch: dict = {}
+        # req_pool_idx -> (prefix_len, sorted adopted prefix locs) cache for
+        # the fused swap-in's per-layer membership test (one extend's worth).
+        self._extend_scratch_sorted: dict = {}
         self.wlp_trace = envs.SGLANG_WLP_TRACE.get()
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -1819,6 +1822,7 @@ class HiSparseCoordinator:
         locs = self._extend_scratch.pop(req_pool_idx, None)
         if locs is not None and locs.numel() > 0:
             self.token_to_kv_pool_allocator.free_hisparse_indices(locs)
+        self._extend_scratch_sorted.pop(req_pool_idx, None)
 
     def _grow_extend_scratch(self, req_pool_idx: int, min_slots: int) -> torch.Tensor:
         """Grow the registered scratch to at least ``min_slots`` slots."""
@@ -1916,6 +1920,120 @@ class HiSparseCoordinator:
         )
         if prefix_locs is not None:
             table = torch.where(valid & is_prefix, prefix_locs, device_locs)
+        else:
+            table = device_locs
+        table = torch.where(valid, table, -1)
+        return table.to(torch.int32)
+
+    def extend_swap_in_page_table_fused(
+        self,
+        req_pool_indices: torch.Tensor,
+        topk_locs: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Fused-topk variant of :meth:`extend_swap_in_page_table`.
+
+        ``topk_locs``: (num_queries, top_k) slot-resolved selections from the
+        fused PAGED transform (logical KV locs, -1 padded). A selection is a
+        prefix selection iff its loc is one of the request's adopted prefix
+        locs (``req_to_token[r, :prefix_len]``; freshly allocated delta locs
+        are never radix-held, so this is exactly the set of locs with
+        retained host rows for this batch). The union of those locs is
+        loaded into the extend scratch (order-preserving per query, like the
+        unfused variant) and the table points at the scratch slots; every
+        other valid selection is a delta-token loc translated to its
+        hisparse device slot -- the same mapping the unfused path applies to
+        ``translated``.
+        """
+        num_reqs = int(req_pool_indices.numel())
+        if num_reqs != 1:
+            raise NotImplementedError(
+                "warm-local-prefill extend supports single-request batches "
+                f"(got {num_reqs})"
+            )
+        r = int(req_pool_indices[0].item())
+        prefix_len = int(prefix_lens[0].item())
+
+        loc = topk_locs.to(torch.int64)
+        valid = loc >= 0
+        loc_c = loc.clamp(min=0)
+        # Prefix discrimination stays on-device: a selection is a prefix
+        # selection iff its loc is one of the request's adopted prefix locs
+        # (req_to_token[r, :prefix_len], seeded by write_cache_indices with
+        # the same prefix_indices that adopt_prefix retained). Freshly
+        # allocated delta locs are never radix-held, so this is exactly the
+        # set of locs with retained host rows for this batch. (The full-pool
+        # logical_to_host_row table is host-side; only the small union below
+        # pays a CPU round-trip.)
+        if prefix_len > 0:
+            entry = self._extend_scratch_sorted.get(r)
+            if entry is None or entry[0] != prefix_len:
+                entry = (
+                    prefix_len,
+                    torch.sort(
+                        self.req_to_token_pool.req_to_token[r, :prefix_len].to(
+                            torch.int64
+                        )
+                    ).values,
+                )
+                self._extend_scratch_sorted[r] = entry
+            sorted_p = entry[1]
+            flat_c = loc_c.reshape(-1)
+            pos = torch.searchsorted(sorted_p, flat_c, side="right")
+            in_set = (
+                (pos > 0)
+                & (pos <= prefix_len)
+                & (sorted_p[(pos - 1).clamp(min=0)] == flat_c)
+            )
+            is_prefix = (valid.reshape(-1) & in_set).reshape(loc.shape)
+        else:
+            is_prefix = torch.zeros_like(valid)
+
+        flat = loc_c[is_prefix].reshape(-1)
+        if flat.numel() > 0:
+            union = torch.unique(flat)  # sorted ascending
+            u = int(union.numel())
+            if self.wlp_trace and layer_id == 0:
+                mb = u * self.item_size_bytes / 1e6
+                logger.info(
+                    "WLP swapin fused rid_layer=0 prefix=%d union=%d c2c_mb=%.2f",
+                    prefix_len,
+                    u,
+                    mb,
+                )
+            locs = self._extend_scratch.get(r)
+            if locs is None or int(locs.numel()) < u:
+                locs = self._grow_extend_scratch(r, max(u, 1))
+            scratch = locs[:u]
+            host_rows = self.logical_to_host_row[union.to("cpu")].to(
+                scratch.device
+            )
+            if not bool((host_rows >= 0).all()):
+                raise AssertionError(
+                    f"WLP: req {r} layer {layer_id}: no host rows for prefix "
+                    f"locs (prefix_len={prefix_len})"
+                )
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_rows,
+                scratch,
+                layer_id,
+                io_backend="kernel",
+            )
+            idx = torch.searchsorted(union, loc_c.reshape(-1)).reshape(loc.shape)
+            # searchsorted returns len(union) for delta locs (not in the
+            # union); clamp before the gather -- those entries are discarded
+            # by the where-mask below but the gather still evaluates.
+            prefix_locs = scratch[idx.clamp(max=u - 1)]
+        else:
+            prefix_locs = None
+
+        device_locs = self.mem_pool_device.translate_loc_to_hisparse_device(
+            loc_c
+        )
+        if prefix_locs is not None:
+            table = torch.where(is_prefix, prefix_locs, device_locs)
         else:
             table = device_locs
         table = torch.where(valid, table, -1)

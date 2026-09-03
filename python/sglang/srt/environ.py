@@ -463,14 +463,14 @@ class Envs:
     # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
     # copies; affects the HiCache H2D load path (page_first host pools) and
     # the layer_first D2H backup path (hisparse staging backup).
-    SGLANG_HICACHE_BULK_COPY = EnvBool(False)
+    SGLANG_HICACHE_BULK_COPY = EnvBool(True)
     # D2H bulk backup via warp-coalesced SM stores instead of the copy engine
     # (the CE D2H path is capped at ~170 GB/s over C2C on GH200; coalesced SM
     # stores sustain ~383 GB/s into the same pinned pool). Replaces the
     # segment copies AND the remainder kernel of the bulk backup when
     # SGLANG_HICACHE_BULK_COPY is also on; byte-identical; falls back to the
     # merged copy-engine path when the JIT module is unavailable.
-    SGLANG_D2H_SM_STORES = EnvBool(False)
+    SGLANG_D2H_SM_STORES = EnvBool(True)
     # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
     # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
     # eligibility (max new-span tokens, min matched fraction of the prompt) and
@@ -482,6 +482,15 @@ class Envs:
     # rank): rig weight-equality probe + the local-refill fallback variant.
     SGLANG_WLP_ALLOW_COLD = EnvBool(False)
     SGLANG_WLP_TRACE = EnvBool(False)
+    # wlp-fused-topk: consume prod's fused PAGED top-k output (slot-resolved
+    # logical locs) in the WLP retained-prefix extend. ON (default): the
+    # union swap-in discriminates prefix/delta selections in the loc domain
+    # via logical_to_host_row -- the same fused/1PASS kernel (and therefore
+    # the same selection) as the prefill arm's warm extends. OFF: WLP extends
+    # force the unfused top-k (raw positions; the original lane-validated
+    # path; exact vs the PD path only when SGLANG_DSA_FUSE_TOPK=0 on both
+    # arms).
+    SGLANG_WLP_FUSED_TOPK = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -1519,7 +1528,7 @@ class Envs:
     # sgl_kernel fast_topk_v2 on decode/verify shapes (row_starts is None,
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
-    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(True)
     # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
     # persistent launch with in-kernel grid barriers reading each row once
     # (plus a small sample and a rare fg-equivalent fallback re-read),
