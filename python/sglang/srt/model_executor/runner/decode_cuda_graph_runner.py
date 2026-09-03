@@ -1137,9 +1137,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend, BreakableCudaGraphBackend
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
+        mark("cos_begin", bs=bs)
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+                bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        mark("cos_prepare_done", bs=bs)
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1222,18 +1224,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
+                mark("cos_autotune_begin", bs=bs)
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
+                mark("cos_autotune_done", bs=bs)
                 self.backend.capture_one(
                     shape_key,
                     run_once,
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                mark("cos_capture_done", bs=bs)
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
