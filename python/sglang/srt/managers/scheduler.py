@@ -2462,10 +2462,17 @@ class Scheduler(
                 )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
-                # Invalid request for disaggregated mode
+                # Invalid request for disaggregated mode. Exception: WLP-marked
+                # requests take the warm-local extend path on the decode arm —
+                # no bootstrap room, no transfer.
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not (
+                        self.wlp_enable
+                        and recv_req.rid is not None
+                        and recv_req.rid.startswith("WLP-")
+                    )
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
