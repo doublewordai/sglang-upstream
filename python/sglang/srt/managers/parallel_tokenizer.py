@@ -177,7 +177,6 @@ class ParallelTokenizer:
                     return self.tokenizer.encode(text, **kwargs)
 
         self.last_path = "parallel"
-        ids: List[int] = []
-        for e in encodings[:k]:
-            ids.extend(e.ids)
-        return ids
+        from itertools import chain
+
+        return list(chain.from_iterable(e.ids for e in encodings[:k]))
