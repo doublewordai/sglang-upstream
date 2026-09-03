@@ -1172,6 +1172,12 @@ def pre_permute_deepep_normal_to_deep_gemm(
                 use_mxfp8=quant_info.use_mxfp8,
             )
         )
+        # capture BEFORE dispose_tensor (inplace frees the storage and
+        # collapses .shape to (0,)) — the post-permute gather needs the recv
+        # shape to allocate its output.
+        recv_shape = hidden_states.shape
+        recv_dtype = hidden_states.dtype
+        recv_device = hidden_states.device
         if runner_config.inplace:
             dispose_tensor(hidden_states)
             if hidden_states_scale is not None:
@@ -1179,9 +1185,9 @@ def pre_permute_deepep_normal_to_deep_gemm(
         running_state["masked_mode"] = True
         running_state["topk_ids"] = topk_ids
         running_state["topk_weights"] = topk_weights
-        running_state["hidden_states_shape"] = hidden_states.shape
-        running_state["hidden_states_dtype"] = hidden_states.dtype
-        running_state["hidden_states_device"] = hidden_states.device
+        running_state["hidden_states_shape"] = recv_shape
+        running_state["hidden_states_dtype"] = recv_dtype
+        running_state["hidden_states_device"] = recv_device
         running_state["src2dst"] = src2dst
         running_state["mxfp8_act_gran_k"] = (
             quant_info.block_shape[1] if quant_info.block_shape else 128
