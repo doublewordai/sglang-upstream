@@ -1369,10 +1369,15 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = prepped["end"]
         if prepped["last"]:
             # Suppress the radix insert's dedup-free of pages the in-flight
-            # transfer is still reading; _pdho_reconcile_early_send restores
-            # the value and stashes the orphans for freeing at completion.
-            req.pdho_saved_protected = req.cache_protected_len
+            # transfer is still reading: bump cache_protected_len to the sent
+            # range end so cache_unfinished_req's free_segment
+            # [protected:new_prefix_len) skips the in-flight pages. The insert
+            # then overwrites cache_protected_len with the tree's coverage --
+            # we must NOT restore it afterwards (restoring would make the final
+            # cache_finished_req free the tree's own pages). The duplicate
+            # (orphan) pages are stashed and freed at transfer completion.
             req.pdho_sent_fresh = prepped["fresh"]
+            req.pdho_sent_start = prepped["start"]
             if (
                 req.cache_protected_len is not None
                 and req.cache_protected_len < prepped["end"]
@@ -1391,23 +1396,25 @@ class SchedulerDisaggregationPrefillMixin:
         return True
 
     def _pdho_reconcile_early_send(self: Scheduler, req: Req) -> None:
-        """After the radix insert: restore cache_protected_len and stash the
-        dedup-orphaned pages (freshly-written pages the tree replaced with
-        cached copies) for freeing once the transfer completes."""
+        """After the radix insert: stash the dedup-orphaned pages (freshly
+        written pages the tree replaced with cached copies) for freeing once
+        the transfer completes. cache_protected_len is left at the value the
+        insert set (the tree's coverage) -- do NOT restore the pre-send value:
+        the final cache_finished_req frees [cache_protected_len:freed_end), and
+        restoring would free the tree's own pages."""
         fresh = getattr(req, "pdho_sent_fresh", None)
-        saved = getattr(req, "pdho_saved_protected", None)
+        start = getattr(req, "pdho_sent_start", None)
         req.pdho_sent_fresh = None
-        req.pdho_saved_protected = None
-        if fresh is None or saved is None:
+        req.pdho_sent_start = None
+        if fresh is None or start is None:
             return
-        req.cache_protected_len = saved
         post = req.prefix_indices
         if post is None:
             return
-        n = min(len(post) - saved, len(fresh))
+        n = min(len(post) - start, len(fresh))
         if n <= 0:
             return
-        post_np = post[saved : saved + n].cpu().numpy()
+        post_np = post[start : start + n].cpu().numpy()
         orphan_mask = post_np != fresh[:n]
         if orphan_mask.any():
             orphans = torch.as_tensor(
