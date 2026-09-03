@@ -1640,6 +1640,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            if cold_trace_enabled():
+                cold_trace(
+                    "tm_dispatch",
+                    rid=str(getattr(tokenized_obj, "rid", "")),
+                    tokenize_finish=tokenized_obj.time_stats.tokenize_finish_time,
+                    dispatch=tokenized_obj.time_stats.api_server_dispatch_time,
+                    dispatch_finish=tokenized_obj.time_stats.api_server_dispatch_finish_time,
+                    input_len=len(tokenized_obj.input_ids)
+                    if tokenized_obj.input_ids is not None
+                    else -1,
+                )
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
