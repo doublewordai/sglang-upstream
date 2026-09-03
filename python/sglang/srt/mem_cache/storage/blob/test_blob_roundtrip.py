@@ -424,6 +424,122 @@ def main():
           sum(resd3[PoolName.KV]) == N_D and not any(resd3["draft"]),
           f"kv={sum(resd3[PoolName.KV])} d={sum(resd3['draft'])}")
 
+    # ---------------- 9. store-failure degradation (never raise) -------------
+    # vLLM mooncake-store pattern: a store failure must warn + skip + roll
+    # the save watermark back - never raise (which kills the loading/
+    # backup thread and every in-flight request with it).
+    rootf = root + "_fail"
+    os.makedirs(rootf, exist_ok=True)
+    bf, kvf, idxf = make_backend(rootf)
+    kf = chain_keys(20, seed=9)
+    kvf_h = kvf.alloc(20 * PAGE_TOKENS)
+    idxf_h = idxf.alloc(20 * PAGE_TOKENS)
+    for pg in range(20):
+        kvf.fill(pg, 21); idxf.fill(pg, 22)
+
+    # 9a: injected IOError mid-write -> all-False, no raise
+    orig_pwrite = bf._pwrite_all
+    def _boom_pwrite(fd, buf, total):
+        raise IOError("injected transfer error")
+    bf._pwrite_all = _boom_pwrite
+    try:
+        resf = bf.batch_write_v3(transfers_for(kf, kvf, idxf, kvf_h, idxf_h))
+        raised = False
+    except Exception:
+        raised = True
+    bf._pwrite_all = orig_pwrite
+    check("write IOError injected -> no raise", not raised, f"raised={raised}")
+    check("write IOError injected -> all pages False",
+          not any(resf[PoolName.KV]) and not any(resf[PoolName.INDEXER]),
+          f"kv={sum(resf[PoolName.KV])}/20")
+
+    # 9b: unexpected exception (TypeError) from the host pool mid-write
+    # -> caught by the future wrapper, all-False, no raise
+    orig_gdp = kvf.get_data_page
+    def _boom_gdp(index, flat=True):
+        raise TypeError("injected pool corruption")
+    kvf.get_data_page = _boom_gdp
+    try:
+        resf2 = bf.batch_write_v3(transfers_for(kf, kvf, idxf, kvf_h, idxf_h))
+        raised2 = False
+    except Exception:
+        raised2 = True
+    kvf.get_data_page = orig_gdp
+    check("write TypeError injected -> no raise", not raised2, f"raised={raised2}")
+    check("write TypeError injected -> all pages False",
+          not any(resf2[PoolName.KV]), f"kv={sum(resf2[PoolName.KV])}/20")
+
+    # 9c: watermark rollback - after the failed writes nothing is stored;
+    # a clean retry must succeed from scratch (idempotent semantics)
+    hf = bf.batch_exists_v2(kf, [])
+    check("failed writes stored nothing (watermark rolled back)",
+          hf.kv_hit_pages == 0, f"{hf.kv_hit_pages}")
+    resf3 = bf.batch_write_v3(transfers_for(kf, kvf, idxf, kvf_h, idxf_h))
+    check("clean retry after failure succeeds",
+          all(resf3[PoolName.KV]) and all(resf3[PoolName.INDEXER]),
+          f"kv={sum(resf3[PoolName.KV])}/20")
+
+    # 9d: truncated object (struct.error path) -> read = clean miss, no raise
+    gid0 = bf._group_id(kf[0], bf._poolset)
+    p0 = bf._obj_path(gid0)
+    sz = os.path.getsize(p0)
+    with open(p0, "r+b") as f:
+        f.truncate(64)  # header intact magic but truncated pool table/keys
+    bf._coverage.invalidate(gid0)
+    try:
+        resf4 = bf.batch_read_v3(transfers_for(kf, kvf, idxf, kvf_h, idxf_h))
+        raised4 = False
+    except Exception:
+        raised4 = True
+    check("truncated object read -> no raise", not raised4, f"raised={raised4}")
+    # only group 0 was truncated; group 1 (pages 16-19, intact object)
+    # must still serve its 4 pages - per-group corruption isolation
+    check("truncated object read -> group 0 miss, group 1 isolated hit",
+          not any(resf4[PoolName.KV][:16]) and all(resf4[PoolName.KV][16:]),
+          f"kv={sum(resf4[PoolName.KV])}/20 (g0={sum(resf4[PoolName.KV][:16])}, "
+          f"g1={sum(resf4[PoolName.KV][16:])})")
+    with open(p0, "r+b") as f:
+        f.truncate(sz)
+
+    # 9e: controller hook swallows a backend exception (loading + backup)
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    class _Op:
+        id = "fake-op"
+        host_indices = kvf_h
+        hash_value = kf
+        prefix_keys = None
+        pool_transfers = []
+        pool_transfers_done = False
+        completed_tokens = 0
+        def increment(self, n):
+            self.completed_tokens = n * 64
+        class _PSR:
+            @staticmethod
+            def update_extra_pool_hit_pages(d):
+                pass
+        pool_storage_result = _PSR()
+    ctrl = HybridCacheController.__new__(HybridCacheController)
+    ctrl.storage_backend = None  # _can_use_v3_io -> False; legacy path will
+    # hit None storage too -> exception -> must be swallowed by the wrapper
+    op = _Op()
+    try:
+        ctrl._page_backup(op)
+        raised5 = False
+    except Exception:
+        raised5 = True
+    check("controller backup hook swallows store exception",
+          not raised5 and op.completed_tokens == 0, f"raised={raised5}")
+    op2 = _Op()
+    try:
+        ctrl._page_transfer(op2)
+        raised6 = False
+    except Exception:
+        raised6 = True
+    check("controller transfer hook swallows store exception",
+          not raised6 and op2.pool_transfers_done, f"raised={raised6}")
+
     print()
     if failures:
         print(f"{len(failures)} FAILURES: {failures}")
