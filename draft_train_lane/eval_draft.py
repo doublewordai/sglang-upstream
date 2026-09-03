@@ -17,11 +17,20 @@ import json
 import os
 import sys
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from draft_data import RealData  # noqa: E402
 from draft_model import DraftNextN, chain_loss, draft_loss  # noqa: E402
+
+
+def build_model(weights_dir: str) -> DraftNextN:
+    """Same construction as train_draft.build_model."""
+    from safetensors.torch import load_file
+
+    import train_draft  # reuse build_model verbatim
+    return train_draft.build_model(weights_dir, "cpu")
 
 
 def main():
@@ -35,17 +44,23 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(0)
-    model = DraftNextN(args.weights).cuda().eval()
-    data = RealData(args.data, window=args.window, seed=0)
-    n = min(args.max_windows, len(data))
-    print(f"windows: {n} (of {len(data)}), window={args.window}")
+    model = build_model(args.weights).cuda().eval()
+    # holdout_sessions=0: baseline eval over all data (train/val split is the
+    # trainer's concern; the semantic check wants maximum coverage)
+    data = RealData(args.data, window=args.window, holdout_sessions=0, seed=0)
+    idx = data.train_idx[: args.max_windows]
+    n = len(idx)
+    print(f"windows: {n} (of {len(data.train_idx)}), window={args.window}")
 
     ce_sum = mse_sum = 0.0
     top1 = top4 = tok = 0.0
     chain_top1 = None
-    with torch.no_grad():
-        for i in range(n):
-            tokens, prev, pos = [t.cuda() for t in data[i]]
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+        for i, (rid, s) in enumerate(idx):
+            t, p, a = data.get(rid, s, args.window)
+            tokens = torch.from_numpy(t.astype(np.int64)).unsqueeze(0).cuda()
+            prev = torch.from_numpy(np.asarray(p, dtype=np.float16)).unsqueeze(0).cuda()
+            pos = (int(a) + torch.arange(args.window)).unsqueeze(0).cuda()
             _, m = draft_loss(model, tokens, prev, pos, 1.0, return_metrics=True)
             w = tokens.shape[1] - 1  # label positions in this window
             ce_sum += m["ce"] * w
