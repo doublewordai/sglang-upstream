@@ -4,6 +4,10 @@ Enabled by setting SGLANG_DRAFT_CAPTURE_DIR (output directory). Optional:
   SGLANG_DRAFT_CAPTURE_MODES  comma list of forward modes to capture
                               (default "extend"; choices: extend, decode)
   SGLANG_DRAFT_CAPTURE_TAG    label baked into the shard filename (e.g. prefill/decode)
+  SGLANG_DRAFT_CAPTURE_MAX_TOKENS  hard volume cap (total captured tokens across
+                              the process); batches past the cap are skipped and
+                              counted as capped_batches in the stats file. For
+                              captures on shared/live systems (e.g. GREEN).
 
 What is captured: per request, the target's POST-FINAL-NORM hidden states —
 the exact tensor fed to the lm_head, which is also the tensor the EAGLE/NextN
@@ -69,6 +73,8 @@ class _Stats:
     bytes: int = 0
     dropped_batches: int = 0
     dropped_tokens: int = 0
+    capped_batches: int = 0
+    capped_tokens: int = 0
     skipped_batches: int = 0
     skipped_reasons: dict = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
@@ -139,6 +145,7 @@ class DraftCapture:
         modes = os.environ.get("SGLANG_DRAFT_CAPTURE_MODES", "extend")
         self.modes = {m.strip().lower() for m in modes.split(",") if m.strip()}
         self.tag = os.environ.get("SGLANG_DRAFT_CAPTURE_TAG", "x")
+        self.max_tokens = int(os.environ.get("SGLANG_DRAFT_CAPTURE_MAX_TOKENS", "0") or 0)
         self.enabled = bool(self.dir) and bool(self.modes)
         self.writer: Optional[_Writer] = None
         self.q: Optional[queue.Queue] = None
@@ -228,6 +235,14 @@ class DraftCapture:
         positions = forward_batch.positions
         if positions is None or positions.shape[0] != input_ids.shape[0]:
             self.writer.stats.note_skip("no_positions")
+            return
+
+        # Hard volume cap (shared/live-system safety): once the cap is reached,
+        # skip and count; never blocks or fails the engine.
+        n_batch = input_ids.shape[0]
+        if self.max_tokens and self.writer.stats.tokens + n_batch > self.max_tokens:
+            self.writer.stats.capped_batches += 1
+            self.writer.stats.capped_tokens += n_batch
             return
 
         # GPU-side conversions, then one sync D2H per tensor.

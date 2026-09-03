@@ -69,7 +69,15 @@ def rope_interleave(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
 
 
 class MLAAttention(nn.Module):
-    """Dense batched training-form MLA. Input [B, n, H]; per-window causal."""
+    """Dense batched training-form MLA. Input [B, n, H]; per-window causal.
+
+    Optional draft-attention window (matches --speculative-draft-window-size /
+    --speculative-draft-attn-sink in the engine): a query at session position p
+    may attend keys at positions <= p within the most recent `attn_window`
+    positions, plus the first `attn_sink` session positions (attention-sink
+    anchor). Keys stay roped at their true positions, exactly as the engine's
+    selection-only restriction does.
+    """
 
     def __init__(self):
         super().__init__()
@@ -81,8 +89,9 @@ class MLAAttention(nn.Module):
         self.kv_b = nn.Parameter(torch.empty(N_HEADS, QK_NOPE + V_HEAD, KV_LORA))
         self.o = nn.Linear(N_HEADS * V_HEAD, HIDDEN, bias=False)
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """x: [B, n, H]; positions: [B, n] absolute."""
+    def forward(self, x: torch.Tensor, positions: torch.Tensor,
+                attn_window: int = 0, attn_sink: int = 0) -> torch.Tensor:
+        """x: [B, n, H]; positions: [B, n] absolute session positions."""
         B, n, _ = x.shape
         q = self.q_b(rms_norm(self.q_a(x), self.q_a_ln))  # [B, n, H*256]
         q = q.view(B, n, N_HEADS, QK_HEAD)
@@ -102,8 +111,20 @@ class MLAAttention(nn.Module):
         scores = torch.einsum("bnhe,bmhe->bhnm", q_nope, k_head)
         scores = scores + torch.einsum("bnhd,bmd->bhnm", q_pe, k_pe)
         scores = scores * ATTN_SCALE
-        causal = torch.ones(n, n, device=x.device, dtype=torch.bool).tril()
-        scores = scores.masked_fill(~causal, float("-inf"))
+        if attn_window > 0:
+            # [B, n, n] grid in session coordinates: query i may attend key j
+            # iff p_j <= p_i (causal) and (p_i - p_j < attn_window or
+            # p_j <= attn_sink). Sink tokens sit at session positions 1..A
+            # (position 0 is never a draft input: the engine's draft-extend
+            # pairs input_ids[1:] with target hiddens).
+            dist = positions[:, :, None] - positions[:, None, :]
+            allowed = (dist >= 0) & (
+                (dist < attn_window) | (positions[:, None, :] <= attn_sink)
+            )
+            scores = scores.masked_fill(~allowed[:, None], float("-inf"))
+        else:
+            causal = torch.ones(n, n, device=x.device, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~causal, float("-inf"))
         attn = scores.softmax(-1) @ v_head.permute(0, 2, 1, 3)  # [B, H, n, 256]
         out = attn.permute(0, 2, 1, 3).reshape(B, n, N_HEADS * V_HEAD)
         return self.o(out)
@@ -183,7 +204,8 @@ class DraftNextN(nn.Module):
     """One window batch, teacher-forced target hiddens. Everything runs inside
     forward() so FSDP wrapping is transparent to the loss code."""
 
-    def __init__(self, vocab: int, embed: torch.Tensor, lm_head: torch.Tensor):
+    def __init__(self, vocab: int, embed: torch.Tensor, lm_head: torch.Tensor,
+                 attn_window: int = 0, attn_sink: int = 0):
         super().__init__()
         self.embed = nn.Parameter(embed, requires_grad=False)
         self.lm_head = nn.Parameter(lm_head, requires_grad=False)
@@ -195,6 +217,8 @@ class DraftNextN(nn.Module):
         self.post_attn_ln = nn.Parameter(torch.ones(HIDDEN))
         self.moe = MoE()
         self.shared_head_norm = nn.Parameter(torch.ones(HIDDEN))
+        self.attn_window = int(attn_window)
+        self.attn_sink = int(attn_sink)
 
     def forward(
         self,
@@ -211,7 +235,7 @@ class DraftNextN(nn.Module):
         eh = self.eh_proj(eh)
         residual = eh
         h = rms_norm(eh, self.input_ln)
-        h = self.attn(h, positions)
+        h = self.attn(h, positions, self.attn_window, self.attn_sink)
         h = residual + h
         residual = h
         h = rms_norm(h, self.post_attn_ln)
@@ -234,31 +258,45 @@ def draft_loss(
     positions: torch.Tensor,  # [B, n]
     feature_weight: float = 1.0,
     return_metrics: bool = False,
+    ctx_len: int = 0,  # leading context (sink) tokens: attended but not supervised
 ):
     """CE next-token + EAGLE feature loss.
 
     tokens[b,t] = x_{s+t}; prev_hidden[b,t] = target hidden at s+t-1.
     Label for g_t is x_{t+1} = tokens[b,t+1]; feature target for g_t is the
     target hidden at s+t = prev_hidden[b,t+1] (post-norm on both sides).
+    Positions t < ctx_len (the sink block) are context-only: supervised
+    positions are [ctx_len, n-1) (the engine's draft-extend runs sink tokens
+    for KV, not for logits).
     """
     B, n = tokens.shape
     g, logits = model(tokens, prev_hidden, positions, compute_logits=True)
 
     labels = tokens[:, 1:]
-    ce = F.cross_entropy(
-        logits[:, :-1].reshape(-1, logits.shape[-1]).float(), labels.reshape(-1)
-    )
+    sup = torch.ones_like(labels, dtype=torch.bool)
+    if ctx_len > 0:
+        sup[:, :ctx_len] = False
+    flat_logits = logits[:, :-1].reshape(-1, logits.shape[-1]).float()
+    flat_labels = labels.reshape(-1)
+    flat_sup = sup.reshape(-1)
+    ce_all = F.cross_entropy(flat_logits, flat_labels, reduction="none")
+    ce = ce_all[flat_sup].mean()
     feat = prev_hidden[:, 1:]
-    mse = F.mse_loss(g[:, :-1].float(), feat.float())
+    mse_all = F.mse_loss(
+        g[:, :-1].float(), feat.float(), reduction="none"
+    ).mean(-1)
+    mse = mse_all[sup].mean()
 
     loss = ce + feature_weight * mse
     if return_metrics:
         with torch.no_grad():
             lg = logits[:, :-1]
             pred = lg.argmax(-1)
-            top1 = (pred == labels).float().mean().item()
+            top1 = ((pred == labels) & sup).sum().item() / sup.sum().item()
             top4 = (
-                (lg.topk(4, -1).indices == labels[:, :, None]).any(-1).float().mean().item()
+                ((lg.topk(4, -1).indices == labels[:, :, None]).any(-1) & sup)
+                .sum().item()
+                / sup.sum().item()
             )
         return loss, {"ce": ce.item(), "mse": mse.item(), "top1": top1, "top4": top4}
     return loss
@@ -283,6 +321,8 @@ def chain_loss(
     # the (detached) probability the chain reached depth j (VAT,
     # arXiv 2608.30135: sequential verification discards the tail after the
     # first rejection, so supervision should follow the reach pattern)
+    ctx_len: int = 0,  # leading sink/context tokens in the batch (see draft_loss):
+    # chains start at/after ctx_len and the prefix always includes the sink block
 ):
     """residual_weight > 0 adds the residual-draft-distillation objective:
     the chain's consecutive-step logit DELTA must match the target's
@@ -308,7 +348,7 @@ def chain_loss(
     m = {"ce": [], "mse": [], "top1_by_depth": [0] * chain_len, "chains": 0}
     for b in range(B):
         for c in range(n_chains):
-            lo = 1
+            lo = max(1, ctx_len)
             hi = n - chain_len - 1
             if hi <= lo:
                 continue
@@ -322,10 +362,11 @@ def chain_loss(
             _lmw = lm_head
             _reach = 1.0  # VAT: P(chain reaches current depth)
             # prefix start: include window context before the chain so the
-            # chain sees the same KV context as real inference (ctx=0 -> all).
+            # chain sees the same KV context as real inference (ctx=0 -> all;
+            # with a sink block (ctx_len>0) the prefix always includes it).
             # Convention: prev_hidden[b, i] = target hidden h_{i-1}; the input
             # for window token i is h_{i-1}.
-            p0 = 0 if ctx == 0 else max(0, s - ctx)
+            p0 = 0 if (ctx == 0 or ctx_len > 0) else max(0, s - ctx)
             for j in range(chain_len):
                 # prevs for tokens p0..s-1 (target h), the seed for token s
                 # (h_{s-1}), then the draft's own g_{j-1} for tokens s+1..s+j

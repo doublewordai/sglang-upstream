@@ -27,13 +27,15 @@ from draft_data import RealData, SyntheticData, make_batch  # noqa: E402
 from draft_model import HIDDEN, DraftNextN, chain_loss, draft_loss  # noqa: E402
 
 
-def build_model(weights_dir: str, device) -> DraftNextN:
+def build_model(weights_dir: str, device, attn_window: int = 0,
+                attn_sink: int = 0) -> DraftNextN:
     from safetensors.torch import load_file
 
     small = load_file(os.path.join(weights_dir, "draft.safetensors"))
     experts = load_file(os.path.join(weights_dir, "experts.safetensors"))
     vocab, _ = small["embed"].shape
-    m = DraftNextN(vocab, small["embed"], small["lm_head"])
+    m = DraftNextN(vocab, small["embed"], small["lm_head"],
+                   attn_window=attn_window, attn_sink=attn_sink)
     sd = m.state_dict()
     mapping = {
         "enorm": "enorm",
@@ -103,6 +105,12 @@ def main():
                     help="logit-delta (residual) objective weight in the chain loss")
     ap.add_argument("--chain-vat", action="store_true",
                     help="VAT: reweight chain depth-j supervision by reach probability")
+    ap.add_argument("--attn-window", type=int, default=0,
+                    help="draft attention window W (0 = full/dense, the control arm); "
+                         "matches --speculative-draft-window-size at serving")
+    ap.add_argument("--attn-sink", type=int, default=0,
+                    help="session-start sink keys A (LongSpec anchor-offset block); "
+                         "matches --speculative-draft-attn-sink at serving")
     ap.add_argument("--val-every", type=int, default=50)
     ap.add_argument("--val-windows", type=int, default=16)
     ap.add_argument("--holdout", type=int, default=6,
@@ -122,7 +130,8 @@ def main():
     device = f"cuda:{rank}"
     torch.manual_seed(args.seed + rank)
 
-    model = build_model(args.weights, device)
+    model = build_model(args.weights, device, attn_window=args.attn_window,
+                        attn_sink=args.attn_sink)
     nparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
     trainable_keys = {
         n for n, p in model.named_parameters() if p.requires_grad
@@ -158,7 +167,7 @@ def main():
         val_pick = lambda rng, n: data.windows(n, args.window, rng, "val")
     else:
         data = RealData(args.data, window=args.window, seed=args.seed,
-                        holdout_sessions=args.holdout)
+                        holdout_sessions=args.holdout, attn_sink=args.attn_sink)
         get = data.get
         train_pick = lambda rng, n: [data.train_idx[i] for i in rng.choice(len(data.train_idx), n)]
         def val_pick(rng, n):
@@ -194,10 +203,11 @@ def main():
         if not items:
             model.train()
             return {}
-        tokens, prev, pos = make_batch(get, items, args.window, device)
+        tokens, prev, pos, ctx_len = make_batch(get, items, args.window, device)
         with torch.autocast("cuda", torch.bfloat16):
             loss, m = draft_loss(
-                model, tokens, prev, pos, args.feature_weight, return_metrics=True
+                model, tokens, prev, pos, args.feature_weight,
+                return_metrics=True, ctx_len=ctx_len
             )
         model.train()
         for k in m:
@@ -218,10 +228,11 @@ def main():
     for step in range(1, args.steps + 1):
         model.train()
         items = train_pick(rng, args.micro_bs)
-        tokens, prev, pos = make_batch(get, items, args.window, device)
+        tokens, prev, pos, ctx_len = make_batch(get, items, args.window, device)
         with torch.autocast("cuda", torch.bfloat16):
             loss, m = draft_loss(
-                model, tokens, prev, pos, args.feature_weight, return_metrics=True
+                model, tokens, prev, pos, args.feature_weight,
+                return_metrics=True, ctx_len=ctx_len
             )
             if args.chain_weight > 0:
                 closs, cm = chain_loss(
@@ -237,6 +248,7 @@ def main():
                     residual_weight=args.chain_residual,
                     lm_head=lm_snap,
                     vat=args.chain_vat,
+                    ctx_len=ctx_len,
                 )
                 loss = loss + args.chain_weight * closs
                 m = dict(m)
