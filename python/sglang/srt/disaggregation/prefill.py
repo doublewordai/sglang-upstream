@@ -1228,6 +1228,7 @@ class SchedulerDisaggregationPrefillMixin:
                 os.environ.get("SGLANG_PDHO_EARLY_SEND", "0") == "1"
                 and not self.enable_staging
             )
+            state_types = None
             if ok:
                 state_types = (
                     self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
@@ -1235,6 +1236,13 @@ class SchedulerDisaggregationPrefillMixin:
                 allowed = (StateType.DSA, StateType.MINIMAX_INDEX_K)
                 ok = all(st in allowed for st in state_types)
             self._pdho_eligible = ok
+            logger.info(
+                "pdho eligibility: env=%s staging=%s state_types=%s -> %s",
+                os.environ.get("SGLANG_PDHO_EARLY_SEND"),
+                self.enable_staging,
+                state_types,
+                ok,
+            )
         return self._pdho_eligible
 
     def _pdho_prestage_for_batch(self: Scheduler, batch) -> None:
