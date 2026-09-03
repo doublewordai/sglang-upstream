@@ -54,6 +54,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_PMOE_FUSED_ACT_QUANT = get_bool_env_var("SGLANG_PMOE_FUSED_ACT_QUANT")
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -336,6 +338,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
+        # prefill-moe lane: the fused branch below emits TMA-aligned scales
+        # directly; every other branch leaves them row-major for the trailing
+        # tma_align_input_scale.
+        down_scale_needs_align = True
         if self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
@@ -417,6 +423,31 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 swizzle=self.use_swizzle,
             )
             del gateup_output
+        elif (
+            _PMOE_FUSED_ACT_QUANT
+            and self.config.activation == "silu"
+            and self.swiglu_limit is None
+            and not _is_musa
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            # prefill-moe lane: one fused SiLU*mul + fp8 group-quant kernel
+            # emitting the TMA-aligned col-major scale layout directly
+            # (replaces legacy act_and_mul + row-major quant + tma_align;
+            # bit-exact, see lane dir test_fused_act_quant.py).
+            from sglang.kernels.ops.quantization.per_token_group_quant import (
+                per_token_group_quant,
+            )
+
+            down_input_fp8, down_input_scale = per_token_group_quant(
+                gateup_output,
+                group_size=scale_block_size,
+                scale_ue8m0=False,
+                fuse_silu_and_mul=True,
+                column_major_scales=True,
+                legacy_exact_act=True,
+            )
+            del gateup_output
+            down_scale_needs_align = False
         else:
             from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
@@ -459,7 +490,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if (
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and down_scale_needs_align
+        ):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
