@@ -2109,7 +2109,9 @@ class HiSparseCoordinator:
                 entry = (
                     prefix_len,
                     torch.sort(
-                        self.req_to_token[r, :prefix_len].to(torch.int64)
+                        self.req_to_token_pool.req_to_token[r, :prefix_len].to(
+                            torch.int64
+                        )
                     ).values,
                 )
                 self._extend_scratch_sorted[r] = entry
