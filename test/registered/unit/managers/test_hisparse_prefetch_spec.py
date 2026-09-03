@@ -530,8 +530,6 @@ class TestHiSparseVerifyPrefetchSpec(unittest.TestCase):
                 )
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestResolveSpecGate(unittest.TestCase):
@@ -592,3 +590,7 @@ class TestResolveSpecGate(unittest.TestCase):
             )
         finally:
             os.environ.pop("SGLANG_HISPARSE_SPEC_PREFETCH", None)
+
+
+if __name__ == "__main__":
+    unittest.main()
