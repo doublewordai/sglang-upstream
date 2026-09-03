@@ -47,7 +47,20 @@ class HandoverNixlAgent:
         cxi_device_index: Optional[int] = None,
         num_threads: int = 0,
     ):
-        from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
+        try:
+            from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
+        except ImportError as e:
+            import sys
+
+            print("NIXL IMPORT FAILED:", e, file=sys.stderr)
+            print("sys.executable:", sys.executable, file=sys.stderr)
+            print("PYTHONPATH:", os.environ.get("PYTHONPATH"), file=sys.stderr)
+            print(
+                "nixl-ish sys.path entries:",
+                [p for p in sys.path if "nixl" in p],
+                file=sys.stderr,
+            )
+            raise
 
         if cxi_device_index is not None:
             os.environ["UCCL_CXI_DEVICE_INDEX"] = str(cxi_device_index)
@@ -57,7 +70,7 @@ class HandoverNixlAgent:
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
-        backend_params = {"num_cpus": "8"} if backend == "UCCL" else {}
+        backend_params = {"num_cpus": ""} if backend == "UCCL" else {}
         self.agent.create_backend(backend, backend_params)
         if backend not in self.agent.get_plugin_list():
             raise ValueError(f"NIXL backend {backend!r} not available")
