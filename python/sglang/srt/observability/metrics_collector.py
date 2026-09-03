@@ -2484,6 +2484,11 @@ _ALL_RANKS_DEVICE_POOL_FAMILIES: tuple = (
         "device_token_pool_free_tokens",
     ),
     (
+        "sglang:device_token_pool_reclaimable_tokens",
+        "Device KV token pool reclaimable margin: free + evictable (the quantity that is exactly zero when the pool refuses; -1 if not reported).",
+        "device_token_pool_reclaimable_tokens",
+    ),
+    (
         "sglang:device_token_pool_evictable_tokens",
         "Device KV token pool unlocked radix rows, freeable by eviction (-1 if not reported).",
         "device_token_pool_evictable_tokens",

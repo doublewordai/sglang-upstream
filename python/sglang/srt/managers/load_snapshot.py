@@ -235,6 +235,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # (scheduler_components/pool_lock_breakdown.py; lane prefill-oom-1328).
     # -1 = not reported (arm not wired / not a prefill rank).
     device_token_pool_free_tokens: int = -1
+    # free + evictable: the exact quantity that was EXACTLY ZERO at the
+    # 13:28Z device-pool refusal - the reclaimable margin, one gauge.
+    device_token_pool_reclaimable_tokens: int = -1
     device_token_pool_evictable_tokens: int = -1
     device_token_pool_locked_transfer_tokens: int = -1
     device_token_pool_locked_forward_tokens: int = -1

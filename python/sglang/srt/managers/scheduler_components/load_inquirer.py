@@ -210,6 +210,7 @@ class SchedulerLoadInquirer:
 
                 b = compute_pool_lock_breakdown(LoadInquirerAdapter(self))
                 dev_free = b.get("free", -1)
+                dev_reclaimable = b.get("free", -1) + b.get("evictable", -1)
                 dev_evictable = b.get("evictable", -1)
                 dev_locked_transfer = b["transfer"].tokens
                 dev_locked_forward = b["forward"].tokens
@@ -321,6 +322,7 @@ class SchedulerLoadInquirer:
             num_active_tokens=num_active_tokens,
             host_pool_free_tokens=host_pool_free_tokens,
             device_token_pool_free_tokens=dev_free,
+            device_token_pool_reclaimable_tokens=dev_reclaimable,
             device_token_pool_evictable_tokens=dev_evictable,
             device_token_pool_locked_transfer_tokens=dev_locked_transfer,
             device_token_pool_locked_forward_tokens=dev_locked_forward,
