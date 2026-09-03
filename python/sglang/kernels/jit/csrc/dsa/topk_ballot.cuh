@@ -56,7 +56,7 @@ namespace sglang {
 
 namespace {
 
-constexpr uint32_t kSampleBlock = 512;   // S1
+constexpr uint32_t kSampleBlock = 1024;  // S1
 constexpr uint32_t kSampleWarps = kSampleBlock / 32;
 constexpr uint32_t kCapBlock = 1024;     // S2
 constexpr uint32_t kSelBlock = 1024;     // S3
@@ -113,11 +113,10 @@ __global__ __launch_bounds__(kSampleBlock) void ballot_sample_kernel(const Ballo
   const uint32_t E = n_s / W;
   __shared__ uint16_t s_keys[kSampleMax];
   __shared__ int s_hist[kSampleWarps][kRadix];  // warp-privatized
-  __shared__ int s_scan[2][kRadix + 1];
+  __shared__ int s_scan[kRadix + 1];
   __shared__ int s_sub[kRadix];
+  __shared__ int s_scratch[273];
   __shared__ int s_tc, s_tsub, s_above;
-  s_scan[0][kRadix] = 0;
-  s_scan[1][kRadix] = 0;
   for (uint32_t i = threadIdx.x; i < kSampleWarps * kRadix; i += kSampleBlock)
     (&s_hist[0][0])[i] = 0;
   for (uint32_t i = threadIdx.x; i < kRadix; i += kSampleBlock)
@@ -142,7 +141,7 @@ __global__ __launch_bounds__(kSampleBlock) void ballot_sample_kernel(const Ballo
   if (threadIdx.x < kRadix) {
     int acc = 0;
     for (uint32_t w = 0; w < kSampleWarps; ++w) acc += s_hist[w][threadIdx.x];
-    s_scan[0][threadIdx.x] = acc;
+    s_scan[threadIdx.x] = acc;
   }
   __syncthreads();
 
@@ -151,10 +150,10 @@ __global__ __launch_bounds__(kSampleBlock) void ballot_sample_kernel(const Ballo
   j = max(j, 1u);
   j = min(j, n_s);
 
-  suffix_scan_257(s_scan[0], s_scan[1]); // s_scan[0][i] = #{coarse >= i}
+  suffix_scan_256_ip(s_scan, s_scratch); // s_scan[i] = #{coarse >= i}
   if (threadIdx.x < kRadix) {
-    if (s_scan[0][threadIdx.x] >= static_cast<int>(j) &&
-        s_scan[0][threadIdx.x + 1] < static_cast<int>(j))
+    if (s_scan[threadIdx.x] >= static_cast<int>(j) &&
+        s_scan[threadIdx.x + 1] < static_cast<int>(j))
       s_tc = static_cast<int>(threadIdx.x);
   }
   __syncthreads();
@@ -164,7 +163,7 @@ __global__ __launch_bounds__(kSampleBlock) void ballot_sample_kernel(const Ballo
     device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
-  if (threadIdx.x == 0) s_above = s_scan[0][tc + 1];
+  if (threadIdx.x == 0) s_above = s_scan[tc + 1];
   __syncthreads();
   const int above = s_above;
 
@@ -174,14 +173,12 @@ __global__ __launch_bounds__(kSampleBlock) void ballot_sample_kernel(const Ballo
     if ((key >> 8) == static_cast<uint16_t>(tc)) atomicAdd(&s_sub[key & 0xFFu], 1);
   }
   __syncthreads();
-  if (threadIdx.x < kRadix) s_scan[0][threadIdx.x] = s_sub[threadIdx.x];
-  s_scan[0][kRadix] = 0;
-  s_scan[1][kRadix] = 0;
+  if (threadIdx.x < kRadix) s_scan[threadIdx.x] = s_sub[threadIdx.x];
   __syncthreads();
-  suffix_scan_257(s_scan[0], s_scan[1]); // s_scan[0][i] = #{sub >= i} within tc
+  suffix_scan_256_ip(s_scan, s_scratch); // s_scan[i] = #{sub >= i} within tc
   if (threadIdx.x < kRadix) {
-    if (above + s_scan[0][threadIdx.x] >= static_cast<int>(j) &&
-        above + s_scan[0][threadIdx.x + 1] < static_cast<int>(j))
+    if (above + s_scan[threadIdx.x] >= static_cast<int>(j) &&
+        above + s_scan[threadIdx.x + 1] < static_cast<int>(j))
       s_tsub = static_cast<int>(threadIdx.x);
   }
   __syncthreads();
@@ -256,11 +253,13 @@ SGL_DEVICE void stream_row(const T* rowp, int64_t len, F&& fn) {
 }
 
 // ---------------------------------------------------------------------------
-// S2: the one read — compare + rare append (no ballots, no smem staging)
+// S2: the one read — compare + smem-staged append (one global atomic per CTA)
 // ---------------------------------------------------------------------------
 
+constexpr uint32_t kStage = 8192;  // per-CTA staging entries (64 KB smem)
+
 template <bool kUsePDL, typename T>
-__global__ __launch_bounds__(kCapBlock) void ballot_capture_kernel(const BallotTopKParams p) {
+__global__ __launch_bounds__(kCapBlock, 2) void ballot_capture_kernel(const BallotTopKParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t row = blockIdx.y;
   const int32_t length = p.lengths[row];
@@ -284,18 +283,52 @@ __global__ __launch_bounds__(kCapBlock) void ballot_capture_kernel(const BallotT
   const float v_s = p.v_s[row];
   uint2* cand = p.cand + static_cast<int64_t>(row) * p.cap;
   unsigned* pcount = reinterpret_cast<unsigned*>(&p.counters[row * 4 + 0]);
+  unsigned* pstored = reinterpret_cast<unsigned*>(&p.counters[row * 4 + 1]);
   int* phist = p.hist + static_cast<int64_t>(row) * kRadix;
+
+  // per-CTA staging: matches append into smem (rare; a per-CTA counter is
+  // contention-free at ~100 hits/chunk), flushed ONCE with a single global
+  // atomicAdd + bulk copy. A per-match GLOBAL atomic measured ~150 ns
+  // effective on one address (bench_stream.py) — 870 us for 256 MB at a 2.3%
+  // match rate; this structure removes it from the per-element path.
+  __shared__ uint2 s_buf[kStage];
+  __shared__ int s_cnt;
+  __shared__ int s_hist[kRadix];
+  __shared__ int s_base;
+  if (threadIdx.x == 0) s_cnt = 0;
+  for (uint32_t i = threadIdx.x; i < kRadix; i += kCapBlock) s_hist[i] = 0;
+  __syncthreads();
 
   stream_chunk<T>(rowp, lo, hi, [&](int64_t pos, float x) {
     if (!(x < v_s)) { // NaN-inclusive, like fg
-      const uint32_t key = sortable_u32(x);
-      const uint32_t slot = atomicAdd(pcount, 1u);
-      if (slot < p.cap) {
-        cand[slot] = make_uint2(key, static_cast<uint32_t>(pos));
-        atomicAdd(&phist[key >> 24], 1);
+      // cap the staging: once past kStage this CTA's overflow already dooms
+      // the row to the fallback — don't hammer the counter
+      if (s_cnt < static_cast<int>(kStage)) {
+        const uint32_t key = sortable_u32(x);
+        const int slot = atomicAdd(&s_cnt, 1);
+        if (slot < static_cast<int>(kStage)) {
+          s_buf[slot] = make_uint2(key, static_cast<uint32_t>(pos));
+          atomicAdd(&s_hist[key >> 24], 1);
+        }
       }
     }
   });
+  __syncthreads();
+  const int nst = s_cnt;
+  if (nst > 0) {
+    if (threadIdx.x == 0) s_base = static_cast<int>(atomicAdd(pcount, static_cast<unsigned>(nst)));
+    __syncthreads();
+    const int base = s_base;
+    const int ncopy = min(nst, static_cast<int>(kStage));
+    for (int i = threadIdx.x; i < ncopy; i += kCapBlock)
+      if (base + i < static_cast<int>(p.cap)) cand[base + i] = s_buf[i];
+    if (threadIdx.x == 0)
+      atomicAdd(pstored, static_cast<unsigned>(ncopy));
+    for (uint32_t b = threadIdx.x; b < kRadix; b += kCapBlock) {
+      const int v = s_hist[b];
+      if (v != 0) atomicAdd(&phist[b], v);
+    }
+  }
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -321,19 +354,17 @@ __global__ __launch_bounds__(kSelBlock) void ballot_select_kernel(const BallotTo
     return;
   }
   const uint32_t n = static_cast<uint32_t>(p.counters[row * 4 + 0]); // exact count
-  const bool fast = (n >= topk) && (n <= p.cap);
+  const uint32_t n_stored = static_cast<uint32_t>(p.counters[row * 4 + 1]);
+  const bool fast = (n >= topk) && (n <= p.cap) && (n_stored >= n);
   int32_t* out_row = p.out + static_cast<int64_t>(row) * p.topk;
   const uint2* cand = p.cand + static_cast<int64_t>(row) * p.cap;
   const T* rowp = reinterpret_cast<const T*>(p.scores) + static_cast<int64_t>(row) * p.stride +
                   (p.row_starts != nullptr ? p.row_starts[row] : 0);
 
-  __shared__ int s_scan[2][kRadix + 1];
+  __shared__ int s_scan[kRadix + 1];
   __shared__ int s_h[2][kRadix + 1];
+  __shared__ int s_scratch[273];
   __shared__ int s_t, s_ngt, s_fill, s_res, s_nres, s_ctr, s_tie;
-  s_scan[0][kRadix] = 0;
-  s_scan[1][kRadix] = 0;
-  s_h[0][kRadix] = 0;
-  s_h[1][kRadix] = 0;
   if (threadIdx.x == 0) { s_t = -1; s_ngt = 0; s_fill = 0; s_res = 0; s_nres = 0; }
   __syncthreads();
 
@@ -358,19 +389,20 @@ __global__ __launch_bounds__(kSelBlock) void ballot_select_kernel(const BallotTo
   __syncthreads();
 
   // ---- round-0 boundary bin (crossing at topk) ----
-  suffix_scan_257(s_h[0], s_scan[0]); // result in s_h[0][i] = #{bin >= i}
+  suffix_scan_256_ip(s_h[0], s_scratch); // s_h[0][i] = #{bin >= i}
   if (threadIdx.x < kRadix) {
-    // '>=' left / '<=' right: the exactly-covered case must select a bin;
-    // any plateau winner yields n_gt <= topk and a nonempty bin when r0 > 0.
+    // '>=' left / '<=' right: the exactly-covered case must select a bin. Any
+    // plateau winner is CONSISTENT because n_gt is derived AFTER the barrier
+    // from the resolved bin (writing the pair from the winner races: two
+    // winners can tear t and ngt).
     if (s_h[0][threadIdx.x] >= static_cast<int>(topk) &&
         s_h[0][threadIdx.x + 1] <= static_cast<int>(topk)) {
       s_t = static_cast<int>(threadIdx.x);
-      s_ngt = s_h[0][threadIdx.x + 1];
     }
   }
   __syncthreads();
   const int t0 = s_t;      // >= 0: hist sums to >= topk on both paths
-  const int ngt0 = s_ngt;
+  const int ngt0 = s_h[0][t0 + 1];
 
   // ---- round-0 scatter: emit above-boundary to out; boundary -> residual
   //      (+ round-1 histogram of the residual, byte 1 of the 32-bit key) ----
@@ -418,18 +450,17 @@ __global__ __launch_bounds__(kSelBlock) void ballot_select_kernel(const BallotTo
   int parity = 1; // s_h[1] holds the round-1 histogram
   for (int round = 1; round <= 3 && need > 0; ++round) {
     const int shift = 24 - 8 * round;
-    suffix_scan_257(s_h[parity], s_scan[0]); // result in s_h[parity][i] = #{bin >= i}
+    suffix_scan_256_ip(s_h[parity], s_scratch); // s_h[parity][i] = #{bin >= i}
     if (threadIdx.x == 0) { s_t = -1; s_ngt = 0; s_ctr = 0; s_tie = 0; }
     __syncthreads();
     if (threadIdx.x < kRadix) {
       if (s_h[parity][threadIdx.x] >= need && s_h[parity][threadIdx.x + 1] <= need) {
         s_t = static_cast<int>(threadIdx.x);
-        s_ngt = s_h[parity][threadIdx.x + 1];
       }
     }
     __syncthreads();
     const int t = s_t;    // >= 0: residual >= need (invariant from round r-1)
-    const int ngt = s_ngt;
+    const int ngt = s_h[parity][t + 1];
     if (round < 3) {
       for (uint32_t i = threadIdx.x; i < kRadix; i += kSelBlock) s_h[1 - parity][i] = 0;
       if (threadIdx.x == 0) s_nres = 0;
@@ -552,8 +583,16 @@ struct TopKBallot {
         .topk = topk,
         .cap = cap,
         .target = target,
-        .cap_chunk = 16384u,
+        .cap_chunk = 4096u,
     };
+
+    // ~264 CTAs total (2 per SM x 132 SMs): one wave, long streams per CTA.
+    // Small batches get small chunks (spread one row across the SMs); large
+    // batches get whole-row-ish chunks (fewer waves, longer pipelines).
+    const int64_t want = static_cast<int64_t>(stride) * static_cast<int64_t>(batch) / 264 + 1;
+    uint32_t chunk = 4096;
+    while (chunk < want && chunk < (1u << 20)) chunk <<= 1;
+    p.cap_chunk = chunk;
 
     const uint32_t chunks = static_cast<uint32_t>((stride + p.cap_chunk - 1) / p.cap_chunk);
     const dim3 grid_capture(chunks, batch);

@@ -97,6 +97,7 @@ struct FusedSmem {
     } fb;
   } u;
   int scan[2][kRadix + 1];         // sample scans + fallback coarse/sub hists
+  int scratch[273];                // suffix_scan_256_ip scratch
   int32_t out_indices[kMaxTopK];   // select output: 8 KB
   int tbin, ngt, tsub, ngt_sub;    // plan scalars
   TieHandleSmem tie;               // ~2.2 KB (radix_tie_select scratch)
@@ -402,8 +403,6 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
     const uint32_t E = n_s / kSampleWindows;
     for (uint32_t i = tx; i < kNumWarps * kRadix; i += kBlockSize)
       (&s->u.sample.coarse[0][0])[i] = 0;
-    s->scan[0][kRadix] = 0;
-    s->scan[1][kRadix] = 0;
     if (tx == 0) s->tbin = 0;
     __syncthreads();
     const uint32_t warp = tx / 32;
@@ -424,14 +423,14 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
       s->scan[0][tx] = acc;
     }
     __syncthreads();
-    // the coarse rows are dead now: reuse row 0 as the sub-bin histogram
+    // the coarse rows are dead: reuse row 0 as the sub-bin histogram
     // (MUST be re-zeroed first — it still holds warp 0's coarse counts)
     for (uint32_t i = tx; i < kRadix; i += kBlockSize) s->u.sample.coarse[0][i] = 0;
     __syncthreads();
     uint32_t j = (p.target * n_s + length - 1) / length;
     j = max(j, 1u);
     j = min(j, n_s);
-    suffix_scan_257(s->scan[0], s->scan[1]); // scan[0][i] = #{coarse >= i}
+    suffix_scan_256_ip(s->scan[0], s->scratch); // scan[0][i] = #{coarse >= i}
     if (tx < kRadix) {
       if (s->scan[0][tx] >= (int)j && s->scan[0][tx + 1] < (int)j)
         s->tbin = (int)tx;
@@ -452,10 +451,8 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
       }
       __syncthreads();
       if (tx < kRadix) s->scan[0][tx] = s->u.sample.coarse[0][tx];
-      s->scan[0][kRadix] = 0;
-      s->scan[1][kRadix] = 0;
       __syncthreads();
-      suffix_scan_257(s->scan[0], s->scan[1]); // scan[0][i] = #{sub >= i}
+      suffix_scan_256_ip(s->scan[0], s->scratch); // scan[0][i] = #{sub >= i}
       if (tx == 0) s->tsub = -1;
       __syncthreads();
       if (tx < kRadix) {
@@ -475,8 +472,13 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
   __syncthreads();
   stream_window(row, length, [&](float x, uint32_t idx) {
     if (!(x < v_s)) { // NaN-inclusive
-      const auto pos = atomicAdd(&s->u.collect.count, 1);
-      if (pos < kCap) s->u.collect.cand[pos] = TieValue{x, idx};
+      // once the count passes kCap the row is doomed to the fallback: stop
+      // appending (a capture-all row would otherwise hammer the counter with
+      // `length` same-address atomics)
+      if (s->u.collect.count < kCap) {
+        const auto pos = atomicAdd(&s->u.collect.count, 1);
+        if (pos < kCap) s->u.collect.cand[pos] = TieValue{x, idx};
+      }
     }
   });
   __syncthreads();
@@ -500,16 +502,15 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
       atomicAdd(&s->scan[0][coarse16(x)], 1);
     });
     __syncthreads();
-    suffix_scan_257(s->scan[0], s->scan[1]);
+    suffix_scan_256_ip(s->scan[0], s->scratch);
     if (tx < kRadix) {
       if (s->scan[0][tx] >= (int)topk && s->scan[0][tx + 1] <= (int)topk) {
-        s->tbin = (int)tx;
-        s->ngt = s->scan[0][tx + 1];
+        s->tbin = (int)tx;   // ngt derived after the barrier (torn-pair race)
       }
     }
     __syncthreads();
     const int t0 = s->tbin;   // >= 0: hist sums to length > topk
-    const int ngt0 = s->ngt;
+    const int ngt0 = s->scan[0][t0 + 1];
     const int remain = (int)topk - ngt0; // > 0 unless the plateau hit exactly
 
     // gather (read 3): coarse > t0 -> out; coarse == t0 -> tie buffer
@@ -544,10 +545,7 @@ __global__ __launch_bounds__(kBlockSize, 2) void topk_prefill_fused_kernel(
           atomicAdd(&s->scan[0][sortable_f16(x) & 0xFFu], 1);
       });
       __syncthreads();
-      s->scan[0][kRadix] = 0;
-      s->scan[1][kRadix] = 0;
-      __syncthreads();
-      suffix_scan_257(s->scan[0], s->scan[1]); // scan[0][i] = #{sub >= i} (full bin)
+      suffix_scan_256_ip(s->scan[0], s->scratch); // scan[0][i] = #{sub >= i} (full bin)
       if (tx < kRadix) { s->tsub = -1; s->ngt_sub = 0; }
       __syncthreads();
       if (tx < kRadix) {

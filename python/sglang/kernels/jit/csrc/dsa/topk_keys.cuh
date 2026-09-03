@@ -85,5 +85,44 @@ SGL_DEVICE void suffix_scan_257(int* buf_a, int* buf_b) {
   }
 }
 
+/// Fast in-place suffix scan over the 256-bin histogram in hist[0..255]
+/// (hist[256] is set to 0 as the sentinel). Warp-parallel: 2 __syncthreads
+/// total (the Hillis-Steele version costs 16 — it dominated the small
+/// kernels' time at 1024 threads). scratch must hold >= 273 ints, NOT
+/// overlapping hist. Requires blockDim >= 256.
+SGL_DEVICE void suffix_scan_256_ip(int* __restrict__ hist, int* __restrict__ scratch) {
+  const int tid = static_cast<int>(threadIdx.x);
+  if (tid < 256) {
+    const int w = tid >> 5, l = tid & 31;
+    const int v = hist[tid];
+    int inc = v;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const int n = __shfl_up_sync(0xFFFFFFFFu, inc, d);
+      if (l >= d) inc += n;
+    }
+    scratch[tid] = inc - v;               // in-warp exclusive prefix
+    if (l == 31) scratch[256 + w] = inc;  // warp totals
+  }
+  __syncthreads();
+  if (tid < 8) {
+    const int v = scratch[256 + tid];
+    int inc = v;
+#pragma unroll
+    for (int d = 1; d < 8; d <<= 1) {
+      const int n = __shfl_up_sync(0xFFu, inc, d);
+      if (tid >= d) inc += n;
+    }
+    scratch[264 + tid] = inc - v;  // exclusive warp-prefix sums
+    if (tid == 7) scratch[272] = inc;  // grand total
+  }
+  __syncthreads();
+  if (tid < 256) {
+    const int excl = scratch[264 + (tid >> 5)] + scratch[tid];
+    hist[tid] = scratch[272] - excl;
+    if (tid == 0) hist[256] = 0;
+  }
+}
+
 } // namespace
 } // namespace sglang
