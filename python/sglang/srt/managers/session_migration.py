@@ -741,7 +741,10 @@ class NixlPlane:
                 d = dst_pages[off : off + max_pages]
                 sd = self.agent.get_xfer_descs(geom.page_descs(s), geom.mem)
                 dd = self.agent.get_xfer_descs(_spec_page_descs(spec, d), spec.get("mem", "DRAM"))
-                notif = f"mig_{pool}_{off}".encode()
+                # Notif must be inert to the PD KV receiver's parser
+                # (conn.py update_transfer_status: "{room}_{tag}_..."; unknown
+                # tags are ignored) -> numeric room head + "mig" tag.
+                notif = f"0_mig_{pool}_{off}".encode()
                 h = self.agent.initialize_xfer("WRITE", sd, dd, canonical, notif)
                 if not h:
                     raise RuntimeError("initialize_xfer returned None")
