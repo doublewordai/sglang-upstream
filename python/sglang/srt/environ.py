@@ -624,6 +624,20 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # draft-prefetch lane probe: per verify step, stash the draft seed top-k,
+    # the target's per-layer/per-position top-k, the per-layer resident tables,
+    # per-(layer,position) swap-in CUDA-event timings and miss counts, then
+    # append one JSON line per step to SGLANG_DPF_PROBE_OUT. Works with the
+    # eager and CUDA-graph verify paths; spec (target_verify) only.
+    SGLANG_DPF_PROBE = EnvBool(False)
+    SGLANG_DPF_PROBE_OUT = EnvStr("")
+    SGLANG_DPF_PROBE_REQS = EnvInt(2)
+    SGLANG_DPF_PROBE_RAW_STEPS = EnvInt(0)
+    # draft-prefetch: after the draft step, prefetch (draft seed top-k -
+    # resident) rows into each layer's device buffer on the coordinator's
+    # side stream, ordered by layer; the verify swap-ins wait per layer.
+    # Exact by construction (cache fill only).
+    SGLANG_DPF_PREFETCH = EnvBool(False)
     # Diagnostic: log HiSparse verify-step miss counts (per draft position,
     # last anchor group's plans) every N verify steps; 0 = off.
     SGLANG_HISPARSE_MISS_LOG = EnvInt(0)
@@ -631,6 +645,9 @@ class Envs:
     # full-GPU-grid kernel copies the recorded miss plan (warp per row).
     # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
     SGLANG_HISPARSE_WIDE_GATHER = EnvBool(True)
+    # mk-batch-curve: size the narrow copy_cache_planned fallback grid by bytes
+    # (one CTA per 64 KiB of worst-case miss bytes, capped at the SM count)
+    SGLANG_HISPARSE_RIGHTSIZE_COPY_GRID = EnvBool(False)
 
     # HiSparse IO streams (write-staging / decode-backup / shared-index
     # prefetch / the swap-in gather) bound to a CUDA green context holding this
@@ -645,6 +662,15 @@ class Envs:
     # is b x 960 threads (<= 5 SMs), so SM isolation buys nothing there while
     # the fork/join adds latency; on by default would change step timing.
     SGLANG_HISPARSE_SWAPIN_GREEN_CTX = EnvBool(False)
+    # Defer the decode hisparse map/eager-backup chain (map_last_loc_to_buffer)
+    # from prepare_for_decode to the forward launch (run_batch), i.e. past the
+    # per-step DP-attention metadata all_gather. A rank still running that chain
+    # is a straggler entering the collective; every other rank then waits in
+    # c10d::Work::wait with its GPU idle (the synchronized 8-12 ms decode
+    # stalls; see lanes hiccup/hiccup-2). Default off.
+    SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
+    # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
+    SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
@@ -732,6 +758,7 @@ class Envs:
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_BLOB_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.

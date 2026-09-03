@@ -122,14 +122,14 @@ class SchedulerLoadInquirer:
             )
 
         # HiSparse host KV pool state (host-pool backpressure): the decode
-        # arm pins MLA latent in the host pool, so free host tokens are the
-        # admission constraint the dispatcher/metrics need to see.
+        # arm pins MLA latent in the host pool, so free/pinned host tokens
+        # are the admission constraint the dispatcher/metrics need to see.
         # NOTE: SchedulerLoadInquirer is a wrapper dataclass (not a Scheduler
         # mixin) — reach the coordinator through tp_worker.model_runner,
         # never via getattr(self, ...): a slots dataclass has no scheduler
-        # attributes, so such guards silently evaluate to their defaults
-        # (prod showed host_free_tok=[0,...] with pools 60-98% full).
-        host_pool_free_tokens = host_pool_total_tokens = host_pool_wait_events = 0
+        # attributes, so such guards silently evaluate to their defaults.
+        host_pool_free_tokens = host_pool_total_tokens = host_pool_pinned_tokens = 0
+        host_pool_evictable_tokens = host_pool_wait_events = 0
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             coordinator = None
             if self.server_args.enable_hisparse:
@@ -141,8 +141,18 @@ class SchedulerLoadInquirer:
                     host_pool = coordinator.mem_pool_host
                     host_pool_free_tokens = int(host_pool.available_size())
                     host_pool_total_tokens = int(host_pool.size)
+                    host_pool_pinned_tokens = (
+                        host_pool_total_tokens - host_pool_free_tokens
+                    )
                     host_pool_wait_events = int(
                         self.get_disagg_decode_prealloc_queue().host_pool_wait_events
+                    )
+                    # Unlocked retained radix rows: host tokens the admission
+                    # path can free by eviction (what the scheduler log calls
+                    # `evictable=`). locked = pinned - evictable.
+                    host_pool_evictable_tokens = int(
+                        self.get_disagg_decode_prealloc_queue()
+                        .tree_cache.evictable_size()
                     )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
@@ -262,6 +272,8 @@ class SchedulerLoadInquirer:
             num_active_tokens=num_active_tokens,
             host_pool_free_tokens=host_pool_free_tokens,
             host_pool_total_tokens=host_pool_total_tokens,
+            host_pool_pinned_tokens=host_pool_pinned_tokens,
+            host_pool_evictable_tokens=host_pool_evictable_tokens,
             host_pool_wait_events=host_pool_wait_events,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
