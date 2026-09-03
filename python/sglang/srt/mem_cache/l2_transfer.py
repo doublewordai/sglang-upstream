@@ -6,6 +6,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -54,12 +55,33 @@ class L2TransferEngine:
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
 
+    @staticmethod
+    def _split_bulk(transfers: list[L2Transfer], attr: str) -> tuple[list[L2Transfer], list[L2Transfer]]:
+        """Partition transfers into (bulk-eligible, per-layer-loop) when
+        SGLANG_HICACHE_BULK_COPY is on. Only whole-pool transfers without a
+        layer mapper (CP sharding) or draft semantics qualify."""
+        if envs.SGLANG_HICACHE_BULK_COPY.get():
+            bulk = [
+                t
+                for t in transfers
+                if t.layer_mapper is None
+                and not t.is_draft
+                and getattr(t.host_pool, attr, False)
+            ]
+        else:
+            bulk = []
+        loop = [t for t in transfers if id(t) not in {id(x) for x in bulk}]
+        return bulk, loop
+
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         with device_module.stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
+            # NOTE: bulk dispatch for D2H lives inside
+            # MLATokenToKVPoolHost.backup_from_device_all_layer (the hisparse
+            # coordinator also calls it directly, bypassing this engine).
             for transfer in transfers:
                 transfer.host_pool.backup_from_device_all_layer(
                     transfer.device_pool,
@@ -85,8 +107,16 @@ class L2TransferEngine:
         with device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
+            bulk, loop = self._split_bulk(transfers, "supports_bulk_load")
+            for transfer in bulk:
+                transfer.host_pool.load_to_device_bulk(
+                    transfer.device_pool,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    self.io_backend,
+                )
             for layer_id in range(layer_num):
-                for transfer in transfers:
+                for transfer in loop:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
                         if transfer.layer_mapper is not None
@@ -107,6 +137,11 @@ class L2TransferEngine:
                         is_draft=transfer.is_draft,
                     )
                 if on_layer_done is not None:
+                    on_layer_done(layer_id)
+            if bulk and not loop and on_layer_done is not None:
+                # bulk completed every layer at once; still advance the
+                # per-layer completion counter so acks fire normally
+                for layer_id in range(layer_num):
                     on_layer_done(layer_id)
             ack_finish.record()
             self._record_stream(transfers, self.host_to_device_stream)

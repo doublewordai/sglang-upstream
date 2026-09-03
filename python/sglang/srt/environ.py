@@ -453,6 +453,12 @@ class Envs:
     # mtp-debug lane: log the first target-verify step's hisparse page table
     # and the draft pool's transferred rows (diagnosis of spec x hisparse).
     SGLANG_MTP_DEBUG = EnvBool(False)
+    # Bulk host<->device HiCache transfers: coalesce page-granular index sets
+    # into contiguous runs and move them with cudaMemcpyBatchAsync (copy
+    # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
+    # copies; affects the HiCache H2D load path (page_first host pools) and
+    # the layer_first D2H backup path (hisparse staging backup).
+    SGLANG_HICACHE_BULK_COPY = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -701,6 +707,15 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Fail hard instead of silently falling back to base pages when the
+    # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
+    # hugetlb mmap failure, THP coverage below ~98%).
+    SGLANG_HUGEPAGE_STRICT = EnvBool(False)
+    # Disable transparent hugepages for the whole engine process tree at init
+    # (prctl PR_SET_THP_DISABLE, inherited by children). Stops khugepaged/
+    # kcompactd churn on non-pool host allocations while the pools themselves
+    # use explicit hugepages via SGLANG_HUGEPAGE_SIZE.
+    SGLANG_DISABLE_THP = EnvBool(False)
     # Back host KV pools with MAP_PRIVATE anonymous pages (huge pages off) instead
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
@@ -1037,6 +1052,9 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # Lane deepep-v2: V2 ElasticBuffer sizing (max tokens per rank in a step;
+    # chunked-prefill-size per DP rank on the prefill arm).
+    SGLANG_DEEPEP_V2_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
@@ -1053,6 +1071,17 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+
+    # GLM-5.3 small-M decode GEMMs: route the fp8 block-128 W8A8 GEMM
+    # through the JIT CUTLASS sm90 blockwise kernel (ex-67 recipe, swapAB
+    # orientation, variant 5 = cooperative 128x16x128) instead of DeepGEMM
+    # for the measured-winning (N, K) shapes at small M (GH200 bench,
+    # lane w8a16-gemm 2026-09-02; outputs bit-exact vs DeepGEMM):
+    #   o_proj 16384->6144  0.86x/0.92x/0.92x at M=1/4/16
+    #   d_dn   12288->6144  0.91x/0.94x/0.94x
+    #   sh_gu   6144->4096  0.96x/0.93x/1.10x (M<=4 only)
+    # No effect on other shapes/M or on non-sm90 CUDA.
+    SGLANG_GLM_FP8_BLOCKWISE_SMALLM_GEMM = EnvBool(False)
 
     # Megakernel MoE (doublewordai/megakernel): per-rank decode token capacity
     SGLANG_MEGAKERNEL_NUM_MAX_TOKENS_PER_RANK = EnvInt(64)
@@ -1406,6 +1435,11 @@ class Envs:
     # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
     # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
     SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(False)
+    # lane/streamindex-topk: key-chunked scorer + partition-merge candidate
+    # maintenance for the prefill indexer top-k; the [q, L] logits tensor
+    # never exists (exact top-2048, tie-consistent at the boundary).
+    SGLANG_DSA_TOPK_STREAMINDEX = EnvBool(False)
+    SGLANG_DSA_TOPK_STREAMINDEX_W = EnvInt(8192)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )

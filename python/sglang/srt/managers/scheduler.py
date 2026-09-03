@@ -324,6 +324,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -2812,10 +2813,24 @@ class Scheduler(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if cold_trace_enabled():
+                cold_trace(
+                    "pf_bootstrap_add",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    input_len=len(req.origin_input_ids),
+                )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
+                if cold_trace_enabled():
+                    cold_trace(
+                        "dec_prealloc_add",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        input_len=len(req.origin_input_ids),
+                    )
             else:
                 req.time_stats.set_retract_time()
         else:
@@ -3553,6 +3568,9 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled() and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in can_run_list:
+                cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
