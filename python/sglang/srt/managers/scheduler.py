@@ -574,6 +574,8 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
+        self.maybe_init_session_migration()
+
         # warm-local-prefill (lane warm-local-prefill): decode-rank local
         # extends of warm-turn appends. Requests whose rid carries the
         # "WLP-" marker (set by the bench client / future router hook) take
@@ -1825,6 +1827,9 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1869,6 +1874,9 @@ class Scheduler(
             maybe_log_pool_aging(self)
             if self.gracefully_exit:
                 break
+
+            if self.session_migration_agent is not None:
+                self.session_migration_agent.poll()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2040,6 +2048,41 @@ class Scheduler(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
+
+    def maybe_init_session_migration(self) -> None:
+        """Start the session-migration agent when SGLANG_RANK_MIGRATION_PORT_BASE
+        is set (prefill-arm DP ranks push session host pages to each other)."""
+        self.session_migration_agent = None
+        port_base = os.environ.get("SGLANG_RANK_MIGRATION_PORT_BASE")
+        if not port_base:
+            return
+        try:
+            from sglang.srt.managers.session_migration import (
+                MIGRATION_STATS_FILE_ENV,
+                SessionMigrationAgent,
+            )
+
+            dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            # Pin the UCCL agent to this rank's physical CXI device (the CUDA
+            # device id is remapped by CUDA_VISIBLE_DEVICES).
+            cxi = None
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible:
+                ids = [int(x) for x in visible.split(",") if x.strip() != ""]
+                if 0 <= self.ps.gpu_id < len(ids):
+                    cxi = ids[self.ps.gpu_id]
+            agent = SessionMigrationAgent(
+                tree_cache=self.tree_cache,
+                dp_rank=dp_rank,
+                port=int(port_base) + dp_rank,
+                cxi_device_index=cxi,
+                stats_file=os.environ.get(MIGRATION_STATS_FILE_ENV),
+            )
+            agent.start()
+            self.session_migration_agent = agent
+        except Exception:
+            logger.exception("session-migration agent init failed; disabled")
+            self.session_migration_agent = None
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
@@ -2805,6 +2848,13 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
+            logger.info(
+                "[kvl3] prefetch gate rid=%s last_host_node=%s is_backuped=%s is_root=%s prefix_idx=%d host_hit=%d",
+                req.rid, req.last_host_node,
+                tree_cache.is_backuped(req.last_host_node),
+                tree_cache.is_root(req.last_host_node),
+                len(req.prefix_indices), req.host_hit_length,
+            )
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
                 req.last_host_node
             ):
@@ -2814,7 +2864,12 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
+                    # FULL chain incl. the matched node's own pages: the core
+                    # get_prefix_hash_values returns ancestors only, and
+                    # position-aware storage backends (blob) address groups
+                    # by absolute chain position.
                     tree_cache.get_prefix_hash_values(req.last_host_node)
+                    + tree_cache.get_hash_values(req.last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )

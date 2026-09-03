@@ -1461,6 +1461,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        return self.tree_core.get_hash_values(node_id)
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -1845,6 +1848,10 @@ class UnifiedRadixCache(BasePrefixCache):
         def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
+                logger.info(
+                    "[kvl3] drain hit rid=%s storage_hit_tokens=%d terminated=%s",
+                    req_id, operation.storage_hit_count, operation.is_terminated(),
+                )
                 info = self.ongoing_prefetch.get(req_id)
                 if info is None:
                     # request already aborted/cleaned up, skip
@@ -1883,6 +1890,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 operation.host_indices = host_indices
                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
                 cc.prefetch_buffer.put(operation)
+                logger.info(
+                    "[kvl3] drain alloc rid=%s alloc_len=%d -> io thread",
+                    req_id, alloc_len,
+                )
 
         def _drain_backup():
             drained = 0
@@ -2143,16 +2154,23 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if finish_count is None:
-            # Every rank must enter the all_reduce below; ongoing_write_through can
-            # diverge across ranks (e.g. write_backup returning 0 on a subset).
-            finish_count = 0
-            if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cc.ack_write_queue)
+            # Ack completion is per-rank data: a PP stage's write-through covers
+            # its own layers, and the pipeline makes PP0's ack queue run ahead
+            # of later stages, so the old PP0-counts-then-broadcast scheme
+            # popped past the end of a lagging stage's queue (IndexError).
+            # Reduce the ready count over the attention groups only (shared
+            # device data under TP/CP attention; a no-op singleton under DP
+            # attention), matching drain_storage_control_queues.
+            finish_count = self._count_ready_acks(cc.ack_write_queue)
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = finish_count_tensor.item()
+            self._all_reduce_attn_groups(
+                finish_count_tensor, torch.distributed.ReduceOp.MIN
+            )
+            finish_count = min(
+                finish_count_tensor.item(), len(cc.ack_write_queue)
+            )
 
         # Process completed acks
         while finish_count > 0:
@@ -2184,19 +2202,19 @@ class UnifiedRadixCache(BasePrefixCache):
         if cc is None:
             return
         if finish_count is None:
-            # Every rank must enter the all_reduce below; ongoing_load_back can
-            # diverge across ranks.
-            finish_count = 0
-            if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cc.ack_load_queue)
+            # Same as writing_check: reduce over the attention groups only; a
+            # PP stage's load-back acks are its own data, so PP0's count must
+            # never gate (nor exceed) a later stage's local queue.
+            finish_count = self._count_ready_acks(cc.ack_load_queue)
             # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
             # equal iff reclaim victim order matched on every rank.
             digest = self.tree_core.write_back_duplicate_reclaim_digest
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_attn_groups(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
+            finish_count = min(finish_count, len(cc.ack_load_queue))
             assert (
                 sync_tensor[1].item() == -sync_tensor[2].item()
             ), "write_back duplicate-reclaim victims diverged across TP ranks"
