@@ -1690,8 +1690,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 device=self.device,
             )
         )
-        ev0 = self.device_module.Event(enable_timing=True)
-        ev1 = self.device_module.Event(enable_timing=True)
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
         ev0.record()
         out = self._verify_impl(batch, grammar_barrier)
         ev1.record()
