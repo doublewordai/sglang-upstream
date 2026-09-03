@@ -1135,6 +1135,19 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation in ("silu", "situ")
 
+    # lane prefill-graphs: worst-case dispatch on an idle DP rank returns
+    # degenerate empty tensors (no rows); the masked preprocess cannot handle
+    # those, so route empties through the original zero-safe list path with a
+    # synthesized all-zero per-expert list (identical to the sync path on
+    # zero-recv ranks, which production already exercises).
+    degenerate = (
+        hidden_states.dim() < 2
+        or hidden_states.shape[0] == 0
+        or topk_ids.numel() == 0
+    )
+    if not num_recv_tokens_per_expert and degenerate:
+        num_recv_tokens_per_expert = [0] * runner_config.num_local_experts
+
     if not num_recv_tokens_per_expert:
         # lane prefill-graphs: worst-case (num_worst_tokens) dispatch returned no
         # host per-expert list. Derive the masked grouped-GEMM layout on device
