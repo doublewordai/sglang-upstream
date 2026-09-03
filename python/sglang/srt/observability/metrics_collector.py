@@ -2535,14 +2535,19 @@ class AllRanksLoadSnapshotCollector:
         return []
 
     def _label_values(self, snapshot) -> list:
-        """Label values in self._labelnames order (add_metric takes a list)."""
+        """Label values in self._labelnames order (add_metric takes a list).
+
+        All values are str-coerced: the venv's prometheus_client escapes label
+        values with str.replace at exposition time and crashes on ints (found
+        on the rig: "'int' object has no attribute 'replace'").
+        """
         values = [
-            self._model_name,
-            self._engine_type,
-            snapshot.tp_rank,
-            snapshot.pp_rank,
-            snapshot.moe_ep_rank,
-            snapshot.dp_rank,
+            str(self._model_name),
+            str(self._engine_type),
+            str(snapshot.tp_rank),
+            str(snapshot.pp_rank),
+            str(snapshot.moe_ep_rank),
+            str(snapshot.dp_rank),
         ]
         if self._priority:
             # Scheduler-side gauges carry a priority label ("" = total).
