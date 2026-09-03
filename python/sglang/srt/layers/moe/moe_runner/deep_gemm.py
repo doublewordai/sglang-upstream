@@ -1161,6 +1161,16 @@ def pre_permute_deepep_normal_to_deep_gemm(
             if quant_info.w13_weight.dtype == torch.bfloat16
             else torch.float8_e4m3fn
         )
+        # lane prefill-graphs: when the dispatch already emitted per-token-group
+        # fp8 (use_fp8 dispatch), pass its scales straight through — the fill
+        # kernel gathers rows+scales in the fp8 domain, no requant roundtrip.
+        input_scale = (
+            hidden_states_scale
+            if hidden_states.dtype == torch.float8_e4m3fn
+            and output_dtype == torch.float8_e4m3fn
+            and hidden_states_scale is not None
+            else None
+        )
         masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
             moe_ep_deepgemm_preprocess(
                 topk_ids,
@@ -1170,6 +1180,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
                 quant_info.block_shape,
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
+                input_scale=input_scale,
             )
         )
         # capture BEFORE dispose_tensor (inplace frees the storage and
