@@ -22,9 +22,11 @@ import os
 import shutil
 
 from safetensors import safe_open
+from safetensors.torch import load_file
 
 import torch
 from safetensors import safe_open
+from safetensors.torch import load_file
 from safetensors.torch import save_file
 
 CKPT = "/projects/s6p/hf/hub/models--zai-org--GLM-5.3/snapshots/e0b07fd2751b42d5efa199cc02c2b271deadc516"
@@ -153,15 +155,30 @@ def main():
     # (the bf16-dequant -> requant path costs ~0.4% per-element drift).
     if args.orig_ckpt:
         idx = json.load(open(os.path.join(args.orig_ckpt, "model.safetensors.index.json")))["weight_map"]
+        # kv_b is TRAINABLE (14.7M params): only passthrough if training did
+        # not move it (vs the extraction); else keep the trained requantized
+        # values so the export reflects what was trained.
+        small = load_file(os.path.join(args.weights_dir, "draft.safetensors"))
+        kv_drift = (
+            (ft["attn.kv_b"].float() - small["kv_b"].float()).abs().max().item()
+            / small["kv_b"].float().abs().max().item()
+        )
+        kv_moved = kv_drift > 1e-3
+        if kv_moved:
+            print(f"kv_b moved during training (drift {kv_drift:.3e}) -> keeping trained requantized kv_b")
+        kvb_keys = set() if kv_moved else {
+            f"model.layers.{L}.self_attn.kv_b_proj.weight",
+            f"model.layers.{L}.self_attn.kv_b_proj.weight_scale_inv",
+        }
         n_passthrough = 0
         for k in list(out.keys()):
-            if (".mlp.experts." in k and f".{L}." in k) or k.startswith(f"model.layers.{L}.self_attn.kv_b_proj."):
+            if (".mlp.experts." in k and f".{L}." in k) or k in kvb_keys:
                 if k not in idx:
                     continue
                 with safe_open(os.path.join(args.orig_ckpt, idx[k]), framework="pt", device="cpu") as f:
                     out[k] = f.get_tensor(k)
                 n_passthrough += 1
-        print(f"passthrough from orig ckpt: {n_passthrough} fp8 tensors (experts + kv_b)")
+        print(f"passthrough from orig ckpt: {n_passthrough} fp8 tensors (experts + kv_b if unmoved)")
 
     save_file(out, os.path.join(args.out, "model.safetensors"))
 

@@ -83,11 +83,14 @@ def main():
         r = ((got - ref).abs().max() / ref.abs().max()).item()
         print(f"{k}: trained-fp8 requant maxabs/maxref={r:.3e}")
         worst.append((r, k))
-        if r >= 0.02:
+        # bound: e4m3 half-step of a mid/high-range code in the max block
+        # is 1.8-3.6% of block max ~= tensor max; allow 4% (end-to-end
+        # accept measurement is the final arbiter anyway)
+        if r >= 0.04:
             ok = False
 
-    # kv_b (trained? NO - kv_b is in the attention but was it trainable?
-    # attn.kv_b is a frozen buffer too (part of w_kc/w_vc split) -> exact-ish
+    # kv_b is TRAINABLE in our setup (14.7M params): if it moved during
+    # training the export must carry the trained (requantized) values
     kvb = f"model.layers.{L}.self_attn.kv_b_proj.weight"
     q = ex.get_tensor(kvb)
     s = ex.get_tensor(kvb[: -len(".weight")] + ".weight_scale_inv")
@@ -95,7 +98,7 @@ def main():
     ref = ft["attn.kv_b"].float()
     r = ((got - ref).abs().max() / ref.abs().max()).item()
     print(f"{kvb}: kv_b requant maxabs/maxref={r:.3e}"); worst.append((r, kvb))
-    if r >= 0.02:
+    if r >= 0.04:
         ok = False
 
     # frozen routed experts: must round-trip essentially exactly
@@ -120,7 +123,7 @@ def main():
         idx = json.load(open(os.path.join(args.orig_ckpt, "model.safetensors.index.json")))["weight_map"]
         npt = nbit = 0
         for k in list(ex.keys()):
-            if (".mlp.experts." in k and f".{L}." in k) or k.startswith(f"model.layers.{L}.self_attn.kv_b_proj."):
+            if ".mlp.experts." in k and f".{L}." in k:  # experts only: kv_b is trainable
                 if k not in idx:
                     continue
                 with safe_open(os.path.join(args.orig_ckpt, idx[k]), framework="pt", device="cpu") as f:

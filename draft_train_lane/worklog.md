@@ -200,3 +200,21 @@
   our teacher-forced training distribution: an EAGLE-worker change with zero
   retraining; cheapest deep-K fix, try before any second drafter. Residual-objective
   arm (logit-delta matching, zero new params) implemented, running.
+- 05:25 UTC Day-2 burst complete. Objective arms done: at lr2e-4/w256/s400 pure-parallel
+  estA4 1.63 beats chain (1.03) and chain+residual (1.13 at w=0.5, 1.03 at w=1.0 with
+  parallel top-1 degraded); recipes don't stack on the dummy pilot; real-data run
+  arbitrates all three arms (one command each). Scout notes recorded in variants.md:
+  DFlash-style verifier-hidden conditioning = ZERO-retraining worker change matching our
+  teacher-forced training distribution (cheapest deep-K fix, try before any new drafter);
+  P-EAGLE (medium fork); AngelSpec routing + ATLAS adaptive = Gate B architectures;
+  EAGLE-3.1 depth pathologies (our hnorm/shared_head_norm discipline covers post-norm;
+  attention-drift escalation path noted). All committed 6cbf291ed4; bundles on gotenks.
+- 06:00 UTC Day-2: recipe milestone complete on the smoke capture (199k tok, real val):
+  val top-1 0.165 (dummy-target ceiling - recalibrates pilot absolutes), first per-segment
+  numbers (p .43 / c .22 / j .52), export+verify+load PASS after the verify caught a REAL
+  bug (trainable kv_b silently discarded by unconditional fp8 passthrough - now conditional
+  on drift; experts stay bit-identical 1536/1536). GO/NO-GO row written: GO - 1-2 days of
+  prod capture (57M tok/day at 4k req/h) or a few replay passes cover the 10-100M-token
+  fine-tune regime; <6 GPU-h per arm; recipe adjustment for real data = LOW lr (1e-5/5e-5
+  arms + cosine decay + early stop) since the head starts at ~0.8 top-1, not from scratch.
+  VAT (verification-aware training) implemented + arm in flight at the chain-helpful config.
