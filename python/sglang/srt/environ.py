@@ -322,6 +322,10 @@ class Envs:
     # Logging
     # ===================================================================
     SGLANG_LOG_GC = EnvBool(False)
+    # decode-cpu-path: auto gc.freeze after scheduler init; log every GC pause
+    # >= 1ms (scheduler process) for the timeline attribution.
+    SGLANG_AUTO_FREEZE_GC = EnvBool(True)
+    SGLANG_DCP_GC_LOG = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
