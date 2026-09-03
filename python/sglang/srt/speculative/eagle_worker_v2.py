@@ -1679,6 +1679,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 except OSError as e:
                     logger.warning("verify timing write failed: %s", e)
         bs = int(batch.req_pool_indices.shape[0])
+        spec = batch.spec_info
         layout = getattr(spec, "ragged_verify_layout", None)
         vl_clone = (
             layout.verify_lens.to(torch.int64).clone()
