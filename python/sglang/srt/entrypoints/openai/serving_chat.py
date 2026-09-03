@@ -71,6 +71,10 @@ from sglang.srt.function_call.utils import (
     normalize_json_schema_types,
 )
 from sglang.srt.managers.delta_tokenizer import DeltaTokenizerCache
+from sglang.srt.managers.parallel_tokenizer import (
+    ParallelTokenizer,
+    parallel_tokenize_enabled,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -205,6 +209,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self._parallel_tokenizer = ParallelTokenizer(self.tokenizer_manager.tokenizer)
         self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
@@ -1347,6 +1352,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         DeltaTokenizerCache.session_key(openai_compatible_messages),
                         **encode_kwargs,
                     )
+                elif parallel_tokenize_enabled():
+                    prompt_ids = self._parallel_tokenizer.encode(
+                        rendered_prompt, **encode_kwargs
+                    )
                 else:
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
@@ -1457,7 +1466,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop.extend(request.stop)
 
         if not is_multimodal:
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+            if parallel_tokenize_enabled():
+                prompt_ids = self._parallel_tokenizer.encode(prompt)
+            else:
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
         return MessageProcessingResult(
             prompt=prompt,

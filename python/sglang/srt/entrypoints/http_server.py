@@ -439,9 +439,27 @@ class ORJSONRequest(Request):
     on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
     """
 
+    async def body(self) -> bytes:
+        if not hasattr(self, "_body"):
+            ts = self.scope.get("_ingest_ts")
+            if ts is not None:
+                ts["body_start"] = time.perf_counter()
+            self._body = await super().body()
+            ts = self.scope.get("_ingest_ts")
+            if ts is not None:
+                ts["body"] = time.perf_counter()
+                ts["body_bytes"] = len(self._body)
+        return self._body
+
     async def json(self) -> Any:
         if not hasattr(self, "_json"):
+            ts = self.scope.get("_ingest_ts")
+            if ts is not None:
+                ts["json_start"] = time.perf_counter()
             self._json = orjson.loads(await self.body())
+            ts = self.scope.get("_ingest_ts")
+            if ts is not None:
+                ts["json"] = time.perf_counter()
         return self._json
 
 
@@ -450,6 +468,7 @@ class ORJSONRoute(APIRoute):
         original_handler = super().get_route_handler()
 
         async def custom_handler(request: Request):
+            request.scope.setdefault("_ingest_ts", {})["route"] = time.perf_counter()
             return await original_handler(ORJSONRequest(request.scope, request.receive))
 
         return custom_handler
