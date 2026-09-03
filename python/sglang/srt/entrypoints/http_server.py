@@ -118,6 +118,8 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    HandoverExportReqInput,
+    HandoverImportReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -1155,6 +1157,64 @@ async def hicache_storage_backend_status():
         )
     }
 
+
+
+
+# Generation handover (warm start): heir pulls the old generation's host-tier
+# radix cache between boot and validate. Old side: /handover/export; heir:
+# /handover/import. Both require --admin-api-key.
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/handover/import \
+#   -H 'Content-Type: application/json' -d '{"src_host": "10.1.2.3", "src_http_port": 30000}'
+@app.api_route("/handover/import", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def handover_import(obj: Annotated[HandoverImportReqInput, Body()]):
+    """Heir-side: pull the old generation's host-tier cache and import it."""
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.handover_import(
+        src_host=obj.src_host,
+        src_http_port=obj.src_http_port,
+        timeout_s=obj.timeout_s,
+        verify=obj.verify,
+        admin_key=obj.admin_key,
+    )
+    return ORJSONResponse(
+        content={
+            "success": ret.success,
+            "message": ret.message,
+            "data": ret.data,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/handover/export \
+#   -H 'Content-Type: application/json' -d '{"phase": "info"}'
+@app.api_route("/handover/export", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def handover_export(obj: Annotated[HandoverExportReqInput, Body()]):
+    """Old-side: phase=info (sizes), phase=push (RDMA push), phase=release."""
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.handover_export(
+        phase=obj.phase,
+        model_path=obj.model_path,
+        staged=obj.staged,
+        payload_json=obj.payload_json,
+        timeout_s=obj.timeout_s,
+    )
+    return ORJSONResponse(
+        content={
+            "success": ret.success,
+            "message": ret.message,
+            "data": ret.data,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)

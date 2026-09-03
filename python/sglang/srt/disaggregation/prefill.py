@@ -31,6 +31,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
@@ -71,9 +72,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_memory,
     get_parallel,
     get_schedule,
 )
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -237,12 +240,25 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
+        kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            if hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+            # Draft (NextN) layers sit at global ids [num_hidden_layers, ...).
+            # Register them so a PP decode peer pairs this stage's entries
+            # (its target layers +, on the LAST stage, the draft layer) by
+            # layer id instead of treating the longer decode list as
+            # decode-only speculative decoding.
+            draft_num = len(draft_kv_data_ptrs)
+            num_hidden_layers = self.scheduler.model_config.num_hidden_layers
+            kv_layer_ids += list(
+                range(num_hidden_layers, num_hidden_layers + draft_num)
+            )
+        elif self.draft_token_to_kv_pool is not None:
+            kv_layer_ids = []
+        kv_args.kv_layer_ids = kv_layer_ids
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -253,6 +269,12 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        # PP + spec: only the last PP stage owns the draft hidden states /
+        # DSA top-k that fill the spec aux components; earlier stages skip
+        # them at send time (their rows are zero/stale and share the decode
+        # side's destination row).
+        kv_args.aux_spec_buf_range = self.metadata_buffers.get_spec_aux_range()
+        kv_args.aux_send_spec_bufs = self.pp_rank == self.pp_size - 1
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
@@ -359,6 +381,14 @@ class PrefillBootstrapQueue:
             decode_prefix_len,
             num_pages,
         )
+        cold_trace(
+            "pf_bootstrap_done",
+            rid=req.rid,
+            room=req.bootstrap_room,
+            input_len=num_kv_indices,
+            decode_prefix_len=decode_prefix_len,
+            send_pages=num_pages,
+        )
         req.pending_bootstrap = False
         return True
 
@@ -455,6 +485,12 @@ class PrefillBootstrapQueue:
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
+                    cold_trace(
+                        "pf_waiting_entry",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        optimistic=1,
+                    )
             elif poll == KVPoll.WaitingForInput:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
@@ -465,6 +501,12 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
+                cold_trace(
+                    "pf_waiting_entry",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    optimistic=0,
+                )
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -552,6 +594,13 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        # Poll async HiCache events (write-through acks, load-backs). The
+        # normal loop does this in get_next_batch_to_run; without it the
+        # disagg-prefill loop never releases write-through page locks and the
+        # pool fills with protected (unevictable) pages under sustained load.
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            self.tree_cache.check_hicache_events()
+
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -576,6 +625,11 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -615,6 +669,11 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -716,6 +775,13 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if cold_trace_enabled():
+                cold_trace(
+                    "pf_result_entry",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    mid=req.inflight_middle_chunks,
+                )
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -895,6 +961,16 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                cold_trace(
+                    "pf_last_ack",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    transfer_ms=(
+                        req.time_stats.prefill_kv_transfer_finish_time
+                        - req.time_stats.prefill_transfer_queue_entry_time
+                    )
+                    * 1000,
+                )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
@@ -1301,6 +1377,13 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        cold_trace(
+            "pf_send_call",
+            rid=req.rid,
+            room=req.bootstrap_room,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1324,6 +1407,15 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices if segment_is_last else None,
                 num_kv_tokens=seg_end - seg_start,
             )
+        cold_trace(
+            "pf_chunk_send",
+            rid=req.rid,
+            room=req.bootstrap_room,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            tokens=end_idx - start_idx,
+            last=1 if last_chunk else 0,
+        )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.

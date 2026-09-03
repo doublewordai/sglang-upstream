@@ -100,6 +100,52 @@ class HiSparseHostPoolMixin:
 
         return req_to_host_pool[req_pool_idx, start_pos:end_pos]
 
+    def alloc_paged_token_slots_batch(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_to_host_pool_allocated_len: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        start_pos_cpu: torch.Tensor,
+        num_tokens: int = 1,
+    ) -> torch.Tensor:
+        """Batch counterpart of alloc_paged_token_slots for a uniform
+        num_tokens (the decode eager backup backs up one row per request).
+
+        Fast path: when no request crosses into unallocated host pages (the
+        common case - one new compressed token per request per step), the
+        slots are a single gather. If any request needs new pages, or any
+        start_pos is negative (empty slice in the scalar path), fall back to
+        the per-request path so allocation order and pool state are exactly
+        those of sequential alloc_paged_token_slots calls.
+        """
+        assert num_tokens == 1
+        n = len(req_pool_indices_cpu)
+        if n == 0:
+            return torch.empty((0,), dtype=torch.int64, device=req_to_host_pool.device)
+        ps = self.page_size
+        end_pos = start_pos_cpu + num_tokens
+        page_end = (end_pos + ps - 1) // ps * ps
+        allocated = req_to_host_pool_allocated_len[req_pool_indices_cpu]
+        if bool((page_end > allocated).any()) or bool((start_pos_cpu < 0).any()):
+            return torch.cat(
+                [
+                    self.alloc_paged_token_slots(
+                        req_to_host_pool,
+                        req_to_host_pool_allocated_len,
+                        int(req_pool_indices_cpu[i]),
+                        int(start_pos_cpu[i]),
+                        num_tokens,
+                    )
+                    for i in range(n)
+                ]
+            )
+        device = req_to_host_pool.device
+        # Async pinned H2D (a blocking pageable copy would sync the schedule
+        # stream against the running forward - the stall this patch removes).
+        idx = req_pool_indices_cpu.pin_memory().to(device, non_blocking=True)
+        pos = start_pos_cpu.pin_memory().to(device, non_blocking=True)
+        return req_to_host_pool[idx, pos]
+
     def allocated_host_indices(
         self,
         req_to_host_pool: torch.Tensor,

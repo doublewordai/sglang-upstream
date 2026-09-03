@@ -293,6 +293,10 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+    # Compact ragged target-verify (per-request verify lengths, token-keyed
+    # graphs) is supported: the TARGET_VERIFY metadata/attention paths read
+    # spec_info.ragged_verify_layout (see lane/adaptive-spec).
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -332,6 +336,10 @@ class DeepseekSparseAttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self._hisparse_verify_pt = None
         self._hisparse_verify_page_table = _dsa_hisparse_verify_page_table.__get__(self)
+        # Compact ragged target-verify (lane/adaptive-spec): tier metadata
+        # keyed (slots, tier); see _apply_ragged_verify_graph_metadata.
+        self.ragged_verify_cuda_graph_metadata: dict = {}
+        self._ragged_capture_layouts: dict = {}
         # pd/mtp-hisparse: allocate the verify page table before any CUDA-graph
         # capture (a tensor allocated inside capture lives in that graph's pool).
         _n_draft = int(get_spec().speculative_num_draft_tokens or 0)
@@ -455,6 +463,7 @@ class DeepseekSparseAttnBackend(
         # the gather kernel fuses that in.  Same single-stream reuse
         # argument as `_q8kv8_qpad_buf`.
         self._q8kv8_kv_buf: Optional[torch.Tensor] = None
+        self._native_fp8_ws: Optional[dict] = None
         # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
         # rows whose topk indices end in a -1 pad run skip whole topk blocks
         # in-kernel.
@@ -766,6 +775,285 @@ class DeepseekSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    # ------------------------------------------------------------------
+    # Compact ragged target-verify (lane/adaptive-spec): per-request verify
+    # lengths ride spec_info.ragged_verify_layout; the batch's q/out_cache_loc
+    # rows are front-packed per request and padded to the token tier
+    # (graph_num_tokens). Ghost rows (pad slots' leftover tokens) get
+    # seqlens_expanded = 0 so no page is dereferenced (flash_mla masks -1
+    # page entries; the indexer sees 0-length contexts).
+    # ------------------------------------------------------------------
+    def _resolve_ragged_verify_layout(self, forward_batch):
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            return None
+        return getattr(spec_info, "ragged_verify_layout", None)
+
+    def _ragged_row_index(
+        self, *, verify_lens: torch.Tensor, total: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(req_id, within, valid) per compact row [total]; ghost rows ->
+        (bs, 0, False)."""
+        verify_lens_64 = verify_lens.to(torch.int64)
+        incl = torch.cumsum(verify_lens_64, dim=0)
+        bs = int(verify_lens_64.shape[0])
+        rows = torch.arange(total, device=verify_lens.device, dtype=torch.int64)
+        if bs == 0:
+            zero = torch.zeros_like(rows)
+            return (
+                torch.full_like(rows, bs),
+                zero,
+                torch.zeros(total, dtype=torch.bool, device=verify_lens.device),
+            )
+        req_id = torch.searchsorted(incl, rows, right=True)
+        valid = rows < incl[-1]
+        safe_req = req_id.clamp(max=bs - 1)
+        # start of request i is incl[i-1] (inclusive cumsum), NOT
+        # incl[i-1] - vl[i]: the old form double-subtracted vl[i] and made
+        # within = true_within + vl[i] (OOB page-table gathers at tier >= 48
+        # capture; silently wrong metadata at any bs >= 2).
+        starts = incl.gather(0, (safe_req - 1).clamp(min=0))
+        starts = torch.where(safe_req > 0, starts, torch.zeros_like(starts))
+        within = torch.where(valid, rows - starts, torch.zeros_like(rows))
+        return req_id, within, valid
+
+    def _build_ragged_target_verify_metadata(
+        self,
+        *,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layout,
+        seq_lens_cpu=None,
+        page_table_width: Optional[int] = None,
+    ):
+        """Fresh DSAMetadata for a ragged (compact) TARGET_VERIFY batch.
+
+        ``layout.verify_lens`` [bs] and ``layout.qo_indptr_device`` [bs+1] are
+        device tensors (the staged capture buffers on the graph path); rows =
+        layout.graph_num_tokens. The page table is PER-REQUEST [bs, max_len]
+        (the PAGED transform runs with page_table_is_expanded=False and
+        cu_seqlens_q = layout.qo_indptr_device).
+        """
+        device = self.device
+        verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+        verify_lens_64 = verify_lens.to(torch.int64)
+        T = int(layout.graph_num_tokens)
+
+        cache_seqlens_int32 = (seq_lens.to(torch.int64) + verify_lens_64).to(
+            torch.int32
+        )
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+        if seq_lens_cpu is not None:
+            max_seqlen_k = int(
+                torch.maximum(
+                    seq_lens_cpu.to(torch.int64),
+                    torch.zeros_like(seq_lens_cpu, dtype=torch.int64),
+                ).max().item()
+                + verify_lens_64.max().item()
+            )
+        elif page_table_width is not None:
+            max_seqlen_k = int(page_table_width)
+        else:
+            max_seqlen_k = int(cache_seqlens_int32.max().item())
+        max_seqlen_k = max(max_seqlen_k, 1)
+
+        page_table = self.req_to_token_pool.req_to_token[
+            req_pool_indices, :max_seqlen_k
+        ]
+
+        req_id, within, valid = self._ragged_row_index(
+            verify_lens=verify_lens, total=T
+        )
+        safe_req = req_id.clamp(max=bs - 1) if bs > 0 else req_id
+        seqlens_expanded = torch.where(
+            valid,
+            cache_seqlens_int32.to(torch.int64)[safe_req]
+            - verify_lens_64[safe_req]
+            + within
+            + 1,
+            torch.zeros_like(within),
+        ).to(torch.int32)
+
+        dsa_cache_seqlens_int32 = compute_dsa_seqlens(
+            seqlens_expanded, dsa_index_topk=self.dsa_index_topk
+        )
+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
+        dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
+
+        real_page_table = self._transform_table_1_to_real(page_table)
+        if real_page_table is page_table:
+            # Never alias: the per-token gather below must not rewrite the
+            # per-request page table the PAGED transform reads.
+            real_page_table = page_table.clone()
+        if real_page_table.shape[0] != T:
+            # Per-request table -> per-token rows via the row->request map
+            # (ghost rows read row 0's pages; never dereferenced, cache 0).
+            gather_rows = torch.where(
+                valid, safe_req, torch.zeros_like(safe_req)
+            )
+            real_page_table = real_page_table[gather_rows]
+
+        paged_mqa_ctx_lens_2d = seqlens_expanded.contiguous().view(-1, 1)
+        paged_mqa_schedule_metadata = None
+        if is_cuda():
+            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            )
+
+        extend_lens_cpu = (
+            layout.verify_lens_cpu
+            if layout.verify_lens_cpu is not None
+            else [int(v) for v in verify_lens.detach().to("cpu").tolist()]
+        )
+
+        metadata = DSAMetadata(
+            page_size=self.real_page_size,
+            cache_seqlens_int32=cache_seqlens_int32,
+            max_seq_len_q=1,
+            max_seq_len_k=max_seqlen_k,
+            cu_seqlens_q=layout.qo_indptr_device.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k,
+            seq_lens_sum=None,
+            page_table_1=page_table,
+            page_table_1_flattened=None,
+            flashmla_metadata=None,
+            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
+            dsa_cu_seqlens_q=dsa_cu_seqlens_q,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+            dsa_seqlens_expanded=seqlens_expanded,
+            dsa_extend_seq_lens_list=extend_lens_cpu,
+            real_page_table=real_page_table,
+            dsa_max_seqlen_q=1,
+            topk_indices_offset=None,
+            indexer_k_start_end=None,
+            indexer_seq_lens_cpu=None,
+            indexer_seq_lens=None,
+            token_to_batch_idx=None,
+            topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+        )
+        return metadata
+
+    def _apply_ragged_verify_graph_metadata(
+        self,
+        *,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu,
+        spec_info,
+    ):
+        """Capture/replay entry for ragged TARGET_VERIFY graphs.
+
+        Keyed (slots, tier): several tiers share a slot count. At capture the
+        spec_info layout IS the capture layout (its verify_lens / qo_indptr
+        are the buffers the runner stages at replay); the built metadata's
+        tensors are the ones the captured graph reads, so replay refreshes
+        them in place from the staged buffers.
+        """
+        live_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if live_layout is None:
+            return False
+        tier = int(live_layout.graph_num_tokens)
+        key = (bs, tier)
+        if key not in self.ragged_verify_cuda_graph_metadata:
+            # Capture (or first use). The page-table buffer must be FULL WIDTH
+            # (like the uniform verify capture): capture-time seq_lens are fill
+            # values, and replay copies real (long) contexts into it.
+            metadata = self._build_ragged_target_verify_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                layout=live_layout,
+                seq_lens_cpu=None,
+                page_table_width=self.req_to_token.shape[1],
+            )
+            self.ragged_verify_cuda_graph_metadata[key] = metadata
+            self._ragged_capture_layouts[key] = live_layout
+            self.forward_metadata = metadata
+            return True
+
+        metadata = self.ragged_verify_cuda_graph_metadata[key]
+        cap_layout = self._ragged_capture_layouts[key]
+        self._refresh_ragged_verify_metadata(
+            metadata,
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            layout=cap_layout,
+        )
+        self.forward_metadata = metadata
+        return True
+
+    def _refresh_ragged_verify_metadata(
+        self,
+        metadata: DSAMetadata,
+        *,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layout,
+    ):
+        """Recompute a tier's ragged metadata values in place (replay path)."""
+        device = self.device
+        verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+        verify_lens_64 = verify_lens.to(torch.int64)
+        T = int(layout.graph_num_tokens)
+
+        cache_seqlens_int32 = (seq_lens.to(torch.int64) + verify_lens_64).to(
+            torch.int32
+        )
+        metadata.cache_seqlens_int32.copy_(cache_seqlens_int32)
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+        max_len = metadata.page_table_1.shape[1]
+        metadata.page_table_1[:, :max_len].copy_(
+            self.req_to_token_pool.req_to_token[req_pool_indices, :max_len]
+        )
+
+        req_id, within, valid = self._ragged_row_index(
+            verify_lens=verify_lens, total=T
+        )
+        safe_req = req_id.clamp(max=bs - 1) if bs > 0 else req_id
+        seqlens_expanded = torch.where(
+            valid,
+            cache_seqlens_int32.to(torch.int64)[safe_req]
+            - verify_lens_64[safe_req]
+            + within
+            + 1,
+            torch.zeros_like(within),
+        ).to(torch.int32)
+        metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
+        metadata.dsa_cache_seqlens_int32.copy_(
+            compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
+        )
+        size = seqlens_expanded.shape[0]
+        metadata.dsa_cu_seqlens_k[1 : 1 + size].copy_(
+            compute_cu_seqlens(metadata.dsa_cache_seqlens_int32[:size])[1:]
+        )
+
+        real_src = self._transform_table_1_to_real(metadata.page_table_1)
+        if real_src is metadata.page_table_1:
+            real_src = metadata.page_table_1.clone()
+        if real_src.shape[0] != T:
+            gather_rows = torch.where(
+                valid, safe_req, torch.zeros_like(safe_req)
+            )
+            real_src = real_src[gather_rows]
+        metadata.real_page_table[:T].copy_(real_src)
+
+        seqlens_32_2d = seqlens_expanded.contiguous().view(-1, 1)
+        self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+        if metadata.paged_mqa_ctx_lens_2d is None:
+            object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+        else:
+            metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        self._refresh_topk_v2_plan(metadata)
+
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -844,6 +1132,20 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
+            ragged_layout = self._resolve_ragged_verify_layout(forward_batch)
+            if ragged_layout is not None:
+                metadata = self._build_ragged_target_verify_metadata(
+                    bs=batch_size,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    layout=ragged_layout,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    page_table_width=self.req_to_token.shape[1]
+                    if forward_batch.seq_lens_cpu is None
+                    else None,
+                )
+                self.forward_metadata = metadata
+                return
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
                 0,
@@ -1249,6 +1551,13 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+        # [lane attn-streams] Static FlashMLA schedule cache (long-context decode:
+        # every dsa_cache_seqlens entry equals dsa_index_topk, so the schedule is
+        # a per-bs constant) and the set of batch sizes whose paged-mqa schedule
+        # refresh was captured in-graph. See SGLANG_DSA_IN_GRAPH_METADATA.
+        self._flashmla_const_cache: Dict = {}
+        self._paged_mqa_in_graph: set = set()
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -1431,6 +1740,19 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        if forward_mode.is_target_verify() and spec_info is not None:
+            # Compact ragged verify first: it owns its own (slots, tier)-keyed
+            # metadata (several tiers can share a slot count, and no uniform
+            # verify metadata is ever captured in ragged mode).
+            if self._apply_ragged_verify_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                spec_info=spec_info,
+            ):
+                return
+
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -1658,7 +1980,15 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        # [lane attn-streams] Skip when the refresh was captured in-graph (the
+        # captured refresh runs on every replay and reads the same static lens).
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and bs in self._paged_mqa_in_graph
+            and forward_mode.is_decode_or_idle()
+        ):
+            pass
+        elif is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -1863,7 +2193,14 @@ class DeepseekSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        # [lane attn-streams] Skip when the refresh was captured in-graph.
+        if (
+            envs.SGLANG_DSA_IN_GRAPH_METADATA.get()
+            and bs in self._paged_mqa_in_graph
+            and forward_mode.is_decode_or_idle()
+        ):
+            pass
+        elif is_cuda():
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
             else:
@@ -2002,18 +2339,34 @@ class DeepseekSparseAttnBackend(
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
-                page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
-                    page_size=1,
-                    output_num_tokens=q_nope.shape[0],
-                    page_table_is_expanded=(
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
-                    ),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                )
+                ragged_layout = self._resolve_ragged_verify_layout(forward_batch)
+                if ragged_layout is not None:
+                    # Per-request page table + ragged cu_seqlens_q; the grid
+                    # must cover the max verify width (ndt) regardless of the
+                    # capture layout's distribution, hence the override.
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                        page_size=1,
+                        output_num_tokens=q_nope.shape[0],
+                        page_table_is_expanded=False,
+                        cu_seqlens_q=ragged_layout.qo_indptr_device,
+                        max_extend_len_override=self.speculative_num_draft_tokens,
+                    )
+                else:
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                        page_size=1,
+                        output_num_tokens=q_nope.shape[0],
+                        page_table_is_expanded=(
+                            forward_batch.forward_mode.is_target_verify()
+                            or forward_batch.forward_mode.is_draft_extend_v2()
+                        ),
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                    )
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
@@ -2032,47 +2385,138 @@ class DeepseekSparseAttnBackend(
                 # this step resolves via num_newest=p+1 (1:1 slots below
                 # device_buffer_size, reserved page above). Results are
                 # interleaved back to row order.
+                # (merge note, lane/warm-local-prefill: the target-verify
+                # check comes FIRST — a verify batch on a retained session
+                # must keep the per-position verify table, not the WLP
+                # extend union table; WLP extends are plain EXTEND mode.)
                 assert topk_indices is not None, (
                     "hisparse target-verify requires the indexer's topk "
                     "positions"
                 )
                 n = self.speculative_num_draft_tokens
                 topk_pos = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-                bs = topk_pos.shape[0] // n
-                tk = topk_pos.view(bs, n, -1)
-                out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
-                outv = out.view(bs, n, -1)
-                for p in range(n):
-                    pt = self.hisparse_coordinator.swap_in_selected_pages(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens + (p + 1),
-                        tk[:, p].contiguous(),
-                        layer.layer_id,
-                        num_newest=p + 1,
-                    )
-                    outv[:, p].copy_(pt)
                 if (
-                    envs.SGLANG_MTP_DEBUG.get()
+                    getattr(self.hisparse_coordinator, "dpf_prefetch_enabled", False)
                     and layer.layer_id == 0
-                    and not getattr(self, "_mtp_dbg_fe_logged", False)
                 ):
-                    self._mtp_dbg_fe_logged = True
-                    logger.warning(
-                        "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
-                        "row0[:12] %s | seq_lens %s out_cache_loc %s",
-                        tuple(out.shape),
-                        out[0, :12].tolist(),
-                        forward_batch.seq_lens[:4].tolist(),
-                        forward_batch.out_cache_loc[:8].tolist(),
+                    # Fork the draft-seed prefetch before the first real
+                    # swap-in of the step (no-op after the first position).
+                    self.hisparse_coordinator.begin_draft_prefetch(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        topk_pos.shape[0] // n,
                     )
-                page_table_1 = out
+                ragged_layout = self._resolve_ragged_verify_layout(forward_batch)
+                if ragged_layout is not None:
+                    page_table_1 = self._hisparse_ragged_verify_page_table(
+                        forward_batch=forward_batch,
+                        ragged_layout=ragged_layout,
+                        topk_pos=topk_pos,
+                        n=n,
+                        layer=layer,
+                    )
+                else:
+                    bs = topk_pos.shape[0] // n
+                    tk = topk_pos.view(bs, n, -1)
+                    out = self._hisparse_verify_page_table(bs, n, tk.shape[-1])
+                    outv = out.view(bs, n, -1)
+                    probe = getattr(self.hisparse_coordinator, "dpf_probe", None)
+                    if probe is not None:
+                        probe.on_verify_layer(
+                            layer.layer_id,
+                            tk,
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens,
+                            bs,
+                            n,
+                        )
+                    for p in range(n):
+                        if (
+                            self.hisparse_coordinator.dpf_prefetch_enabled
+                            and self.hisparse_coordinator._dprefetch_forked
+                        ):
+                            # Join this layer's seed prefetch (recorded at the
+                            # layer-0 fork earlier in this same step/capture)
+                            # before the real swap-in reads the buffer.
+                            self.hisparse_coordinator.wait_layer_prefetch(
+                                layer.layer_id
+                            )
+                        ev = (
+                            probe.events_for(layer.layer_id, p)
+                            if probe is not None
+                            else None
+                        )
+                        if ev is not None:
+                            ev[0].record()
+                        pt = self.hisparse_coordinator.swap_in_selected_pages(
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens + (p + 1),
+                            tk[:, p].contiguous(),
+                            layer.layer_id,
+                            num_newest=p + 1,
+                            probe_plan=probe.plan() if probe is not None else None,
+                        )
+                        if ev is not None:
+                            ev[1].record()
+                        if probe is not None:
+                            probe.after_swap_in(layer.layer_id, p)
+                        outv[:, p].copy_(pt)
+                    if (
+                        envs.SGLANG_MTP_DEBUG.get()
+                        and layer.layer_id == 0
+                        and not getattr(self, "_mtp_dbg_fe_logged", False)
+                    ):
+                        self._mtp_dbg_fe_logged = True
+                        logger.warning(
+                            "MTP_DEBUG fwd_extend verify L0 swap-in: pt %s "
+                            "row0[:12] %s | seq_lens %s out_cache_loc %s",
+                            tuple(page_table_1.shape),
+                            page_table_1[0, :12].tolist()
+                            if page_table_1.dim() == 2
+                            else page_table_1.view(-1)[:12].tolist(),
+                            forward_batch.seq_lens[:4].tolist(),
+                            forward_batch.out_cache_loc[:8].tolist()
+                            if forward_batch.out_cache_loc is not None
+                            else None,
+                        )
             else:
-                # flash_mla_sparse_fwd / tilelang require int32 page indices.
-                page_table_1 = (
-                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                        page_table_1
-                    ).to(torch.int32)
+                has_retained_prefix = bool(
+                    forward_batch.extend_prefix_lens_cpu
+                    and any(forward_batch.extend_prefix_lens_cpu)
                 )
+                if has_retained_prefix:
+                    # warm-local-prefill: the matched prefix is host-resident
+                    # (retained); its selections need a union swap-in from host
+                    # pages. Rebuild the table from the raw positions: prefix
+                    # selections point at scratch slots holding the host bytes,
+                    # delta selections translate through the device mapping.
+                    if self.use_fused_topk:
+                        raise NotImplementedError(
+                            "WLP: fused topk is not supported on the "
+                            "retained-prefix extend path (set both arms to the "
+                            "unfused topk for exactness)"
+                        )
+                    if topk_indices is None:
+                        raise AssertionError(
+                            "WLP: extend with a retained prefix requires topk_indices"
+                        )
+                    padded_positions = self._pad_topk_indices(
+                        topk_indices, q_nope.shape[0]
+                    )
+                    page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        topk_positions=padded_positions,
+                        prefix_lens=forward_batch.extend_prefix_lens,
+                        translated=page_table_1,
+                        layer_id=layer.layer_id,
+                    )
+                else:
+                    # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                    page_table_1 = (
+                        self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                            page_table_1
+                        ).to(torch.int32)
+                    )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2243,6 +2687,95 @@ class DeepseekSparseAttnBackend(
             raise ValueError(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
+
+    def _hisparse_ragged_verify_page_table(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        ragged_layout,
+        topk_pos: torch.Tensor,
+        n: int,
+        layer,
+    ) -> torch.Tensor:
+        """Ragged variant of the hisparse verify swap-in (lane/adaptive-spec).
+
+        q/topk rows are compact [T] (front-packed per request, ghost rows for
+        the pad slots' leftover tokens). Work in strided [slots, n, topk]
+        space so the per-position swap-in loop (num_newest=p+1, causal range
+        seq_len+p+1) runs unchanged over request slots:
+
+        - strided slot (i, p) sources compact row start_i + min(p, vl_i-1):
+          unused positions (p >= vl_i) replay the request's last real top-k
+          row -- all hits, no LRU eviction, no -1 (a -1 entry would corrupt
+          the swap-in's LRU state via host_cache_locs[-1]).
+        - pad slots (>= num_real_reqs) are masked to -1 locs by the swap-in
+          kernel itself; their source rows clamp to row 0.
+        - the final page table gathers the strided rows back to compact
+          order; ghost rows read strided row 0 (in-bounds; never dereference
+          because their dsa_cache_seqlens is 0).
+        All shapes are static per tier (slots, n, topk, T); every value is
+        derived from the staged layout tensors, so this is graph-safe.
+        """
+        verify_lens = ragged_layout.verify_lens.to(
+            device=self.device, dtype=torch.int64
+        )
+        slots = int(verify_lens.shape[0])
+        T = int(ragged_layout.graph_num_tokens)
+        width = int(topk_pos.shape[-1])
+
+        incl = torch.cumsum(verify_lens, dim=0)
+        starts = incl - verify_lens
+        req_id, within, valid = self._ragged_row_index(
+            verify_lens=verify_lens, total=T
+        )
+        safe_req = req_id.clamp(max=slots - 1) if slots > 0 else req_id
+
+        # compact source row per strided slot (i, p): start_i + min(p, vl_i-1)
+        p_cols = torch.arange(n, device=self.device, dtype=torch.int64).view(1, n)
+        src_rows = (
+            starts.view(slots, 1)
+            + torch.minimum(p_cols, (verify_lens - 1).view(slots, 1).clamp(min=0))
+        ).reshape(-1)
+        src_rows = src_rows.clamp(min=0, max=T - 1).to(torch.int64)
+        tk_strided = topk_pos[src_rows].view(slots, n, width)
+
+        out = self._hisparse_verify_page_table(slots, n, width)
+        outv = out.view(slots, n, -1)
+        # A/B measurement gate: cap swap-in positions (default full n). The
+        # loop bound is baked into captured graphs, so a python clamp is only
+        # valid for forced-uniform runs with verify_len <= the cap.
+        p_hi = envs.SGLANG_EAGLE_SWAPIN_MAXPOS.get() or n
+        for p in range(p_hi):
+            pt = self.hisparse_coordinator.swap_in_selected_pages(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens + (p + 1),
+                tk_strided[:, p].contiguous(),
+                layer.layer_id,
+                num_newest=p + 1,
+            )
+            outv[:, p].copy_(pt)
+
+        # strided -> compact; ghost rows take strided row 0 (never read).
+        gather_idx = torch.where(
+            valid, safe_req * n + within, torch.zeros_like(within)
+        )
+        if envs.SGLANG_RAGGED_DEBUG.get() and not (
+            torch.cuda.is_current_stream_capturing()
+        ):
+            logger.error(
+                "RAGGED-DBG pt: slots=%d n=%d T=%d width=%d rows(out)=%d "
+                "vl=%s idxmax=%d within_max=%d req_id_max=%d",
+                slots,
+                n,
+                T,
+                width,
+                out.shape[0],
+                verify_lens.tolist(),
+                int(gather_idx.max()),
+                int(within.max()) if within.numel() else -1,
+                int(safe_req.max()) if safe_req.numel() else -1,
+            )
+        return out.view(slots * n, -1)[gather_idx]
 
     def forward_decode(
         self,
@@ -2858,6 +3391,117 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _forward_native_fp8_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """Lane sparse-decode-kernel path: native-fp8 SM90 split-KV kernel.
+
+        Semantics match _forward_flashmla_kv (all non-negative indices are
+        scored, negative sentinels masked; seqlens only schedules). Buffers
+        grow-only per (b, P) like _q8kv8_kv_buf; CUDA-graph stable at fixed
+        batch. MTP target-verify arrives as b' = bs * n_draft flattened rows
+        with per-row page tables - handled identically.
+        """
+        from sglang.kernels.ops.attention.sparse_mla_fp8_decode_sm90 import (
+            sparse_mla_fp8_decode_fwd,
+        )
+
+        q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
+        b = q_all.shape[0]
+        dev = q_all.device
+        topk = self.dsa_index_topk
+
+        kv_rows = kv_cache.view(torch.uint8).view(-1, 656)
+        idx = page_table_1 if page_table_1.dim() == 2 else page_table_1.view(b, topk)
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        seqlens = metadata.dsa_cache_seqlens_int32
+
+        # split policy: fill the SMs, capped by useful blocks (topk/64 = 32)
+        # and the fused co-residency limit (b*P <= 132 at 1 CTA/SM)
+        P = max(1, min(32, 132 // b))
+        ws = self._native_fp8_ws
+        if ws is None or ws["b"] < b or ws["P"] < P:
+            ws = {
+                "b": b,
+                "P": P,
+                "po": torch.empty((b, P, 64, 512), dtype=torch.float32, device=dev),
+                "pml": torch.empty((b, P, 64, 2), dtype=torch.float32, device=dev),
+                "out": torch.empty((b, 64, 512), dtype=torch.bfloat16, device=dev),
+                "q_fp8": torch.empty((b, 64, 512), dtype=torch.uint8, device=dev),
+                "q_rope": torch.empty((b, 64, 64), dtype=torch.bfloat16, device=dev),
+                "q_scale": torch.empty((b, 64), dtype=torch.float32, device=dev),
+                "counter": torch.zeros(1, dtype=torch.int32, device=dev),
+            }
+            self._native_fp8_ws = ws
+        # tail_sentinel: hisparse guarantees the -1 pads are a tail run
+        # (fast path writes device_loc = -1 for i >= count); the fallback
+        # allocator does not guarantee it, so only take the shortcut there.
+        tail_sentinel = self.hisparse_coordinator is not None
+        qprep = (ws["q_fp8"], ws["q_rope"], ws["q_scale"])
+        out, _, _ = sparse_mla_fp8_decode_fwd(
+            q_all,
+            kv_rows,
+            idx,
+            seqlens,
+            sm_scale,
+            num_splits=P,
+            tail_sentinel=tail_sentinel,
+            fused=True,
+            head_splits=1,
+            counter=ws["counter"],
+            qprep=qprep,
+            partial_o=ws["po"],
+            partial_ml=ws["pml"],
+            out=ws["out"],
+        )
+        return out.view(b, 1, 64, 512)
+
+    def _forward_fused_persist_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """Lane sparse-decode-fused path: persistent fused split+combine Triton
+        kernel (single launch, in-kernel combine, deadlock-free at any batch).
+
+        Semantics match _forward_flashmla_kv (all non-negative indices scored,
+        negative sentinels masked; seqlens only schedule, never mask). The
+        workspace and self-resetting atomic counters live in a module-level
+        grow-only cache keyed by shape - CUDA-graph capturable at fixed batch
+        with no extra memset nodes. MTP target-verify arrives as
+        b' = bs * n_draft flattened rows with per-row page tables - handled
+        identically.
+        """
+        from sglang.kernels.ops.attention.sparse_mla_fused_persist import sdf_fwd
+
+        q_all = q_all.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        b = q_all.shape[0]
+        topk = self.dsa_index_topk
+
+        if kv_cache.dtype == torch.uint8:
+            kv_rows = kv_cache.view(torch.float8_e4m3fn).view(-1, 656)
+        else:
+            kv_rows = kv_cache.view(-1, 656)
+        idx = page_table_1 if page_table_1.dim() == 2 else page_table_1.view(b, topk)
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        if idx.stride(1) != 1:
+            idx = idx.contiguous()
+
+        out = sdf_fwd(q_all, kv_rows, idx, sm_scale)
+        return out.view(b, 1, layer.tp_q_head_num, 512)
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -2868,6 +3512,34 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        if (
+            envs.SGLANG_DSA_DECODE_FUSED_PERSISTENT.get()
+            and self.device_sm_major == 9
+            and self.dsa_kv_cache_store_fp8
+            and self.real_page_size == 64
+            and layer.tp_q_head_num == 64
+            and layer.head_dim == 576
+            and v_head_dim == 512
+            and self.dsa_index_topk == 2048
+        ):
+            return self._forward_fused_persist_decode(
+                q_all, kv_cache, sm_scale, layer, metadata, page_table_1
+            )
+
+        if (
+            envs.SGLANG_DSA_DECODE_FP8_NATIVE.get()
+            and self.device_sm_major == 9
+            and self.dsa_kv_cache_store_fp8
+            and self.real_page_size == 64
+            and layer.tp_q_head_num == 64
+            and layer.head_dim == 576
+            and v_head_dim == 512
+            and self.dsa_index_topk == 2048
+        ):
+            return self._forward_native_fp8_decode(
+                q_all, kv_cache, sm_scale, layer, metadata, page_table_1
+            )
+
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -3488,7 +4160,59 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            layer_id=layer_id,
         )
+
+    def _static_flashmla_for_decode(self, bs: int):
+        """[lane attn-streams] Constant FlashMLA schedule for [topk]*bs decode.
+
+        When every request's context length is >= dsa_index_topk, compute_dsa_seqlens
+        clips all rows to topk, so the schedule (and num_splits) depend only on bs.
+        The per-step recompute in the precompute path is then step-invariant and a
+        cached entry can be reused (bit-identical inputs -> bit-identical outputs).
+        """
+        entry = self._flashmla_const_cache.get(bs)
+        if entry is None:
+            lens = torch.full(
+                (bs,), self.dsa_index_topk, dtype=torch.int32, device=self.device
+            )
+            entry = self._compute_flashmla_metadata(cache_seqlens=lens, seq_len_q=1)
+            self._flashmla_const_cache[bs] = entry
+        return entry
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """[lane attn-streams] Capture the lens-dependent DeepGEMM metadata
+        refreshes inside the graph (SGLANG_DSA_IN_GRAPH_METADATA).
+
+        The fused decode metadata kernel (eager, pre-replay) fills the static
+        cache_seqlens buffer; the captured refresh below then rebuilds the
+        paged-mqa schedule / topk-v2 plan / ctx-lens mirror from it on every
+        replay, so the eager per-step refresh in _apply_cuda_graph_metadata /
+        init_forward_metadata_replay_cuda_graph_from_precomputed can be skipped.
+        """
+        if not envs.SGLANG_DSA_IN_GRAPH_METADATA.get():
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        bs = forward_batch.batch_size
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is None or metadata.paged_mqa_schedule_metadata is None:
+            return
+        lens2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+        if metadata.paged_mqa_ctx_lens_2d is None:
+            object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", lens2d)
+        else:
+            metadata.paged_mqa_ctx_lens_2d.copy_(lens2d)
+        metadata.paged_mqa_schedule_metadata.copy_(
+            deep_gemm.get_paged_mqa_logits_metadata(
+                lens2d, 64, deep_gemm.get_num_sms()
+            )
+        )
+        if metadata.topk_v2_plan is not None:
+            from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+            metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+        self._paged_mqa_in_graph.add(bs)
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata

@@ -16,11 +16,12 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -107,10 +108,14 @@ class DPBudget:
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
         # HiSparse host-pool admission state per rank (host-pool
-        # backpressure). Free host tokens are what a decode rank can still
-        # pin; 0/0 means "not reported" (non-hisparse ranks).
+        # backpressure). Free/pinned host tokens are what a decode rank can
+        # still pin / has pinned (active + retained rows); 0/0 means "not
+        # reported" (non-hisparse ranks). Pinned is the early signal a
+        # controller can act on before the pool limit.
         self.host_pool_free_tokens = [0] * dp_size
         self.host_pool_total_tokens = [0] * dp_size
+        self.host_pool_pinned_tokens = [0] * dp_size
+        self.host_pool_evictable_tokens = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -127,6 +132,12 @@ class DPBudget:
             )
             self.host_pool_total_tokens[load.dp_rank] = getattr(
                 load, "host_pool_total_tokens", 0
+            )
+            self.host_pool_pinned_tokens[load.dp_rank] = getattr(
+                load, "host_pool_pinned_tokens", 0
+            )
+            self.host_pool_evictable_tokens[load.dp_rank] = getattr(
+                load, "host_pool_evictable_tokens", 0
             )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
@@ -215,6 +226,22 @@ class DataParallelController:
         )
         self.prefix_affinity_max_imbalance = (
             server_args.dp_prefix_affinity_max_imbalance
+        )
+
+        # Session host-page migration (holder rank pushes a warm session's
+        # host-tier pages to the chosen rank before dispatch; see
+        # managers/session_migration.py).
+        _mig_base = os.environ.get("SGLANG_RANK_MIGRATION_PORT_BASE")
+        self.rank_migration_port_base = int(_mig_base) if _mig_base else None
+        _mig_hosts = os.environ.get("SGLANG_RANK_MIGRATION_HOSTS", "")
+        self.rank_migration_hosts = (
+            [h.strip() for h in _mig_hosts.split(",") if h.strip()] or None
+        )
+        self.rank_migration_force_bounce = (
+            os.environ.get("SGLANG_RANK_MIGRATION_FORCE_BOUNCE") == "1"
+        )
+        self.rank_migration_timeout = float(
+            os.environ.get("SGLANG_RANK_MIGRATION_TIMEOUT_S", "120")
         )
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
@@ -891,9 +918,12 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             target = req.routed_dp_rank
         else:
+            holder = self._session_holder(keys)
             target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
             if target is None:
                 target = self._new_session_rank()
+            if holder is not None:
+                target = self._maybe_migrate_session(req, keys, holder, target)
             sock_send(self.workers[target], req)
         if logger.isEnabledFor(logging.INFO):
             ranks, matched = self.prefix_index.longest_match(keys)
@@ -925,8 +955,86 @@ class DataParallelController:
         boot-time warmup traffic cannot pin the per-rank footprints used for
         new-session placement. Requests can also opt out individually with
         is_warmup=True (GenerateReqInput)."""
-        self.prefix_index.clear()
-        logger.info("prefix_affinity index cleared after warmup")
+        dropped = self.prefix_index.clear()
+        logger.info(
+            "prefix_affinity index cleared after warmup (dropped %d entries; "
+            "footprints now %s)",
+            dropped,
+            [self.prefix_index.footprint_tokens(r) for r in self._active_workers],
+        )
+
+    def _session_holder(self, keys: List[int]) -> Optional[int]:
+        """The rank that most likely still holds this session's prefix."""
+        ranks, _matched = self.prefix_index.longest_match(keys)
+        ranks = [r for r in ranks if r in self._active_workers]
+        if not ranks:
+            return None
+        return self._least_loaded_rank(ranks)
+
+    def _migration_addr(self, rank: int) -> Tuple[str, int]:
+        host = (
+            self.rank_migration_hosts[rank]
+            if self.rank_migration_hosts and rank < len(self.rank_migration_hosts)
+            else "127.0.0.1"
+        )
+        return host, self.rank_migration_port_base + rank
+
+    def _maybe_migrate_session(
+        self, req: Req, keys: List[int], holder: int, target: int
+    ) -> int:
+        """Decision hook: when the holder is not the chosen rank, push the
+        session's host pages holder -> target before dispatching. Returns the
+        (possibly test-forced) target rank. Failures fall back to a plain
+        dispatch (the target simply re-prefills)."""
+        if self.rank_migration_port_base is None:
+            return target
+        ranks, matched = self.prefix_index.longest_match(keys)
+        warm = matched >= self.prefix_affinity_threshold * len(req.input_ids)
+        if not warm:
+            return target
+        if (
+            self.rank_migration_force_bounce
+            and holder == target
+            and len(self._active_workers) > 1
+        ):
+            others = [r for r in self._active_workers if r != holder]
+            target = self._least_loaded_rank(others)
+        if holder == target:
+            return target
+        t0 = time.perf_counter()
+        ok, imported, reason = False, 0, ""
+        try:
+            from sglang.srt.managers.session_migration import tcp_rpc
+
+            resp = tcp_rpc(
+                self._migration_addr(target),
+                {
+                    "op": "adopt",
+                    "tokens": req.input_ids,
+                    "holder": self._migration_addr(holder),
+                    "req_id": req.rid,
+                    "timeout": self.rank_migration_timeout,
+                },
+                timeout=self.rank_migration_timeout + 30,
+            )
+            ok = bool(resp.get("ok"))
+            imported = resp.get("tokens_imported", 0)
+            reason = resp.get("error") or resp.get("reason") or ""
+        except Exception as e:  # noqa: BLE001
+            reason = str(e).splitlines()[0][:200]
+        logger.info(
+            "[rank-migration] bounce rid=%s len=%d holder=dp%d target=dp%d "
+            "ok=%s imported=%d dt=%.3fs %s",
+            req.rid,
+            len(req.input_ids),
+            holder,
+            target,
+            ok,
+            imported,
+            time.perf_counter() - t0,
+            reason,
+        )
+        return target
 
     def _rank_load(self, rank: int) -> int:
         """Ranks activated beyond the launch dp_size have no budget slot yet

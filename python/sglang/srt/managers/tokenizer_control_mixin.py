@@ -15,6 +15,10 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    HandoverExportReqInput,
+    HandoverExportReqOutput,
+    HandoverImportReqInput,
+    HandoverImportReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -114,6 +118,8 @@ _COMMUNICATOR_SPECS = [
     ("clear_hicache_storage", ClearHiCacheReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
+    ("handover_import", HandoverImportReqOutput),
+    ("handover_export", HandoverExportReqOutput),
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
@@ -150,6 +156,62 @@ class TokenizerControlMixin:
     profile, internal state, etc.) -- everything that talks to the scheduler via
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
+
+    async def handover_import(
+        self: TokenizerManager,
+        src_host: str,
+        src_http_port: int,
+        timeout_s: float = 600.0,
+        verify: bool = True,
+        admin_key: Optional[str] = None,
+    ) -> HandoverImportReqOutput:
+        """Heir-side: pull the old generation's host-tier cache (warm start)."""
+        self.auto_create_handle_loop()
+        results = await self.handover_import_communicator(
+            HandoverImportReqInput(
+                src_host=src_host,
+                src_http_port=src_http_port,
+                timeout_s=timeout_s,
+                verify=verify,
+                admin_key=admin_key,
+            )
+        )
+        out = HandoverImportReqOutput(success=False, message="no results")
+        if results:
+            all_success, all_message = FanOutCommunicator.merge_results(results)
+            out = HandoverImportReqOutput(success=all_success, message=all_message)
+            data = getattr(results[0], "data", None)
+            if data:
+                out.data = data
+        return out
+
+    async def handover_export(
+        self: TokenizerManager,
+        phase: str,
+        model_path: Optional[str] = None,
+        staged: bool = False,
+        payload_json: Optional[str] = None,
+        timeout_s: float = 300.0,
+    ) -> HandoverExportReqOutput:
+        """Old-side: build/push/release the handover export."""
+        self.auto_create_handle_loop()
+        results = await self.handover_export_communicator(
+            HandoverExportReqInput(
+                phase=phase,
+                model_path=model_path,
+                staged=staged,
+                payload_json=payload_json,
+                timeout_s=timeout_s,
+            )
+        )
+        out = HandoverExportReqOutput(success=False, message="no results")
+        if results:
+            all_success, all_message = FanOutCommunicator.merge_results(results)
+            out = HandoverExportReqOutput(success=all_success, message=all_message)
+            data = getattr(results[0], "data", None)
+            if data:
+                out.data = data
+        return out
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
