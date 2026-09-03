@@ -633,13 +633,15 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
                 tensor._sglang_mmap_alloc_bytes = alloc_bytes
-                # MAP_POPULATE silently stops when a mempolicy-bound NUMA
-                # node runs out of memory; a partially-populated pool must
-                # fail HERE with the real cause (see docstring).
+                # NUMA-locality line FIRST so the binding is visible even
+                # when population fails; then verify MAP_POPULATE completed
+                # (it silently stops when a mempolicy-bound NUMA node runs
+                # out of memory; a partially-populated pool must fail HERE
+                # with the real cause -- see verify_host_pool_populated).
+                log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
                 verify_host_pool_populated(
                     tensor.data_ptr(), alloc_bytes, "hugetlb host pool", tol=page_size
                 )
-                log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
                 return tensor
             except OSError as e:
                 msg = (
