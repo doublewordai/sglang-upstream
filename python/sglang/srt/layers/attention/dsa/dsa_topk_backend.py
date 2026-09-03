@@ -37,14 +37,127 @@ class DSATopKBackend(Enum):
     def should_use_topk_v2(self) -> bool:
         return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
+    @staticmethod
+    def _should_use_decode_fg(
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor],
+    ) -> bool:
+        """Gate the full-grid decode top-k kernel (SGLANG_DSA_TOPK_DECODE_FG).
+
+        Only decode / spec-verify shapes: raw-position selection with
+        row_starts is None, a small expanded batch, and fp32/bf16 logits with
+        unit inner stride (the DeepGEMM indexer output). Everything else
+        (prefill row_starts, huge batches, other dtypes) keeps fast_topk_v2.
+        """
+        return (
+            envs.SGLANG_DSA_TOPK_DECODE_FG.get()
+            and row_starts is None
+            and score.dim() == 2
+            and score.stride(1) == 1
+            and 0 < topk <= 2048
+            and 0 < score.shape[0] <= 64
+            and score.dtype in (torch.float32, torch.bfloat16)
+            and score.is_cuda
+        )
+
+    @staticmethod
+    def _should_use_decode_ballot(
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor],
+    ) -> bool:
+        """Gate the warp-ballot one-read decode top-k
+        (SGLANG_DSA_TOPK_DECODE_BALLOT).
+
+        Same shape domain as the fg kernel; takes precedence over floor and fg
+        when set (one full read + a ~0.8% windowed sample instead of two full
+        reads; per-element work is a compare + warp ballot; miss rows fall
+        back device-side to the fg 2-pass chain).
+        """
+        return (
+            envs.SGLANG_DSA_TOPK_DECODE_BALLOT.get()
+            and row_starts is None
+            and score.dim() == 2
+            and score.stride(1) == 1
+            and 0 < topk <= 2048
+            and 0 < score.shape[0] <= 64
+            and score.dtype in (torch.float32, torch.bfloat16)
+            and score.is_cuda
+        )
+
+    @staticmethod
+    def _should_use_decode_floor(
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor],
+    ) -> bool:
+        """Gate the byte-floor persistent decode top-k
+        (SGLANG_DSA_TOPK_DECODE_FLOOR).
+
+        Same shape domain as the fg kernel (decode / spec-verify shapes with
+        row_starts None, small expanded batch, fp32/bf16 logits with unit
+        inner stride); takes precedence over it when both flags are set.
+        """
+        return (
+            envs.SGLANG_DSA_TOPK_DECODE_FLOOR.get()
+            and row_starts is None
+            and score.dim() == 2
+            and score.stride(1) == 1
+            and 0 < topk <= 2048
+            and 0 < score.shape[0] <= 64
+            and score.dtype in (torch.float32, torch.bfloat16)
+            and score.is_cuda
+        )
+
     def topk_func(
         self,
         score: torch.Tensor,
         lengths: torch.Tensor,
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
+        warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
+            if self._should_use_decode_ballot(score, lengths, topk, row_starts):
+                from sglang.kernels.ops.attention.dsa.topk_ballot import (
+                    topk_ballot,
+                )
+
+                return topk_ballot(score, lengths, topk)
+
+            if self._should_use_decode_floor(score, lengths, topk, row_starts):
+                from sglang.kernels.ops.attention.dsa.topk_decode_floor import (
+                    topk_decode_floor,
+                )
+
+                return topk_decode_floor(score, lengths, topk)
+
+            if self._should_use_decode_fg(score, lengths, topk, row_starts):
+                from sglang.kernels.ops.attention.dsa.topk_decode_fg import (
+                    topk_decode_fg,
+                )
+
+                # The warm start trades one full-row read for verify/refine
+                # machinery (~10 us of fixed kernel overhead); measured it only
+                # pays off from ~batch*stride >= 16M elements (1.06-1.34x vs
+                # the plain FG path beyond that, 0.71-0.76x below it).
+                warm = (
+                    envs.SGLANG_DSA_TOPK_WARMSTART.get()
+                    and score.shape[0] * score.shape[1] >= 16_000_000
+                )
+                return topk_decode_fg(
+                    score,
+                    lengths,
+                    topk,
+                    warmstart=warm,
+                    delta=envs.SGLANG_DSA_TOPK_WARMSTART_DELTA.get(),
+                    warm_key=warm_key or 0,
+                )
+
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
@@ -87,9 +200,12 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        warm_key: Optional[int] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            return self.topk_func(
+                logits, lengths, topk, row_starts=row_starts, warm_key=warm_key
+            )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
@@ -120,17 +236,108 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
+            # Single-pass prefill top-k (lane/topk-1pass): replaces the 2-pass
+            # topk_transform_prefill_kernel for exactly the launches that
+            # would take it -- PAGED and not decode-shaped (row_starts present,
+            # or expanded rows != sequences), topk <= 2048. Reads each logits
+            # row once (+0.78% sample) instead of twice.
+            prefill_bs = (
+                cu_seqlens_q_topk.shape[0] - 1 if cu_seqlens_q_topk is not None else None
+            )
+            if (
+                envs.SGLANG_DSA_TOPK_PREFILL_BALLOT.get()
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and 0 < topk <= 2048
+                and prefill_bs is not None
+                and prefill_bs <= logits.shape[0]
+                and (row_starts is not None or prefill_bs != logits.shape[0])
+                and logits.dtype == torch.float32
+                and logits.dim() == 2
+                and logits.stride(1) == 1
+            ):
+                from sglang.kernels.ops.attention.dsa.topk_ballot import (
+                    topk_transform_prefill_ballot,
+                )
+
+                return topk_transform_prefill_ballot(
+                    score=logits,
+                    lengths=lengths,
+                    page_table_size_1=page_table_size_1,
+                    cu_seqlens_q=cu_seqlens_q_topk,
+                    topk=topk,
+                    row_starts=row_starts,
+                )
+
+            if (
+                envs.SGLANG_DSA_TOPK_PREFILL_1PASS.get()
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and 0 < topk <= 2048
+                and prefill_bs is not None
+                and prefill_bs <= logits.shape[0]
+                and (row_starts is not None or prefill_bs != logits.shape[0])
+                and logits.dtype == torch.float32
+                and logits.dim() == 2
+                and logits.stride(1) == 1
+            ):
+                from sglang.kernels.ops.attention.dsa.topk_prefill_1pass import (
+                    fast_topk_transform_prefill_1pass,
+                )
+
+                # lane/pagetable-gather (SGLANG_DSA_PAGETABLE_HOIST): the
+                # chunked-mqa PAGED path (batch_idx_list is not None) used to
+                # materialize page_table_1[batch_idx_list] as a [rows, L]
+                # int32 copy per row-chunk PER TOPK LAYER -- at L~950k that is
+                # ~31 GB of HBM writes per layer, ~5x redundant across the
+                # step's topk layers (the gathered table depends only on
+                # per-step metadata: page_table_1 + token_to_batch_idx).
+                # Instead pass the per-step table whole plus
+                # row_to_page = batch_idx_list; the kernel resolves
+                # src_row = page_table_1[batch_idx_list[i]] directly -- the
+                # identical values the materialized copy held (identity), so
+                # outputs are bit-exact. No new cache: the table's lifetime
+                # stays one forward step (rebuilt in init_forward_metadata,
+                # read live at kernel time exactly as the per-layer gather
+                # re-read it).
+                if (
+                    batch_idx_list is not None
+                    and envs.SGLANG_DSA_PAGETABLE_HOIST.get()
+                ):
+                    return fast_topk_transform_prefill_1pass(
+                        score=logits,
+                        lengths=lengths,
+                        page_table_size_1=attn_metadata.page_table_1,
+                        cu_seqlens_q=None,
+                        topk=topk,
+                        row_starts=row_starts,
+                        row_to_page=batch_idx_list,
+                    )
+
+                page_table_size_1 = (
+                    attn_metadata.page_table_1[batch_idx_list]
+                    if batch_idx_list is not None
+                    else attn_metadata.page_table_1
+                )
+                return fast_topk_transform_prefill_1pass(
+                    score=logits,
+                    lengths=lengths,
+                    page_table_size_1=page_table_size_1,
+                    cu_seqlens_q=cu_seqlens_q_topk,
+                    topk=topk,
+                    row_starts=row_starts,
+                )
+
+            page_table_size_1 = (
+                attn_metadata.page_table_1[batch_idx_list]
+                if batch_idx_list is not None
+                else attn_metadata.page_table_1
+            )
+
             from sgl_kernel import (
                 fast_topk_transform_fused,
                 fast_topk_transform_ragged_fused,
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                page_table_size_1 = (
-                    attn_metadata.page_table_1[batch_idx_list]
-                    if batch_idx_list is not None
-                    else attn_metadata.page_table_1
-                )
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,

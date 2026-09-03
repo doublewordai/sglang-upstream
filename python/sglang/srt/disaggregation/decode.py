@@ -20,7 +20,9 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -84,6 +87,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.pool_host.hisparse import HostPoolExhaustedError
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -349,6 +353,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        # HiSparse host-pool backpressure: admission ticks skipped because the
+        # host KV pool had no whole pages for the head request (exposed via
+        # /server_info + load snapshots so it can be charted/dispatched on).
+        self.host_pool_wait_events: int = 0
+        self._host_pool_wait_last_log_ts: float = 0.0
+        # Starvation follow-up (2026-09-03, prod 6256482 DP9):
+        # per-request wait age since the first failed host-pool
+        # admission. After SGLANG_HISPARSE_STARVE_S (default 5 s)
+        # admission escalates to starvation-honoring deficit
+        # eviction -- retained-idle rows LRU-first; running /
+        # in-transfer rows are never evictable, so never taken.
+        self._host_pool_wait_since: Dict[str, float] = {}
+        self.host_pool_starve_evictions: int = 0
+        try:
+            self._host_pool_starve_s = max(
+                0.0,
+                float(os.environ.get("SGLANG_HISPARSE_STARVE_S", "5.0")),
+            )
+        except ValueError:
+            self._host_pool_starve_s = 5.0
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -473,12 +497,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
+        kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            if hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        if self.draft_token_to_kv_pool is not None:
+            # Draft (NextN) layers sit at global ids [num_hidden_layers, ...):
+            # register them so PP prefill stages pair their subset of layers
+            # (target stage layers + the draft layer on the LAST stage) by
+            # layer id instead of positionally.
+            draft_num = len(draft_kv_data_ptrs)
+            num_hidden_layers = self.scheduler.model_config.num_hidden_layers
+            kv_layer_ids += list(
+                range(num_hidden_layers, num_hidden_layers + draft_num)
+            )
+        kv_args.kv_layer_ids = kv_layer_ids
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -702,6 +736,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self.queue.clear()
+        self._host_pool_wait_since.clear()
         for req in self.retracted_queue:
             retraction_discard(
                 req,
@@ -814,6 +849,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
+                cold_trace(
+                    "dec_handshake_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
@@ -1122,12 +1162,49 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+            if self.scheduler.enable_hisparse and not self._host_pool_admission(
+                decode_req, self._pre_alloc_fill_len(decode_req.req), prefix_len
+            ):
+                # Host KV pool full for THIS request: skip it (it stays queued,
+                # head order preserved among the waiting) and try the next
+                # queued request. Skipping — not breaking — matters: a giant
+                # no-prefix request that cannot fit must not head-of-line block
+                # small cache-hit requests behind it (prod 23:10Z: a 9,510-
+                # page waiter stalled a 173-page hit for ~15 min until it
+                # aborted). The skipped request is retried next tick; if the
+                # pool stays full it eventually hits the bootstrap timeout.
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                continue
+
+            _pa_t0 = time.perf_counter()
+            try:
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
+            except HostPoolExhaustedError:
+                # Safety net: the admission pre-check above should skip
+                # first. Keep the failure non-fatal anyway — the partial
+                # pre-allocation was rolled back inside _pre_alloc, so leave
+                # the request queued, skip to the next queued request and
+                # retry on a later tick.
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                self._note_host_pool_wait(0)
+                continue
+            if cold_trace_enabled():
+                cold_trace(
+                    "dec_prealloc_alloc",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                    dt_ms=(time.perf_counter() - _pa_t0) * 1000,
+                    input_len=origin_input_len,
+                    prefix_len=prefix_len,
+                    total_prefix_len=total_prefix_len,
+                )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1332,10 +1409,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            cold_trace(
+                "dec_metadata_sent",
+                rid=decode_req.req.rid,
+                room=decode_req.req.bootstrap_room,
+                dst_tokens=len(kv_indices),
+                dst_pages=len(page_indices),
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if self._host_pool_wait_since:
+            live_rids = {entry.req.rid for entry in self.queue}
+            for stale_rid in set(self._host_pool_wait_since) - live_rids:
+                self._host_pool_wait_since.pop(stale_rid, None)
 
         return preallocated_reqs, failed_reqs
 
@@ -1553,6 +1641,128 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return num_new_pages * page_size
 
+    def _host_pool_admission(
+        self, decode_req: DecodeRequest, fill_len: int, prefix_len: int
+    ) -> bool:
+        """HiSparse host-pool admission for one queued request.
+
+        Returns True when the host KV pool can cover the request's delta
+        pages right now. When it cannot, evict retained radix rows (their
+        host pages return through the allocator's retention hook) and
+        re-check. Still short means "not yet": the caller leaves the request
+        queued and it is retried on a later scheduling tick, exactly like
+        GPU/logical-pool exhaustion. No exception escapes for this state.
+        """
+        coordinator = self.scheduler.hisparse_coordinator
+        host_pool = coordinator.mem_pool_host
+        start_pos = coordinator.host_token_len(prefix_len)
+        num_tokens = coordinator.host_token_len(fill_len) - start_pos
+        # A retained prefix keeps its host rows (adopted later, inside
+        # _pre_alloc), so only the delta beyond it is newly allocated; the
+        # request's own host-row table is still empty at this point.
+        needed_pages = host_pool.host_pages_needed(start_pos, num_tokens, 0)
+        if needed_pages <= 0 or host_pool.has_free_pages(needed_pages):
+            self._host_pool_wait_since.pop(decode_req.req.rid, None)
+            return True
+
+        # Host pressure, unlike logical-pool pressure, frees nothing by
+        # itself: retained rows only return when their radix nodes are
+        # evicted, so drive eviction with the deficit before giving up.
+        deficit_tokens = (
+            needed_pages * host_pool.page_size - host_pool.available_size()
+        )
+        evictable = self.tree_cache.evictable_size()
+        if evictable > 0:
+            self.tree_cache.evict(
+                EvictParams(num_tokens=min(deficit_tokens, evictable))
+            )
+            if host_pool.has_free_pages(needed_pages):
+                self._host_pool_wait_since.pop(decode_req.req.rid, None)
+                return True
+
+        rid = decode_req.req.rid
+        now = time.monotonic()
+        wait_since = self._host_pool_wait_since.setdefault(rid, now)
+        wait_age = now - wait_since
+        if wait_age > self._host_pool_starve_s:
+            # Starvation override (SGLANG_HISPARSE_STARVE_S, default
+            # 5 s): evict retained-idle rows LRU-first regardless
+            # of retention age until the deficit is covered. This
+            # retention design has no TTL; idle rows are exactly
+            # the unlocked ones, and running / in-transferring
+            # pages are locked chains or private reservations, so
+            # the eviction below can never take them.
+            if self._evict_starved(deficit_tokens) and host_pool.has_free_pages(
+                needed_pages
+            ):
+                self._host_pool_wait_since.pop(rid, None)
+                return True
+
+        self._note_host_pool_wait(needed_pages, wait_age)
+        return False
+
+    def _note_host_pool_wait(
+        self, needed_pages: int, wait_age: float = -1.0
+    ) -> None:
+        """Count one host-pool admission skip; rate-limit the log line."""
+        self.host_pool_wait_events += 1
+        now = time.monotonic()
+        if now - self._host_pool_wait_last_log_ts < 10.0:
+            return
+        self._host_pool_wait_last_log_ts = now
+        host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+        logger.warning(
+            "HiSparse: host mem pool full; prealloc request waits "
+            "(need=%d pages, free=%d pages, queue_len=%d, evictable=%d tok, "
+            "wait_events=%d, wait_age_s=%.1f, starve_evictions=%d)",
+            needed_pages,
+            host_pool.available_size() // host_pool.page_size,
+            len(self.queue),
+            self.tree_cache.evictable_size(),
+            self.host_pool_wait_events,
+            wait_age,
+            self.host_pool_starve_evictions,
+        )
+
+    def _evict_starved(self, deficit_tokens: int) -> bool:
+        """Starvation-honoring deficit eviction (2026-09-03 follow-up).
+
+        Runs only after a prealloc has waited past
+        ``SGLANG_HISPARSE_STARVE_S``: evict retained-idle radix
+        rows LRU-first until the deficit is covered. Rows of
+        running or in-transferring requests are never taken: they
+        are either locked radix chains (``lock_ref > 0``, excluded
+        from ``evictable_leaves``) or the requests' own
+        pre-allocated host rows (not radix rows at all). One log
+        line per evicted node records the cost -- a later turn of
+        an evicted session re-prefills exactly those tokens.
+        """
+        tree_cache = self.tree_cache
+        if tree_cache.evictable_size() <= 0:
+            return False
+
+        def _note_evicted_node(node) -> None:
+            key_head = ",".join(str(t) for t in list(node.key.token_ids)[:8])
+            sid = hashlib.sha1(key_head.encode()).hexdigest()[:12]
+            idle_s = max(0.0, time.monotonic() - node.last_access_time)
+            self.host_pool_starve_evictions += 1
+            logger.warning(
+                "HiSparse: starve eviction sid=%s tokens=%d idle_s=%.1f",
+                sid,
+                len(node.key),
+                idle_s,
+            )
+
+        # The hook is armed only around this evict() call: base
+        # RadixCache.evict() fires _record_remove_event exactly
+        # once per evicted leaf node, with the node still intact.
+        tree_cache._starve_on_evict = _note_evicted_node
+        try:
+            tree_cache.evict(EvictParams(num_tokens=deficit_tokens))
+        finally:
+            tree_cache._starve_on_evict = None
+        return True
+
     def _pre_alloc(
         self,
         req: Req,
@@ -1643,13 +1853,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             # Allocate host indices for the RDMA transfer target (delta only).
             prefix_host = coordinator.host_token_len(prefix_len)
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                prefix_host,
-                coordinator.host_token_len(fill_len) - prefix_host,
-            )
+            try:
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.req_pool_idx,
+                    prefix_host,
+                    coordinator.host_token_len(fill_len) - prefix_host,
+                )
+            except HostPoolExhaustedError:
+                # Roll the partial pre-allocation back so a retried attempt
+                # starts clean: logical indices (their pages are disjoint
+                # from the page-aligned adopted prefix), the adopted host-row
+                # view, and the req slot. The retained prefix itself stays
+                # owned by the radix tree; only this request's view of it is
+                # dropped (unadopt_prefix).
+                self.token_to_kv_pool_allocator.free(kv_loc)
+                coordinator.unadopt_prefix(req)
+                self.req_to_token_pool.free(req)
+                raise
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
             swa_tail_len = self._swa_tail_len(fill_len)
@@ -2015,6 +2237,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        # pd-handover-latency lane: cold-trace marker for the first decode step
+        decode_req.req.pdho_first_step = True
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:
@@ -2127,6 +2351,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                cold_trace(
+                    "dec_kv_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
@@ -2190,6 +2419,11 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2229,6 +2463,11 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2308,6 +2547,36 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
+        # warm-local-prefill: transition staged local extends into decode
+        # (mirror of the normal scheduler's hisparse block in
+        # get_next_batch_to_run), then run at most one local extend as its
+        # own eager step. The extend step replaces this iteration's decode
+        # step (separate-step design: decode keeps its CUDA graphs; the
+        # co-resident decodes stall for the extend chunk's duration).
+        if self.enable_hisparse:
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if len(ready_reqs) > 0:
+                new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                # The PD-prebuilt running batch carries multimodal_inputs as a
+                # per-req list; _build_hisparse_decode_batch leaves it None and
+                # merge_batch concatenates the two. Align the shapes.
+                if new_batch.multimodal_inputs is None:
+                    new_batch.multimodal_inputs = [None] * len(ready_reqs)
+                if running_batch.is_empty():
+                    running_batch = new_batch
+                else:
+                    running_batch.merge_batch(new_batch)
+                running_batch.hisparse_coordinator = self.hisparse_coordinator
+                running_batch.batch_is_full = False
+
+            if self.wlp_enable and self.chunked_req is None:
+                extend_batch = self._wlp_build_extend_batch()
+                if extend_batch is not None:
+                    set_schedule_time_batch(extend_batch)
+                    return NextBatchPlan(
+                        batch_to_run=extend_batch, running_batch=running_batch
+                    )
+
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None
@@ -2371,6 +2640,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if cold_trace_enabled():
+            for req in can_run_list:
+                cold_trace("dec_forward_entry", rid=req.rid, room=req.bootstrap_room)
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
@@ -2419,4 +2691,52 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
+                    if (
+                        envs.SGLANG_MTP_DEBUG.get()
+                        and not getattr(self, "_mtp_dbg_draft_logged", False)
+                    ):
+                        self._mtp_dbg_draft_logged = True
+                        try:
+                            self._mtp_debug_draft_probe(req)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("MTP_DEBUG draft probe failed: %s", e)
             self.waiting_queue.extend(transferred_reqs)
+
+    def _mtp_debug_draft_probe(self: Scheduler, req: Req) -> None:
+        """mtp-debug lane: where did the draft layer's prompt KV land?
+
+        Under hisparse the PD transfer writes every layer (target latent AND
+        draft) at the decode arm's *host row* indices; the draft model reads
+        its pool at *logical* locs. Log both slices' magnitudes to confirm.
+        """
+        coord = self.hisparse_coordinator
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
+        )
+        if draft_pool is None:
+            logger.warning("MTP_DEBUG draft probe: no draft pool")
+            return
+        idx = req.req_pool_idx
+        n = min(int(coord.req_to_host_pool_allocated_len[idx].item()), 8)
+        if n == 0:
+            logger.warning("MTP_DEBUG draft probe: no host rows allocated")
+            return
+        host_rows = coord.req_to_host_pool[idx, :n].to(torch.int64)
+        logical = self.req_to_token_pool.req_to_token[idx, :n].to(torch.int64)
+        kbuf = draft_pool.get_key_buffer(0)
+        host_vals = kbuf[host_rows]
+        logical_vals = kbuf[logical]
+        logger.warning(
+            "MTP_DEBUG draft probe rid=%s n=%d host_rows=%s logical=%s "
+            "| |draft[host]| sum=%.4f | |draft[logical]| sum=%.4f "
+            "(same rows: %s)",
+            req.rid,
+            n,
+            host_rows.tolist(),
+            logical.tolist(),
+            host_vals.float().abs().sum().item(),
+            logical_vals.float().abs().sum().item(),
+            bool(torch.equal(host_rows, logical)),
+        )

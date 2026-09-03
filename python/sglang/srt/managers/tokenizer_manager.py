@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import dataclasses
 import gc
@@ -49,10 +50,12 @@ from fastapi import BackgroundTasks
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.delta_tokenizer import DeltaTokenizerCache
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -65,6 +68,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ClearPrefixAffinityIndexReq,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
@@ -532,6 +536,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.async_dynamic_batch_tokenizer = None
 
+        # Delta tokenizer cache: reuse the previous turn's ids and tokenize only
+        # the appended suffix (exact; see managers/delta_tokenizer.py).
+        if (
+            server_args.enable_delta_tokenizer
+            and not server_args.skip_tokenizer_init
+        ):
+            self.delta_tokenizer = DeltaTokenizerCache(
+                self.tokenizer,
+                max_sessions=server_args.delta_tokenizer_max_sessions,
+            )
+        else:
+            self.delta_tokenizer = None
+
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
             return
@@ -795,6 +812,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        if cold_trace_enabled() and isinstance(obj, GenerateReqInput) and obj.is_single:
+            cold_trace(
+                "tm_recv",
+                rid=obj.rid,
+                room=getattr(obj, "bootstrap_room", None),
+                mode=str(self.server_args.disaggregation_mode),
+                n_in=(len(obj.input_ids) if obj.input_ids is not None else -1),
+                stream=1 if obj.stream else 0,
+            )
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -1457,6 +1483,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                is_warmup=obj.is_warmup,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1484,6 +1511,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                is_warmup=obj.is_warmup,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -1619,6 +1647,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            if cold_trace_enabled():
+                cold_trace(
+                    "tm_dispatch",
+                    rid=str(getattr(tokenized_obj, "rid", "")),
+                    tokenize_finish=tokenized_obj.time_stats.tokenize_finish_time,
+                    dispatch=tokenized_obj.time_stats.api_server_dispatch_time,
+                    dispatch_finish=tokenized_obj.time_stats.api_server_dispatch_finish_time,
+                    input_len=len(tokenized_obj.input_ids)
+                    if tokenized_obj.input_ids is not None
+                    else -1,
+                )
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
@@ -2164,6 +2203,53 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
+
+    def clear_prefix_affinity_index(self) -> None:
+        """Ask the DP controller to drop every prefix-affinity index entry.
+
+        Sent when the server warmup completes so boot-time warmup traffic
+        (whose KV the radix cache evicts within minutes) cannot pin the
+        per-rank footprints used for new-session placement. Gated on a
+        DataParallelController owning the scheduler input socket; a bare
+        scheduler (dp_size == 1, no EP scale-join) has no handler for the
+        message and no index to clear.
+
+        Thread-safe: the server warmup calls this from its own thread, and
+        the send socket is a zmq.asyncio socket whose (uvloop) send Futures
+        need a current event loop — a direct sock_send from a foreign thread
+        raises RuntimeError("There is no current event loop in thread ...").
+        When a foreign thread calls and the tokenizer manager's loop is
+        running, the send runs on that loop instead (the same pattern as
+        gRPC bridge's _submit_on_tm_loop); we wait for it (bounded) so the
+        clear is ordered before "ready to roll" in the boot log."""
+        if not (
+            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+        ):
+            return
+        req = ClearPrefixAffinityIndexReq()
+        loop = self.event_loop
+        on_loop_thread = False
+        try:
+            on_loop_thread = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            pass
+        if loop is not None and loop.is_running() and not on_loop_thread:
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_dispatch_to_scheduler(req), loop
+            )
+            try:
+                future.result(timeout=10.0)
+            except concurrent.futures.TimeoutError:
+                logger.error(
+                    "clear_prefix_affinity_index: timed out sending "
+                    "ClearPrefixAffinityIndexReq on the tokenizer manager loop"
+                )
+            except Exception:
+                logger.exception("clear_prefix_affinity_index: send failed")
+        else:
+            # We are on the tokenizer manager's own loop thread (or no loop
+            # is running); the direct send works there.
+            self._dispatch_to_scheduler(req)
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.

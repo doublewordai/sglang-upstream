@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -13,6 +14,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
 
@@ -77,6 +79,7 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        _ingest_conv_start = time.perf_counter()
 
         try:
             # Validate request
@@ -93,6 +96,23 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            _ingest_conv_done = time.perf_counter()
+            if cold_trace_enabled():
+                _ts = raw_request.scope.get("_ingest_ts") if raw_request is not None else None
+                _ts = _ts or {}
+                cold_trace(
+                    "fe_convert",
+                    rid=str(getattr(adapted_request, "rid", "")),
+                    route=_ts.get("route"),
+                    body_start=_ts.get("body_start"),
+                    body=_ts.get("body"),
+                    json_start=_ts.get("json_start"),
+                    json=_ts.get("json"),
+                    body_bytes=_ts.get("body_bytes"),
+                    ep_start=received_time,
+                    conv_start=_ingest_conv_start,
+                    conv_done=_ingest_conv_done,
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them

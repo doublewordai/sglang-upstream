@@ -294,6 +294,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # fast-boot: stage safetensors mmap views into anon CPU storage before H2D
+    # (removes the 2-6x file-page re-read of pageable H2D; byte-identical).
+    SGLANG_WEIGHT_LOAD_STAGE_VIEWS = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -450,6 +453,44 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    SGLANG_DSA_IN_GRAPH_METADATA = EnvBool(False)
+    SGLANG_HISPARSE_FAST_BACKUP = EnvBool(False)
+    # mtp-debug lane: log the first target-verify step's hisparse page table
+    # and the draft pool's transferred rows (diagnosis of spec x hisparse).
+    SGLANG_MTP_DEBUG = EnvBool(False)
+    # Bulk host<->device HiCache transfers: coalesce page-granular index sets
+    # into contiguous runs and move them with cudaMemcpyBatchAsync (copy
+    # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
+    # copies; affects the HiCache H2D load path (page_first host pools) and
+    # the layer_first D2H backup path (hisparse staging backup).
+    SGLANG_HICACHE_BULK_COPY = EnvBool(True)
+    # D2H bulk backup via warp-coalesced SM stores instead of the copy engine
+    # (the CE D2H path is capped at ~170 GB/s over C2C on GH200; coalesced SM
+    # stores sustain ~383 GB/s into the same pinned pool). Replaces the
+    # segment copies AND the remainder kernel of the bulk backup when
+    # SGLANG_HICACHE_BULK_COPY is also on; byte-identical; falls back to the
+    # merged copy-engine path when the JIT module is unavailable.
+    SGLANG_D2H_SM_STORES = EnvBool(True)
+    # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
+    # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
+    # eligibility (max new-span tokens, min matched fraction of the prompt) and
+    # tracing.
+    SGLANG_WLP_ENABLE = EnvBool(False)
+    SGLANG_WLP_MAX_NEW_TOKENS = EnvInt(4096)
+    SGLANG_WLP_MIN_MATCH_FRAC = EnvFloat(0.5)
+    # Allow prefix_len == 0 (full local prefill of a short prompt on the decode
+    # rank): rig weight-equality probe + the local-refill fallback variant.
+    SGLANG_WLP_ALLOW_COLD = EnvBool(False)
+    SGLANG_WLP_TRACE = EnvBool(False)
+    # wlp-fused-topk: consume prod's fused PAGED top-k output (slot-resolved
+    # logical locs) in the WLP retained-prefix extend. ON (default): the
+    # union swap-in discriminates prefix/delta selections in the loc domain
+    # via logical_to_host_row -- the same fused/1PASS kernel (and therefore
+    # the same selection) as the prefill arm's warm extends. OFF: WLP extends
+    # force the unfused top-k (raw positions; the original lane-validated
+    # path; exact vs the PD path only when SGLANG_DSA_FUSE_TOPK=0 on both
+    # arms).
+    SGLANG_WLP_FUSED_TOPK = EnvBool(True)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -564,6 +605,13 @@ class Envs:
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
     SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
+    # Fuse the post-logits decode pipeline (temperature -> softmax -> token
+    # selection) into one Triton kernel, bit-exact vs the eager reference
+    # (greedy: torch.argmax tie-break; sampled: torch.multinomial's gumbel-max
+    # composite with identical philox RNG consumption). Falls back to the
+    # reference path for top-k/top-p/min-p, seeded/deterministic sampling,
+    # logprob requests, and non-CUDA devices.
+    SGLANG_FUSED_SAMPLING = EnvBool(False)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
@@ -588,10 +636,69 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+
+    # MTP verify path's multi-position shared-index prefetch (union swap-in
+    # per skip layer). Default True (merge policy 2026-09-03: exact and
+    # measured-positive lands as the default path): the per-position fork
+    # measures 2.6-3.2x vs the synchronous per-position swap-in and is
+    # bit-identical. Set 0 to restore the synchronous fallback (speculation
+    # itself is default-off in prod, so this only affects spec runs).
+    SGLANG_HISPARSE_SPEC_PREFETCH = EnvBool(True)
+    # Debug: verify each step swap-in selection contains distinct token
+    # positions (kernel miss-compaction invariant; see hisparse_coordinator).
+    SGLANG_DEBUG_HISPARSE_CHECK_TOPK = EnvBool(False)
+    # draft-prefetch lane probe: per verify step, stash the draft seed top-k,
+    # the target's per-layer/per-position top-k, the per-layer resident tables,
+    # per-(layer,position) swap-in CUDA-event timings and miss counts, then
+    # append one JSON line per step to SGLANG_DPF_PROBE_OUT. Works with the
+    # eager and CUDA-graph verify paths; spec (target_verify) only.
+    SGLANG_DPF_PROBE = EnvBool(False)
+    SGLANG_DPF_PROBE_OUT = EnvStr("")
+    SGLANG_DPF_PROBE_REQS = EnvInt(2)
+    SGLANG_DPF_PROBE_RAW_STEPS = EnvInt(0)
+    # draft-prefetch: after the draft step, prefetch (draft seed top-k -
+    # resident) rows into each layer's device buffer on the coordinator's
+    # side stream, ordered by layer; the verify swap-ins wait per layer.
+    # Exact by construction (cache fill only).
+    SGLANG_DPF_PREFETCH = EnvBool(False)
+    # Diagnostic: log HiSparse verify-step miss counts (per draft position,
+    # last anchor group's plans) every N verify steps; 0 = off.
+    SGLANG_HISPARSE_MISS_LOG = EnvInt(0)
+    # Plan-then-IO swap-in split: the fused kernel plans only and a
+    # full-GPU-grid kernel copies the recorded miss plan (warp per row).
+    # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
+    SGLANG_HISPARSE_WIDE_GATHER = EnvBool(True)
+    # mk-batch-curve: size the narrow copy_cache_planned fallback grid by bytes
+    # (one CTA per 64 KiB of worst-case miss bytes, capped at the SM count)
+    SGLANG_HISPARSE_RIGHTSIZE_COPY_GRID = EnvBool(False)
+
+    # HiSparse IO streams (write-staging / decode-backup / shared-index
+    # prefetch / the swap-in gather) bound to a CUDA green context holding this
+    # many SMs (0 = normal streams, feature off). Bounded SM footprint for the
+    # hicache-like side traffic so it cannot steal SMs from the decode critical
+    # path; CUDA-graph capture works across primary+green streams (verified on
+    # GH200, driver 565.57.01 / CUDA 13 userspace).
+    SGLANG_HISPARSE_GREEN_CTX_SMS = EnvInt(0)
+    # Additionally run the swap-in gather itself (anchor/verify calls, which
+    # sit on the attention critical path) on the green-context stream with a
+    # fork+join. Off by default: at decode batch sizes the fused swap-in grid
+    # is b x 960 threads (<= 5 SMs), so SM isolation buys nothing there while
+    # the fork/join adds latency; on by default would change step timing.
+    SGLANG_HISPARSE_SWAPIN_GREEN_CTX = EnvBool(False)
+    # Defer the decode hisparse map/eager-backup chain (map_last_loc_to_buffer)
+    # from prepare_for_decode to the forward launch (run_batch), i.e. past the
+    # per-step DP-attention metadata all_gather. A rank still running that chain
+    # is a straggler entering the collective; every other rank then waits in
+    # c10d::Work::wait with its GPU idle (the synchronized 8-12 ms decode
+    # stalls; see lanes hiccup/hiccup-2). Default off.
+    SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
+    # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
+    SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
     SGLANG_DSA_ELIDE_SHARED_INDEX_K = EnvBool(False)
+    SGLANG_DSA_ELIDE_PREFILL_HICACHE = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
@@ -674,15 +781,34 @@ class Envs:
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_BLOB_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Fail hard instead of silently falling back to base pages when the
+    # SGLANG_HUGEPAGE_SIZE backing cannot be provided (bad size string,
+    # hugetlb mmap failure, THP coverage below ~98%).
+    SGLANG_HUGEPAGE_STRICT = EnvBool(False)
+    # Pools smaller than this many bytes stay on base pages even when
+    # SGLANG_HUGEPAGE_SIZE is set (v16-memory-plan sizing: only the large
+    # decode hisparse host pool is hugetlb-backed; hicache/shadow pools on
+    # base pages). The register-size fix makes small hugetlb pools pin fine,
+    # so this is tunable; default keeps the v16 behavior (32 GiB).
+    SGLANG_HUGEPAGE_MIN_BYTES = EnvInt(32 * (1 << 30))
+    # Disable transparent hugepages for the whole engine process tree at init
+    # (prctl PR_SET_THP_DISABLE, inherited by children). Stops khugepaged/
+    # kcompactd churn on non-pool host allocations while the pools themselves
+    # use explicit hugepages via SGLANG_HUGEPAGE_SIZE.
+    SGLANG_DISABLE_THP = EnvBool(False)
     # Back host KV pools with MAP_PRIVATE anonymous pages (huge pages off) instead
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
     SGLANG_MAP_HOST_POOL_PRIVATE = EnvBool(False)
+    # Raise (instead of warn) at boot when a host KV pool has <99% of its
+    # populated pages on the GPU-local NUMA node (mmap_allocator check).
+    SGLANG_NUMA_LOCALITY_STRICT = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
@@ -1015,6 +1141,9 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # Lane deepep-v2: V2 ElasticBuffer sizing (max tokens per rank in a step;
+    # chunked-prefill-size per DP rank on the prefill arm).
+    SGLANG_DEEPEP_V2_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
@@ -1031,6 +1160,17 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+
+    # GLM-5.3 small-M decode GEMMs: route the fp8 block-128 W8A8 GEMM
+    # through the JIT CUTLASS sm90 blockwise kernel (ex-67 recipe, swapAB
+    # orientation, variant 5 = cooperative 128x16x128) instead of DeepGEMM
+    # for the measured-winning (N, K) shapes at small M (GH200 bench,
+    # lane w8a16-gemm 2026-09-02; outputs bit-exact vs DeepGEMM):
+    #   o_proj 16384->6144  0.86x/0.92x/0.92x at M=1/4/16
+    #   d_dn   12288->6144  0.91x/0.94x/0.94x
+    #   sh_gu   6144->4096  0.96x/0.93x/1.10x (M<=4 only)
+    # No effect on other shapes/M or on non-sm90 CUDA.
+    SGLANG_GLM_FP8_BLOCKWISE_SMALLM_GEMM = EnvBool(False)
 
     # Megakernel MoE (doublewordai/megakernel): per-rank decode token capacity
     SGLANG_MEGAKERNEL_NUM_MAX_TOKENS_PER_RANK = EnvInt(64)
@@ -1134,7 +1274,24 @@ class Envs:
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # EAGLE adaptive verify (lane/adaptive-spec): per-request verify lengths from
+    # draft confidence + an SPS cost table. Requires SGLANG_RAGGED_VERIFY_MODE=compact.
+    SGLANG_EAGLE_ADAPTIVE_VERIFY = EnvBool(False)
+    # Lane M3: force every request's verify_len (grid timing measurement).
+    SGLANG_EAGLE_FORCE_VERIFY_LEN = EnvInt(0)
+    # Lane M3: append per-step verify timing rows to this jsonl path.
+    SGLANG_EAGLE_VERIFY_TIMING = EnvStr("")
+    # Lane A/B: cap swap-in positions per layer in the ragged verify page
+    # table build (measurement only; unsafe for mixed-vl graph replays).
+    SGLANG_EAGLE_SWAPIN_MAXPOS = EnvInt(0)
+    # Path to an SPS cost table JSON (SpsCostTable or SpsAdditiveCostTable format,
+    # see dspark_sps.py) for the EAGLE adaptive verify budget scheduler. Without
+    # it the schedule degenerates to verify-all (full width through the ragged
+    # graphs) and a warning is logged.
+    SGLANG_EAGLE_SPS_TABLE = EnvStr("")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Lane debug: log ragged verify page-table shapes/values (one line per call).
+    SGLANG_RAGGED_DEBUG = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
@@ -1371,8 +1528,54 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Full-grid decode-time top-k (jit/csrc/dsa/topk_decode_fg.cuh) replacing
+    # sgl_kernel fast_topk_v2 on decode/verify shapes (row_starts is None,
+    # batch <= 64, fp32/bf16). Same selection semantics; each row is read
+    # exactly twice by the whole grid instead of one block per row.
+    SGLANG_DSA_TOPK_DECODE_FG = EnvBool(True)
+    # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
+    # persistent launch with in-kernel grid barriers reading each row once
+    # (plus a small sample and a rare fg-equivalent fallback re-read),
+    # replacing both fast_topk_v2 and the fg chain on decode/verify shapes
+    # (same gate domain as SGLANG_DSA_TOPK_DECODE_FG; precedence: floor > fg).
+    # Same selection semantics as the fg kernel.
+    # Warp-ballot one-read decode top-k (lane ka-topk-issue): same gate domain
+    # as SGLANG_DSA_TOPK_DECODE_FG; precedence ballot > floor > fg.
+    SGLANG_DSA_TOPK_DECODE_BALLOT = EnvBool(False)
+    # Warp-ballot prefill select + page-table transform, same slot as
+    # SGLANG_DSA_TOPK_PREFILL_1PASS; precedence ballot > 1pass.
+    SGLANG_DSA_TOPK_PREFILL_BALLOT = EnvBool(False)
+    SGLANG_DSA_TOPK_DECODE_FLOOR = EnvBool(False)
+    # Warm-start the full-grid decode top-k: carry the previous decode step's
+    # k-th logit minus a delta-sigma margin per (request, layer) as the
+    # threshold seed; 1 streaming pass + exact refine on a hit, full 2-pass
+    # fallback on a miss (requires SGLANG_DSA_TOPK_DECODE_FG).
+    SGLANG_DSA_TOPK_WARMSTART = EnvBool(False)
+    SGLANG_DSA_TOPK_WARMSTART_DELTA = EnvFloat(0.3)
+
+    # Decode-shaped Triton paged-MQA logits kernel
+    # (kernels/ops/attention/dsa/decode_mqa_logits.py) replacing the DeepGEMM
+    # split call at target-verify: every index-K row is read once per request
+    # for all its draft tokens instead of once per query row.
+    SGLANG_DSA_DECODE_MQA_LOGITS_TRITON = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Prefill-shaped PAGED DSA top-k: use the single-pass JIT kernel
+    # (jit/csrc/dsa/topk_prefill_1pass.cuh) instead of the 2-pass
+    # sgl_kernel topk_transform_prefill_kernel. Reads the logits once.
+    SGLANG_DSA_TOPK_PREFILL_1PASS = EnvBool(True)
+    # lane/pagetable-gather: in the chunked-mqa PAGED prefill top-k path,
+    # pass the per-step page table to the 1-pass kernel whole plus a per-row
+    # table-row map (row_to_page) instead of materializing
+    # page_table_1[batch_idx] as a [rows, L] int32 copy per row-chunk per
+    # topk layer (~31 GB/layer of HBM writes at L~950k, 5x redundant across
+    # the step). Identity-exact; requires SGLANG_DSA_TOPK_PREFILL_1PASS=1.
+    SGLANG_DSA_PAGETABLE_HOIST = EnvBool(False)
+    # lane/streamindex-topk: key-chunked scorer + partition-merge candidate
+    # maintenance for the prefill indexer top-k; the [q, L] logits tensor
+    # never exists (exact top-2048, tie-consistent at the boundary).
+    SGLANG_DSA_TOPK_STREAMINDEX = EnvBool(False)
+    SGLANG_DSA_TOPK_STREAMINDEX_W = EnvInt(8192)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
@@ -1380,9 +1583,39 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Lane mqa-tune: block configuration for the prefill indexer logits
+    # kernel sm90_fp8_mqa_logits ('off' | 'best' | 'BQ,BKV,QS,KVS,MT').
+    # Same DeepGEMM kernel template, bit-exact; see lanes/mqa-tune.
+    SGLANG_DSA_MQA_LOGITS_VARIANT = EnvStr("off")
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # GLM-5.3 / DeepSeek-V2 small-M decode: materialize bf16 copies of the
+    # qkv_a and indexer (wq_b, wk, weights_proj) projections at load time and
+    # route M<=16 forwards through the dsv3_fused_a bf16 GEMV, skipping the
+    # per-token-group fp8 activation quant on those paths. Default OFF.
+    SGLANG_GLM_DSV3_BF16_SMALLM_GEMV = EnvBool(False)
+
+    # Opt-in: quantize the (otherwise bf16) LM head / draft shared head to
+    # blockwise fp8 [128, 128] at weight-load time (amax/448 fp32 scales, the
+    # same recipe as the GLM-5.3 FP8 checkpoint's other weights) and run the
+    # LM-head GEMM through the production w8a8 block-fp8 path. Halves the
+    # ~1.9 GB weight read that dominates the decode/verify LM-head cost
+    # (measured 1.87x faster at M=64 on GH200, lanes/lm-head-gemm).
+    # NOT bit-exact vs the bf16 GEMM (quantization error characterized in
+    # lanes/lm-head-gemm); requires N % 128 == 0 and K % 128 == 0 per rank,
+    # otherwise the head silently stays bf16. Takes precedence over
+    # --enable-fp32-lm-head when both are set.
+    SGLANG_LM_HEAD_FP8 = EnvBool(False)
+
+    # lane/indexer-prologue: keep the Hadamard inside the fused DSA indexer
+    # prologue kernels (production arithmetic).
+    SGLANG_DSA_INDEXER_FUSION_KEEP_HADAMARD = EnvBool(False)
+    # lane/decode-glue-fusion: fused decode-layer glue kernels (default off)
+    SGLANG_DECODE_GLUE_FUSE_NORM_QUANT = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_MOE_EPILOGUE = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_ROUTER = EnvBool(False)
+    SGLANG_DECODE_GLUE_FUSE_KV_EPILOGUE = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel
@@ -1408,6 +1641,29 @@ class Envs:
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
     SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-kernel native-fp8 SM90 kernel (JIT).  Numerics:
+    # prod-class error vs the fp32 oracle (q per-row fp8 + exact per-group KV
+    # descale on the QK accumulator + bf16 P/V); NOT bit-exact vs FlashMLA.
+    # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
+    # than the production kernel; kept for development/A-B, default OFF.
+    SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-fused persistent Triton kernel: single launch,
+    # in-kernel split+combine (no second launch / combine kernel), grid
+    # capped at co-resident capacity so it is deadlock-free at any batch.
+    # Numerics: prod-class vs the fp32 oracle (0.17-0.21% of RMS), NOT
+    # bit-exact vs FlashMLA (different dequant path and split order).
+    SGLANG_DSA_DECODE_FUSED_PERSISTENT = EnvBool(False)
+    # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
+    # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
+    # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV
+    # flashmla_kv decode kernel.  Measured 1.38-1.74x faster end-to-end at
+    # GLM-5.3 prefill shapes on GH200 (q=2048..8192, L=0.5M..1M); numerics
+    # differ (per-tensor fp8 requant of KV + fp8 q + fp8 P: ~9x the error of
+    # the bf16-MMA path vs an fp32 oracle, ~2.7% of output RMS mean), hence
+    # default OFF.  Non-EXTEND batches keep flashmla_kv.
+    SGLANG_DSA_PREFILL_Q8KV8_AUTO = EnvBool(False)
     # Q8KV8 born-fp8 q-prep codegen: "auto" = per-K Triton dispatch (default);
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).

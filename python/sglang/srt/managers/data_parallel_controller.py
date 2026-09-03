@@ -16,11 +16,12 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import psutil
 import setproctitle
@@ -33,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ClearPrefixAffinityIndexReq,
     ElasticScaleUpdateReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -105,6 +107,15 @@ class DPBudget:
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        # HiSparse host-pool admission state per rank (host-pool
+        # backpressure). Free/pinned host tokens are what a decode rank can
+        # still pin / has pinned (active + retained rows); 0/0 means "not
+        # reported" (non-hisparse ranks). Pinned is the early signal a
+        # controller can act on before the pool limit.
+        self.host_pool_free_tokens = [0] * dp_size
+        self.host_pool_total_tokens = [0] * dp_size
+        self.host_pool_pinned_tokens = [0] * dp_size
+        self.host_pool_evictable_tokens = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -116,6 +127,18 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.host_pool_free_tokens[load.dp_rank] = getattr(
+                load, "host_pool_free_tokens", 0
+            )
+            self.host_pool_total_tokens[load.dp_rank] = getattr(
+                load, "host_pool_total_tokens", 0
+            )
+            self.host_pool_pinned_tokens[load.dp_rank] = getattr(
+                load, "host_pool_pinned_tokens", 0
+            )
+            self.host_pool_evictable_tokens[load.dp_rank] = getattr(
+                load, "host_pool_evictable_tokens", 0
+            )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -182,8 +205,10 @@ class DataParallelController:
 
         # 0 = size the index to the KV capacity, known once the workers report
         # max_total_num_tokens (_size_prefix_index_to_kv_capacity). With the
-        # hierarchical cache the host tier (hicache_ratio x device) is what a
-        # rank retains, as every device page is written through to it.
+        # hierarchical cache the host tier (hicache_ratio x device, or the
+        # token capacity bought by a fixed hicache_size GB, reported by the
+        # scheduler) is what a rank retains, as every device page is written
+        # through to it.
         self.prefix_index_blocks_arg = (
             server_args.dp_prefix_affinity_max_blocks_per_rank
         )
@@ -196,8 +221,27 @@ class DataParallelController:
             max_blocks_per_rank=self.prefix_index_blocks_arg or (1 << 15),
         )
         self.prefix_affinity_threshold = server_args.dp_prefix_affinity_threshold
+        self.prefix_affinity_abs_floor_tokens = (
+            server_args.dp_prefix_affinity_abs_floor_tokens
+        )
         self.prefix_affinity_max_imbalance = (
             server_args.dp_prefix_affinity_max_imbalance
+        )
+
+        # Session host-page migration (holder rank pushes a warm session's
+        # host-tier pages to the chosen rank before dispatch; see
+        # managers/session_migration.py).
+        _mig_base = os.environ.get("SGLANG_RANK_MIGRATION_PORT_BASE")
+        self.rank_migration_port_base = int(_mig_base) if _mig_base else None
+        _mig_hosts = os.environ.get("SGLANG_RANK_MIGRATION_HOSTS", "")
+        self.rank_migration_hosts = (
+            [h.strip() for h in _mig_hosts.split(",") if h.strip()] or None
+        )
+        self.rank_migration_force_bounce = (
+            os.environ.get("SGLANG_RANK_MIGRATION_FORCE_BOUNCE") == "1"
+        )
+        self.rank_migration_timeout = float(
+            os.environ.get("SGLANG_RANK_MIGRATION_TIMEOUT_S", "120")
         )
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
@@ -210,6 +254,13 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+        # When this controller owns the zmq PULL socket (load-aware methods),
+        # it is the only process draining load snapshots into node-0 SHM.
+        # Dispatches drain it, but at idle nothing would: SHM (and therefore
+        # /v1/loads and the /metrics load-snapshot collector) would go stale
+        # forever. Drain on a ~100 ms cadence from the event loop instead.
+        self._snapshot_drain = getattr(self.load_snapshot_reader, "poll", None)
+        self._last_snapshot_drain_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -376,6 +427,10 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ClearPrefixAffinityIndexReq,
+                    self.handle_clear_prefix_affinity_index,
+                ),
                 (
                     ElasticScaleUpdateReq,
                     lambda msg: self.add_elastic_workers(
@@ -757,6 +812,11 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        # Token capacity of the hierarchical-cache host tier this rank
+        # allocated (None when there is none); see _size_prefix_index_to_kv_capacity.
+        self.hicache_host_pool_tokens = scheduler_info[0].get(
+            "hicache_host_pool_tokens"
+        )
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
@@ -768,6 +828,27 @@ class DataParallelController:
         retained = int(
             self.max_total_num_tokens * self.retained_tokens_per_device_token
         )
+        if (
+            self.server_args.enable_hierarchical_cache
+            and self.server_args.hicache_size > 0
+        ):
+            # A fixed --hicache-size sizes the host tier in bytes; the token
+            # capacity it buys depends on the per-token host bytes of this
+            # rank's layer set, PP-group synchronization and page alignment,
+            # none of which are known until the scheduler allocates the pool.
+            # It therefore reports the capacity in the init handshake, and the
+            # index is sized to the host tier actually allocated instead of
+            # the device pool alone (retained_tokens_per_device_token cannot
+            # express this as a ratio).
+            if self.hicache_host_pool_tokens:
+                retained = max(retained, int(self.hicache_host_pool_tokens))
+            else:
+                logger.warning(
+                    "--hicache-size %s GB is set but the scheduler did not "
+                    "report a hierarchical host pool token capacity; sizing "
+                    "the prefix-affinity index to the device pool only.",
+                    self.server_args.hicache_size,
+                )
         blocks = max(1, retained // self.prefix_index.block_tokens)
         self.prefix_index.set_max_blocks_per_rank(blocks)
 
@@ -844,25 +925,123 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             target = req.routed_dp_rank
         else:
+            holder = self._session_holder(keys)
             target = self._prefix_affinity_rank(keys=keys, input_len=len(req.input_ids))
             if target is None:
                 target = self._new_session_rank()
+            if holder is not None:
+                target = self._maybe_migrate_session(req, keys, holder, target)
             sock_send(self.workers[target], req)
         if logger.isEnabledFor(logging.INFO):
             ranks, matched = self.prefix_index.longest_match(keys)
             logger.info(
-                "prefix_affinity dispatch rid=%s len=%d matched=%d on %s -> dp%d loads=%s",
+                "prefix_affinity dispatch rid=%s len=%d matched=%d on %s -> dp%d loads=%s host_free_tok=%s",
                 req.rid,
                 len(req.input_ids),
                 matched,
                 ranks,
                 target,
                 [self._rank_load(r) for r in self._active_workers],
+                [self.dp_budget.host_pool_free_tokens[r] for r in self._active_workers],
             )
         # Speculative +1 until the next load snapshot, as DPBudget.dispatch does.
         if target < self.dp_budget.dp_size:
             self.dp_budget.total_requests[target] += 1
-        self.prefix_index.record(rank=target, keys=keys)
+        # A warmup/health request is served normally but must not enter the
+        # index: its KV is evicted from the radix cache within minutes of boot,
+        # while an index entry never ages on an idle rank. Recording one
+        # 262k-token warmup inflated one decode rank's footprint_tokens for a
+        # whole production day and starved it of all traffic (dp1 in gen0/gen1).
+        if not getattr(req, "is_warmup", False):
+            self.prefix_index.record(rank=target, keys=keys)
+
+    def handle_clear_prefix_affinity_index(
+        self, _req: ClearPrefixAffinityIndexReq
+    ) -> None:
+        """Drop every index entry, e.g. when the server warmup completes so
+        boot-time warmup traffic cannot pin the per-rank footprints used for
+        new-session placement. Requests can also opt out individually with
+        is_warmup=True (GenerateReqInput)."""
+        dropped = self.prefix_index.clear()
+        logger.info(
+            "prefix_affinity index cleared after warmup (dropped %d entries; "
+            "footprints now %s)",
+            dropped,
+            [self.prefix_index.footprint_tokens(r) for r in self._active_workers],
+        )
+
+    def _session_holder(self, keys: List[int]) -> Optional[int]:
+        """The rank that most likely still holds this session's prefix."""
+        ranks, _matched = self.prefix_index.longest_match(keys)
+        ranks = [r for r in ranks if r in self._active_workers]
+        if not ranks:
+            return None
+        return self._least_loaded_rank(ranks)
+
+    def _migration_addr(self, rank: int) -> Tuple[str, int]:
+        host = (
+            self.rank_migration_hosts[rank]
+            if self.rank_migration_hosts and rank < len(self.rank_migration_hosts)
+            else "127.0.0.1"
+        )
+        return host, self.rank_migration_port_base + rank
+
+    def _maybe_migrate_session(
+        self, req: Req, keys: List[int], holder: int, target: int
+    ) -> int:
+        """Decision hook: when the holder is not the chosen rank, push the
+        session's host pages holder -> target before dispatching. Returns the
+        (possibly test-forced) target rank. Failures fall back to a plain
+        dispatch (the target simply re-prefills)."""
+        if self.rank_migration_port_base is None:
+            return target
+        ranks, matched = self.prefix_index.longest_match(keys)
+        warm = matched >= self.prefix_affinity_threshold * len(req.input_ids)
+        if not warm:
+            return target
+        if (
+            self.rank_migration_force_bounce
+            and holder == target
+            and len(self._active_workers) > 1
+        ):
+            others = [r for r in self._active_workers if r != holder]
+            target = self._least_loaded_rank(others)
+        if holder == target:
+            return target
+        t0 = time.perf_counter()
+        ok, imported, reason = False, 0, ""
+        try:
+            from sglang.srt.managers.session_migration import tcp_rpc
+
+            resp = tcp_rpc(
+                self._migration_addr(target),
+                {
+                    "op": "adopt",
+                    "tokens": req.input_ids,
+                    "holder": self._migration_addr(holder),
+                    "req_id": req.rid,
+                    "timeout": self.rank_migration_timeout,
+                },
+                timeout=self.rank_migration_timeout + 30,
+            )
+            ok = bool(resp.get("ok"))
+            imported = resp.get("tokens_imported", 0)
+            reason = resp.get("error") or resp.get("reason") or ""
+        except Exception as e:  # noqa: BLE001
+            reason = str(e).splitlines()[0][:200]
+        logger.info(
+            "[rank-migration] bounce rid=%s len=%d holder=dp%d target=dp%d "
+            "ok=%s imported=%d dt=%.3fs %s",
+            req.rid,
+            len(req.input_ids),
+            holder,
+            target,
+            ok,
+            imported,
+            time.perf_counter() - t0,
+            reason,
+        )
+        return target
 
     def _rank_load(self, rank: int) -> int:
         """Ranks activated beyond the launch dp_size have no budget slot yet
@@ -893,10 +1072,26 @@ class DataParallelController:
         """The least-loaded rank among those sharing the longest prefix match,
         or None when the match is too short or that rank is too far ahead of
         the least-loaded one (the same rule sgl-router's cache-aware policy
-        applies across workers)."""
+        applies across workers).
+
+        ""Too short" is relative (dp_prefix_affinity_threshold fraction of the
+        prompt) OR absolute (dp_prefix_affinity_abs_floor_tokens): a turn that
+        appends a large new span — a tool result or a paste — drops its match
+        fraction below the threshold while still matching tens of thousands of
+        cached tokens. Bouncing such a turn recomputes the cached span on both
+        PD arms and fragments the session across ranks, so an absolutely large
+        match stays affine; the imbalance guard below still bounds the skew."""
         ranks, matched_tokens = self.prefix_index.longest_match(keys)
         ranks = [r for r in ranks if r in self._active_workers]
-        if not ranks or matched_tokens < self.prefix_affinity_threshold * input_len:
+        if not ranks:
+            return None
+        if (
+            matched_tokens < self.prefix_affinity_threshold * input_len
+            and (
+                self.prefix_affinity_abs_floor_tokens <= 0
+                or matched_tokens < self.prefix_affinity_abs_floor_tokens
+            )
+        ):
             return None
         target = self._least_loaded_rank(ranks)
         least = self._least_loaded_rank(self._active_workers)
@@ -909,6 +1104,11 @@ class DataParallelController:
         while True:
             while True:
                 self.soft_watchdog.feed()
+                if self._snapshot_drain is not None:
+                    now = time.perf_counter()
+                    if now - self._last_snapshot_drain_time >= 0.1:
+                        self._last_snapshot_drain_time = now
+                        self._snapshot_drain()
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
@@ -921,7 +1121,15 @@ def retained_tokens_per_device_token(server_args: ServerArgs) -> float:
     its KV in a host pool of host_to_device_ratio x the device pool and its
     radix cache retains into that pool; a hierarchical cache writes every
     device page through to a host tier of hicache_ratio x the device pool.
-    Without either, the device pool is all a rank retains."""
+    Without either, the device pool is all a rank retains.
+
+    A hierarchical cache sized by --hicache-size (bytes) cannot be reduced to
+    a ratio here: the host tier's token capacity depends on the per-token
+    host bytes of the rank's layer set, on PP-group synchronization and on
+    page alignment, all known only to the scheduler once its pools are
+    allocated. The scheduler reports that capacity in its init handshake and
+    _size_prefix_index_to_kv_capacity sizes the index from it; this
+    function's hierarchical branch covers only ratio-based sizing."""
     if server_args.enable_hisparse:
         return max(1.0, float(parse_hisparse_config(server_args).host_to_device_ratio))
     if server_args.enable_hierarchical_cache and server_args.hicache_size == 0:

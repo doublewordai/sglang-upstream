@@ -97,6 +97,28 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
+    # v16-memory-plan: 2 MiB hugetlb backing is for the decode arm's hisparse
+    # host pool (the swap-in/TPOT path) only. HiCache pools (prefill arm) stay
+    # on base pages: their loads are TTFT-path, and hugepage registration at
+    # these sizes is placement-flaky. SGLANG_HUGEPAGE_HICACHE=1 opts in.
+    import os as _os
+
+    _hp = _os.environ.get("SGLANG_HUGEPAGE_SIZE", "")
+    if _hp and _os.environ.get("SGLANG_HUGEPAGE_HICACHE", "0") != "1":
+        _os.environ.pop("SGLANG_HUGEPAGE_SIZE", None)
+        try:
+            return kv_host_pool_cls(
+                kv_pool,
+                get_memory().hicache_ratio,
+                server_args.hicache_size if host_size is None else host_size,
+                page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+                pool_label=pool_label,
+                **kwargs,
+            )
+        finally:
+            _os.environ["SGLANG_HUGEPAGE_SIZE"] = _hp
     return kv_host_pool_cls(
         kv_pool,
         get_memory().hicache_ratio,

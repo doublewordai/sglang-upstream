@@ -127,6 +127,17 @@ class SchedulerStats:
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
 
+    # HiSparse host KV pool (decode arm), tokens. -1 = not reported
+    # (non-hisparse or prefill arm). locked = pinned - evictable.
+    hisparse_host_pool_free_tokens: int = -1
+    hisparse_host_pool_total_tokens: int = -1
+    hisparse_host_pool_pinned_tokens: int = -1
+    hisparse_host_pool_evictable_tokens: int = -1
+    hisparse_host_pool_wait_events: int = 0
+    # Age of the oldest prealloc blocked on a full host pool, seconds
+    # (-1.0 = not reported: not a hisparse decode arm).
+    hisparse_host_pool_wait_age_s: float = -1.0
+
     # Utilization
     utilization: float = 0.0
     fwd_occupancy: float = float("nan")
@@ -522,6 +533,29 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        for _hpb_name, _hpb_doc in (
+            ("free", "free (unallocated) host KV tokens"),
+            ("total", "total host KV tokens"),
+            ("pinned", "host KV tokens held by active reqs + retained radix rows"),
+            ("evictable", "unlocked retained radix rows (freeable by eviction)"),
+            ("wait_events", "cumulative prealloc admission waits (host pool full)"),
+        ):
+            setattr(
+                self,
+                f"hisparse_host_pool_{_hpb_name}_tokens" if _hpb_name != "wait_events" else "hisparse_host_pool_wait_events",
+                Gauge(
+                    name=f"sglang:hisparse_host_pool_{_hpb_name}_tokens" if _hpb_name != "wait_events" else "sglang:hisparse_host_pool_wait_events",
+                    documentation=f"HiSparse host KV pool {_hpb_doc} (decode arm; -1 if not reported).",
+                    labelnames=labels.keys(),
+                    multiprocess_mode="mostrecent",
+                ),
+            )
+        self.hisparse_host_pool_wait_age_s = Gauge(
+            name="sglang:hisparse_host_pool_wait_age_s",
+            documentation="HiSparse host KV pool age of the oldest prealloc blocked on a full pool, seconds (-1 if not reported).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1370,6 +1404,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_free_tokens, stats.hisparse_host_pool_free_tokens
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_total_tokens, stats.hisparse_host_pool_total_tokens
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_pinned_tokens, stats.hisparse_host_pool_pinned_tokens
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_evictable_tokens,
+            stats.hisparse_host_pool_evictable_tokens,
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_wait_events, stats.hisparse_host_pool_wait_events
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_wait_age_s, stats.hisparse_host_pool_wait_age_s
         )
 
         # Utilization
@@ -2387,6 +2440,308 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
         self.encoder_request_e2e_latency_seconds.labels(
             **self.labels, modality=modality
         ).observe(latency_seconds)
+
+
+# ---------------------------------------------------------------------------
+# All-ranks load-snapshot exporter (master /metrics, cross-node coverage)
+# ---------------------------------------------------------------------------
+
+# (family name, documentation, LoadSnapshot field) for the host-pool gauges.
+# Names/docs mirror the scheduler-side gauges exactly (see
+# SchedulerMetricsCollector.__init__) so dashboards and the pd-router's
+# poolmon see one consistent family whichever side emitted it.
+_ALL_RANKS_POOL_FAMILIES: tuple = (
+    (
+        "sglang:hisparse_host_pool_free_tokens",
+        "HiSparse host KV pool free (unallocated) host KV tokens (decode arm; -1 if not reported).",
+        "host_pool_free_tokens",
+    ),
+    (
+        "sglang:hisparse_host_pool_total_tokens",
+        "HiSparse host KV pool total host KV tokens (decode arm; -1 if not reported).",
+        "host_pool_total_tokens",
+    ),
+    (
+        "sglang:hisparse_host_pool_pinned_tokens",
+        "HiSparse host KV pool host KV tokens held by active reqs + retained radix rows (decode arm; -1 if not reported).",
+        "host_pool_pinned_tokens",
+    ),
+    (
+        "sglang:hisparse_host_pool_evictable_tokens",
+        "HiSparse host KV pool unlocked retained radix rows (freeable by eviction) (decode arm; -1 if not reported).",
+        "host_pool_evictable_tokens",
+    ),
+)
+_ALL_RANKS_POOL_FAMILY_NAMES = frozenset(f[0] for f in _ALL_RANKS_POOL_FAMILIES)
+_ALL_RANKS_WAIT_FAMILY = (
+    "sglang:hisparse_host_pool_wait_events",
+    "HiSparse host KV pool cumulative prealloc admission waits (host pool full).",
+)
+_ALL_RANKS_WAIT_AGE_FAMILY = (
+    "sglang:hisparse_host_pool_wait_age_s",
+    "HiSparse host KV pool age of the oldest prealloc blocked on a full pool, seconds (-1 if not reported).",
+)
+_ALL_RANKS_QUEUE_FAMILY = (
+    "sglang:num_queue_reqs",
+    "The number of requests in the waiting queue.",
+)
+_ALL_RANKS_PREALLOC_QUEUE_FAMILY = (
+    "sglang:num_decode_prealloc_queue_reqs",
+    "The number of requests in the decode prealloc queue.",
+)
+_ALL_RANKS_SNAPSHOT_AGE_FAMILY = (
+    "sglang:load_snapshot_age_seconds",
+    "Age of the rank's newest load snapshot (scheduler liveness tripwire: a rank whose age keeps growing has stopped publishing -- hung scheduler or dead zmq path -- while its budget values silently freeze at the last snapshot).",
+)
+
+
+class AllRanksLoadSnapshotCollector:
+    """Puts EVERY DP rank's per-rank gauges on the master's /metrics.
+
+    /metrics is served from a prometheus_client ``MultiProcessCollector``
+    over a node-local ``PROMETHEUS_MULTIPROC_DIR``: gauge samples written by
+    scheduler processes on OTHER nodes never reach the master (on prod's
+    4-node decode arm only the master node's 4 of 16 ranks were visible).
+    The load-snapshot channel (scheduler zmq PUSH -> node-0 SHM; the same
+    data DP balancing and /v1/loads use) carries these numbers from every
+    rank, so this collector reads it AT SCRAPE TIME (no new sockets, no
+    background threads) and emits the per-rank families for ranks the
+    multiprocess dir cannot see.
+
+    Behavior (default-on under ``--enable-metrics``):
+      - No snapshot from a remote node (single-node or dp_size=1): the
+        wrapped multiprocess collector passes through unchanged; the
+        exposition is identical to the pre-change behavior.
+      - Remote-node snapshots present: the host-pool families (free/total/
+        pinned/evictable/wait_events) and ``sglang:num_queue_reqs`` are
+        emitted HERE for ALL ranks (local + remote) with the exact
+        scheduler-side label set, and filtered out of the multiprocess
+        exposition, so every family appears exactly once (duplicate
+        HELP/TYPE blocks break Prometheus scrapes).
+      - ``num_queue_reqs`` is NOT taken over when priority scheduling is
+        enabled: the scheduler-side family carries per-priority series the
+        snapshot does not, so the multiprocess version wins and remote ranks
+        have no queue series (documented gap).
+
+    Value conventions mirror the scheduler side: -1 = host pool not
+    reported. A decode arm with ``--enable-hisparse`` reports all five
+    fields; a prefill arm with a hierarchical-cache host tier reports
+    free/total only (pinned/evictable stay -1, matching the scheduler
+    side, which never fills them on prefill arms).
+    """
+
+    def __init__(
+        self,
+        reader,
+        *,
+        model_name: Any,
+        engine_type: str,
+        local_node_rank: int,
+        enable_priority_scheduling: bool,
+        decode_hisparse: bool,
+    ) -> None:
+        self._reader = reader
+        self._model_name = model_name
+        self._engine_type = engine_type
+        self._local_node_rank = local_node_rank
+        self._priority = bool(enable_priority_scheduling)
+        self._decode_hisparse = bool(decode_hisparse)
+        self._mp = None  # attached by add_prometheus_middleware
+
+    def attach_multiprocess_collector(self, mp_collector) -> None:
+        """Set the wrapped MultiProcessCollector (registered instead of it)."""
+        self._mp = mp_collector
+
+    def describe(self):
+        # Names are dynamic (depend on which families we take over);
+        # returning [] disables the registry's duplicate-name check, same
+        # trick prometheus_client's own MultiProcessCollector relies on.
+        return []
+
+    def _label_values(self, snapshot) -> list:
+        """Label values in self._labelnames order (add_metric takes a list).
+
+        All values are str-coerced: the venv's prometheus_client escapes label
+        values with str.replace at exposition time and crashes on ints (found
+        on the rig: "'int' object has no attribute 'replace'").
+        """
+        values = [
+            str(self._model_name),
+            str(self._engine_type),
+            str(snapshot.tp_rank),
+            str(snapshot.pp_rank),
+            str(snapshot.moe_ep_rank),
+            str(snapshot.dp_rank),
+        ]
+        if self._priority:
+            # Scheduler-side gauges carry a priority label ("" = total).
+            values.append("")
+        return values
+
+    def _pool_value(self, snapshot, field: str) -> int:
+        if self._decode_hisparse and snapshot.host_pool_total_tokens > 0:
+            return int(getattr(snapshot, field))
+        if field in ("host_pool_free_tokens", "host_pool_total_tokens") and (
+            snapshot.host_pool_total_tokens > 0
+        ):
+            # prefill arm with a hierarchical-cache host tier: free/total only
+            return int(getattr(snapshot, field))
+        return -1  # not reported (scheduler-side convention)
+
+    def _read_snapshots(self) -> list:
+        try:
+            return self._reader.read_all()
+        except Exception as e:
+            logger.warning("load snapshot read for /metrics failed: %s", e)
+            return []
+
+    def collect(self):
+        # prometheus_client must be imported after PROMETHEUS_MULTIPROC_DIR
+        # is set (see SchedulerMetricsCollector.__init__). The venv's
+        # prometheus_client predates the top-level re-export, so GaugeMetric
+        # Family comes from .core (works on old and new versions alike).
+        from prometheus_client.core import GaugeMetricFamily
+
+        snapshots = self._read_snapshots()
+        remote_present = any(
+            s.node_rank != self._local_node_rank for s in snapshots
+        )
+        take_pool = remote_present
+        # Queue-depth families carry per-priority series on the scheduler
+        # side when priority scheduling is on; the snapshot has only totals,
+        # so the multiprocess version wins there (remote ranks get no queue
+        # series — documented gap).
+        take_queue = remote_present and not self._priority and any(
+            s.queues is not None for s in snapshots
+        )
+        take_prealloc = remote_present and not self._priority and any(
+            s.disaggregation is not None for s in snapshots
+        )
+
+        # Liveness tripwire: emitted for EVERY rank with a snapshot (new family,
+        # no mmdb counterpart, so no takeover gating needed -- including the
+        # single-node case). A rank whose age grows without bound has stopped
+        # publishing while consumers (DP budget, /v1/loads, this exporter)
+        # silently hold its last values -- the quietest failure mode of this
+        # channel (found in the 09-03 silent-discard audit; the zmq CONFLATE
+        # bug was another instance of the same class).
+        labelnames = [
+            "model_name",
+            "engine_type",
+            "tp_rank",
+            "pp_rank",
+            "moe_ep_rank",
+            "dp_rank",
+        ]
+        if self._priority:
+            labelnames.append("priority")
+        self._labelnames = labelnames
+        if snapshots:
+            name, doc = _ALL_RANKS_SNAPSHOT_AGE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            now = time.time()
+            for s in snapshots:
+                family.add_metric(
+                    self._label_values(s), max(0.0, now - s.timestamp)
+                )
+            yield family
+
+        mp = self._mp.collect() if self._mp is not None else iter(())
+        if not (take_pool or take_queue or take_prealloc):
+            yield from mp
+            return
+        for metric in mp:
+            name = metric.name
+            if (
+                (take_pool and name in _ALL_RANKS_POOL_FAMILY_NAMES)
+                or (take_pool and name == _ALL_RANKS_WAIT_FAMILY[0])
+                or (take_pool and name == _ALL_RANKS_WAIT_AGE_FAMILY[0])
+                or (take_queue and name == _ALL_RANKS_QUEUE_FAMILY[0])
+                or (take_prealloc and name == _ALL_RANKS_PREALLOC_QUEUE_FAMILY[0])
+            ):
+                continue
+            yield metric
+
+        if take_pool:
+            for name, doc, field in _ALL_RANKS_POOL_FAMILIES:
+                family = GaugeMetricFamily(name, doc, labels=labelnames)
+                for s in snapshots:
+                    family.add_metric(
+                        self._label_values(s), self._pool_value(s, field)
+                    )
+                yield family
+            name, doc = _ALL_RANKS_WAIT_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            for s in snapshots:
+                value = (
+                    int(s.host_pool_wait_events)
+                    if self._decode_hisparse and s.host_pool_total_tokens > 0
+                    else 0
+                )
+                family.add_metric(self._label_values(s), value)
+            yield family
+            name, doc = _ALL_RANKS_WAIT_AGE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            for s in snapshots:
+                value = (
+                    float(s.host_pool_wait_age_s)
+                    if self._decode_hisparse and s.host_pool_total_tokens > 0
+                    else -1.0
+                )
+                family.add_metric(self._label_values(s), value)
+            yield family
+
+        if take_queue:
+            name, doc = _ALL_RANKS_QUEUE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            for s in snapshots:
+                if s.queues is not None:
+                    family.add_metric(self._label_values(s), int(s.queues.waiting))
+            yield family
+
+        if take_prealloc:
+            name, doc = _ALL_RANKS_PREALLOC_QUEUE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            for s in snapshots:
+                if s.disaggregation is not None:
+                    family.add_metric(
+                        self._label_values(s),
+                        int(s.disaggregation.decode_prealloc_queue_reqs),
+                    )
+            yield family
+
+
+def build_load_snapshot_metrics_collector(tokenizer_manager):
+    """Build the AllRanks collector for a TokenizerManager, or None.
+
+    Returns None whenever any piece is missing (no tokenizer manager yet,
+    no load-snapshot reader, metrics disabled): the caller then registers
+    the plain MultiProcessCollector, exactly as before this change.
+    """
+    if tokenizer_manager is None:
+        return None
+    reader = getattr(tokenizer_manager, "load_snapshot_reader", None)
+    server_args = getattr(tokenizer_manager, "server_args", None)
+    if reader is None or server_args is None:
+        return None
+    if not getattr(server_args, "enable_metrics", False):
+        return None
+    return AllRanksLoadSnapshotCollector(
+        reader,
+        model_name=server_args.served_model_name,
+        engine_type=DisaggregationMode.to_engine_type(
+            server_args.disaggregation_mode
+        ),
+        local_node_rank=int(getattr(server_args, "node_rank", 0) or 0),
+        enable_priority_scheduling=getattr(
+            server_args, "enable_priority_scheduling", False
+        ),
+        decode_hisparse=(
+            DisaggregationMode(server_args.disaggregation_mode)
+            == DisaggregationMode.DECODE
+            and server_args.enable_hisparse
+        ),
+    )
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
