@@ -1046,6 +1046,9 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # Lane deepep-v2: V2 ElasticBuffer sizing (max tokens per rank in a step;
+    # chunked-prefill-size per DP rank on the prefill arm).
+    SGLANG_DEEPEP_V2_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
