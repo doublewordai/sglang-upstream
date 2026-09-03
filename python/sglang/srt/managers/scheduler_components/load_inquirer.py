@@ -200,7 +200,8 @@ class SchedulerLoadInquirer:
             dev_locked_migration,
             dev_oldest_transfer_age_s,
             dev_oldest_admission_age_s,
-        ) = (-1, -1, -1, -1, -1, -1, -1, -1.0, -1.0)
+            dev_reclaimable,
+        ) = (-1, -1, -1, -1, -1, -1, -1, -1.0, -1.0, -1)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             try:
                 from sglang.srt.managers.scheduler_components.pool_lock_breakdown import (
