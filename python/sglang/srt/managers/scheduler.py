@@ -2300,6 +2300,7 @@ class Scheduler(
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_tree_cache=lambda: self.tree_cache,
+            get_pdho_inflight_state=lambda: self._pdho_inflight_state(),
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -3050,8 +3051,7 @@ class Scheduler(
         """
         bound = self._pdho_inflight_bound_tokens()
         if (
-            bound <= 0
-            or self.disaggregation_mode != DisaggregationMode.PREFILL
+            self.disaggregation_mode != DisaggregationMode.PREFILL
             or not hasattr(self, "disagg_prefill_inflight_queue")
         ):
             return False, []
@@ -3074,10 +3074,25 @@ class Scheduler(
                     "age_s": round(now - entry_ts, 3) if entry_ts > 0 else None,
                 }
             )
-        if total <= bound:
+        # Blocked only when a bound is ACTIVE and exceeded. Holders are
+        # computed regardless (bound=0 shows the mass on the gauges without
+        # gating anything — the unbounded experiment arm needs exactly that).
+        if not (bound > 0 and total > bound):
             return False, holders
         holders.sort(key=lambda h: h["tokens"], reverse=True)
         return True, holders
+
+    def _pdho_inflight_state(self) -> tuple:
+        """(in-flight handover tokens, bound tokens, cumulative blocks) for
+        the load snapshot / metrics channel — the device-pool-degrade control
+        state, reported even when the gate is off so the unbounded arm of the
+        experiment can watch the mass grow."""
+        _blocked, holders = self._pdho_backpressure_state()
+        return (
+            int(sum(h["tokens"] for h in holders)),
+            int(self._pdho_inflight_bound_tokens()),
+            int(self.pdho_backpressure_blocks),
+        )
 
     def _note_pdho_backpressure_block(self, holders: list, total: int) -> None:
         """Rate-limited visibility for a back-pressure block: name the top

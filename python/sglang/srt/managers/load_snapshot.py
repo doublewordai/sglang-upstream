@@ -231,6 +231,18 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # busy rank from a STUCK one (supervisor's DP2 incident 09-03: 130 s
     # wait_age at evictable=0 was invisible in every exported metric).
     host_pool_wait_age_s: float = 0.0
+    # device-pool-degrade (prefill arm): in-flight handover mass — device KV
+    # held by finished prompts awaiting the PD KV transfer (unreclaimable
+    # until the transfer completes; the mass the back-pressure bound limits,
+    # 2026-09-03 13:28Z outage), the active bound
+    # (SGLANG_PDHO_INFLIGHT_FRACTION x pool; 0 = off), and the cumulative
+    # admission-block counter. Admission-cost accounting: per-request held
+    # tokens summed (each admission adds its full length), not a deduped page
+    # union — it is the quantity the bound bounds. The DEVICE-side
+    # counterpart of the host-pool gauges above.
+    pdho_inflight_handover_tokens: int = 0
+    pdho_inflight_bound_tokens: int = 0
+    pdho_backpressure_blocks: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
