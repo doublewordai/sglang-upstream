@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.pool_host.hisparse import HostPoolExhaustedError
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 
@@ -354,6 +355,10 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
+        # Store-degradation-rollback: set when a host-pool backup
+        # allocation failed for this request; freezes its mirror
+        # watermark so the mirror stays a clean prefix.
+        self._mirror_degraded = [False] * max_num_req_slots
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -541,6 +546,7 @@ class HiSparseCoordinator:
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self._mirror_degraded[req.req_pool_idx] = False
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def remap_draft_kv_from_host_rows(self, req: Req) -> None:
@@ -768,6 +774,7 @@ class HiSparseCoordinator:
             if adopted > 0:
                 self._fixup_wlp_buffer_tokens(req, adopted)
             self._skip_first_backup[req.req_pool_idx] = True
+            self._mirror_degraded[req.req_pool_idx] = False
             req.hisparse_staging = False
             finish_count -= 1
             ready_reqs.append(req)
@@ -1123,19 +1130,47 @@ class HiSparseCoordinator:
         accept_gpu = accept_lens.to(torch.int64).view(-1, 1)
         device_locs = slot_locs[col < accept_gpu].to(torch.int64)
         host_locs_list = []
+        keep = []
+        base = 0
         for i, a in enumerate(accept_cpu):
             if a <= 0:
                 continue
             req_idx = int(req_pool_indices_cpu[i])
-            start_pos = int(seq_lens_cpu[i])
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
-                a,
-            )
-            host_locs_list.append(host_locs)
+            ok = True
+            if self._mirror_degraded[req_idx]:
+                ok = False
+            else:
+                start_pos = int(seq_lens_cpu[i])
+                try:
+                    host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                        self.req_to_host_pool,
+                        self.req_to_host_pool_allocated_len,
+                        req_idx,
+                        start_pos,
+                        a,
+                    )
+                    host_locs_list.append(host_locs)
+                except HostPoolExhaustedError:
+                    # Store-degradation-rollback: warn, skip, freeze
+                    # the watermark — never kill the verify commit.
+                    self._mirror_degraded[req_idx] = True
+                    logger.warning(
+                        "HiSparse: host pool full during verify backup "
+                        "(req_idx=%d, pos=%d, accept=%d) — mirror "
+                        "watermark frozen at %d",
+                        req_idx,
+                        start_pos,
+                        a,
+                        int(self.req_to_host_pool_allocated_len[req_idx]),
+                    )
+                    ok = False
+            if ok:
+                keep.extend(range(base, base + a))
+            base += a
+        if keep:
+            device_locs = device_locs[
+                torch.tensor(keep, dtype=torch.long, device=device_locs.device)
+            ]
         if not host_locs_list:
             return
         host_locs = torch.cat(host_locs_list)
@@ -1280,18 +1315,46 @@ class HiSparseCoordinator:
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
         host_locs_list = []
-        for i in backup_indices:
+        keep_rows = []
+        for k, i in enumerate(backup_indices):
             req_idx = int(req_pool_indices_cpu[i])
+            if self._mirror_degraded[req_idx]:
+                # Watermark frozen by an earlier backup allocation
+                # failure; finish-flush repairs what it can.
+                continue
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
-                1,
-            )
+            try:
+                host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                    self.req_to_host_pool,
+                    self.req_to_host_pool_allocated_len,
+                    req_idx,
+                    start_pos,
+                    1,
+                )
+            except HostPoolExhaustedError:
+                # Store-degradation-rollback: warn, skip, freeze
+                # this request's mirror watermark — never kill the
+                # decode step for a save failure. A hole is
+                # impossible: the failed page never advances
+                # req_to_host_pool_allocated_len.
+                self._mirror_degraded[req_idx] = True
+                logger.warning(
+                    "HiSparse: host pool full during decode backup "
+                    "(req_idx=%d, pos=%d) — mirror watermark frozen "
+                    "at %d; the finished request's cache will shorten",
+                    req_idx,
+                    start_pos,
+                    int(self.req_to_host_pool_allocated_len[req_idx]),
+                )
+                continue
             host_locs_list.append(host_locs)
+            keep_rows.append(k)
+        if not host_locs_list:
+            return
         host_locs = torch.cat(host_locs_list)
+        device_locs = device_locs[
+            torch.tensor(keep_rows, dtype=torch.long, device=device_locs.device)
+        ]
 
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
@@ -1594,6 +1657,7 @@ class HiSparseCoordinator:
         # device pool (the staging backup never consumed it).
         self.free_extend_scratch(req.req_pool_idx)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mirror_degraded[req.req_pool_idx] = False
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -1649,6 +1713,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mirror_degraded[req.req_pool_idx] = False
 
     # ------------------------------------------------------------------
     # Prefix retention (radix-over-hisparse)
@@ -1733,19 +1798,35 @@ class HiSparseCoordinator:
             [s for _, s in recoverable], dtype=torch.int64, device=self.device
         )
         device_locs = self.req_to_device_buffer[idx, slots]
-        host_locs = self.mem_pool_host.alloc_paged_token_slots(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            idx,
-            positions[0],
-            len(positions),
-        )
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs,
-            io_backend="kernel",
-        )
+        try:
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                idx,
+                positions[0],
+                len(positions),
+            )
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+        except HostPoolExhaustedError:
+            # Store-degradation-rollback: the pool is full at
+            # finish time. Warn, keep the verified mirror head,
+            # shorten the retained prefix — never kill the engine
+            # for a save failure.
+            logger.warning(
+                "HiSparse: host pool full during finish-flush "
+                "(req_idx=%d, have=%d, want=%d) — retaining the "
+                "%d-token mirror head only",
+                idx,
+                have,
+                want,
+                have,
+            )
+            return have
         device_module.current_stream().synchronize()
         return min(target_len, positions[-1] + 1)
 
@@ -1756,13 +1837,28 @@ class HiSparseCoordinator:
         return self.req_to_host_pool[idx, :n].clone()
 
     def retain_rows(self, logical_values: torch.Tensor, rows: torch.Tensor) -> None:
-        """Move host-row ownership for `logical_values` to the side table."""
+        """Move host-row ownership for `logical_values` to the side table.
+
+        Store-degradation-rollback: a logical index that already
+        holds a retained row (duplicate content / accounting
+        drift) keeps the EXISTING row; the duplicate row is freed
+        and a warning logged — never assert and kill the engine.
+        """
         assert logical_values.numel() == rows.numel()
         idx = logical_values.to(device="cpu", dtype=torch.int64)
-        assert bool(
-            (self.logical_to_host_row[idx] < 0).all()
-        ), "retain_rows: logical index already holds a retained row"
-        self.logical_to_host_row[idx] = rows.to(device="cpu", dtype=torch.int64)
+        rows = rows.to(device="cpu", dtype=torch.int64)
+        dup = self.logical_to_host_row[idx] >= 0
+        if bool(dup.any()):
+            self.mem_pool_host.free(rows[dup])
+            logger.warning(
+                "HiSparse retain_rows: %d logical indices already "
+                "retained; freed the duplicate host rows",
+                int(dup.sum()),
+            )
+            idx = idx[~dup]
+            rows = rows[~dup]
+        if idx.numel() > 0:
+            self.logical_to_host_row[idx] = rows
 
     def adopt_prefix(self, req: Req, prefix_indices: torch.Tensor) -> None:
         """Point a new request's host-row table at a retained prefix."""
@@ -1834,6 +1930,7 @@ class HiSparseCoordinator:
         self.req_adopted_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mirror_degraded[req.req_pool_idx] = False
 
     def free_unretained_rows(self, rows: torch.Tensor) -> None:
         """Free host rows that were never moved to the side table."""
