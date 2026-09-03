@@ -463,14 +463,14 @@ class Envs:
     # engine) instead of per-row UVA gather/scatter kernels. Byte-identical
     # copies; affects the HiCache H2D load path (page_first host pools) and
     # the layer_first D2H backup path (hisparse staging backup).
-    SGLANG_HICACHE_BULK_COPY = EnvBool(False)
+    SGLANG_HICACHE_BULK_COPY = EnvBool(True)
     # D2H bulk backup via warp-coalesced SM stores instead of the copy engine
     # (the CE D2H path is capped at ~170 GB/s over C2C on GH200; coalesced SM
     # stores sustain ~383 GB/s into the same pinned pool). Replaces the
     # segment copies AND the remainder kernel of the bulk backup when
     # SGLANG_HICACHE_BULK_COPY is also on; byte-identical; falls back to the
     # merged copy-engine path when the JIT module is unavailable.
-    SGLANG_D2H_SM_STORES = EnvBool(False)
+    SGLANG_D2H_SM_STORES = EnvBool(True)
     # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
     # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
     # eligibility (max new-span tokens, min matched fraction of the prompt) and

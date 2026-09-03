@@ -168,6 +168,9 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.observability.metrics_collector import (
+    build_load_snapshot_metrics_collector,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -287,7 +290,12 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Add prometheus middleware
     if server_args.enable_metrics:
-        add_prometheus_middleware(app)
+        add_prometheus_middleware(
+            app,
+            load_snapshot_collector=build_load_snapshot_metrics_collector(
+                _global_state.tokenizer_manager
+            ),
+        )
         enable_func_timer()
 
     # Init tracing
