@@ -275,6 +275,7 @@ def chain_loss(
     detach_feedback: bool = False,
     return_metrics: bool = False,
     generator: torch.Generator | None = None,
+    ctx: int = 0,  # prefix context (0 = full window before the chain start)
 ):
     """EAGLE-3.1-style chain fine-tune (depth-stability variant).
 
@@ -303,15 +304,21 @@ def chain_loss(
                 s = int(torch.randint(lo, hi, (1,), generator=generator, device=device))
             else:
                 s = int(torch.randint(lo, hi, (1,), device=device))
+            m["chains"] += 1
             gs = []
+            # prefix start: include window context before the chain so the
+            # chain sees the same KV context as real inference (ctx=0 -> all).
+            # Convention: prev_hidden[b, i] = target hidden h_{i-1}; the input
+            # for window token i is h_{i-1}.
+            p0 = 0 if ctx == 0 else max(0, s - ctx)
             for j in range(chain_len):
-                L = j + 1
-                prev = [prev_hidden[b, s - 1]] + [
-                    g.detach() if detach_feedback else g for g in gs
-                ]
-                prev_chunk = torch.stack(prev).unsqueeze(0)  # [1, L, H]
-                tok_chunk = tokens[b, s : s + L].unsqueeze(0)  # [1, L]
-                pos_chunk = positions[b, s : s + L].unsqueeze(0)  # [1, L]
+                # prevs for tokens p0..s-1 (target h), the seed for token s
+                # (h_{s-1}), then the draft's own g_{j-1} for tokens s+1..s+j
+                prev = [prev_hidden[b, i] for i in range(p0, s + 1)]
+                prev += [g.detach() if detach_feedback else g for g in gs]
+                prev_chunk = torch.stack(prev).unsqueeze(0)  # [1, p + j + 1, H]
+                tok_chunk = tokens[b, p0 : s + j + 1].unsqueeze(0)
+                pos_chunk = positions[b, p0 : s + j + 1].unsqueeze(0)
                 g_all, lg_all = model(
                     tok_chunk, prev_chunk, pos_chunk, compute_logits=True
                 )
@@ -324,8 +331,8 @@ def chain_loss(
                 ce = torch.nn.functional.cross_entropy(
                     lg.float().unsqueeze(0), label.unsqueeze(0)
                 )
-                # feature loss vs the target hidden at s+j
-                feat = prev_hidden[b, s + j]
+                # feature loss: g_j approximates h_{s+j} = prev_hidden[b, s+j+1]
+                feat = prev_hidden[b, s + j + 1]
                 mse = torch.nn.functional.mse_loss(g_j.float(), feat.float())
                 losses.append(ce + feature_weight * mse)
                 m["ce"].append(ce.item())
@@ -333,7 +340,6 @@ def chain_loss(
                 with torch.no_grad():
                     if int(lg.argmax()) == int(label):
                         m["top1_by_depth"][j] += 1
-                m["chains"] += 1
     if not losses:
         z = torch.zeros(1, device=device, requires_grad=True)
         return (z, m) if return_metrics else z

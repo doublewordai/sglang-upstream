@@ -99,6 +99,7 @@ srun --overlap --jobid="$HOLDER" -N1 -n1 -w "$TRAIN_NODE" --gres=gpu:4 \
     export PYTHONDONTWRITEBYTECODE=1; cd $LANE
     CUDA_VISIBLE_DEVICES=0 ~/sglang-venv/bin/python $LANE/export_draft.py \
       --weights-dir $LANE/draft_weights --ft $LANE/runs/real/draft_finetuned.pt \
+      --orig-ckpt /projects/s6p/hf/hub/models--zai-org--GLM-5.3/snapshots/e0b07fd2751b42d5efa199cc02c2b271deadc516 \
       --out $LANE/export_trained_real
   " > $LOGS/pipe-export.out 2>&1 || { echo EXPORT-FAILED; tail -20 $LOGS/pipe-export.out; exit 1; }
 tail -2 $LOGS/pipe-export.out

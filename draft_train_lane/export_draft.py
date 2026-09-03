@@ -21,6 +21,8 @@ import json
 import os
 import shutil
 
+from safetensors import safe_open
+
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -59,6 +61,7 @@ def main():
     ap.add_argument("--weights-dir", required=True, help="extractor output (meta.json)")
     ap.add_argument("--ft", required=True, help="draft_finetuned.pt from training")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--orig-ckpt", help="original HF checkpoint dir: frozen expert + kv_b fp8 tensors are copied byte-identical (zero requant drift)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -144,6 +147,21 @@ def main():
     # finds a complete weight set in its own directory)
     out["model.embed_tokens.weight"] = ft["embed"].to(torch.bfloat16)
     out["lm_head.weight"] = ft["lm_head"].to(torch.bfloat16)
+
+    # frozen fp8 passthrough from the ORIGINAL checkpoint: experts and kv_b
+    # never train, so their fp8 codes + scales can be copied byte-identical
+    # (the bf16-dequant -> requant path costs ~0.4% per-element drift).
+    if args.orig_ckpt:
+        idx = json.load(open(os.path.join(args.orig_ckpt, "model.safetensors.index.json")))["weight_map"]
+        n_passthrough = 0
+        for k in list(out.keys()):
+            if (".mlp.experts." in k and f".{L}." in k) or k.startswith(f"model.layers.{L}.self_attn.kv_b_proj."):
+                if k not in idx:
+                    continue
+                with safe_open(os.path.join(args.orig_ckpt, idx[k]), framework="pt", device="cpu") as f:
+                    out[k] = f.get_tensor(k)
+                n_passthrough += 1
+        print(f"passthrough from orig ckpt: {n_passthrough} fp8 tensors (experts + kv_b)")
 
     save_file(out, os.path.join(args.out, "model.safetensors"))
 

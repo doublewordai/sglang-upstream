@@ -46,10 +46,18 @@ def main():
     ap.add_argument("--per-segment", action="store_true",
                     help="top-1 by segment class (prose/code/tool-JSON) via marker segmentation")
     ap.add_argument("--tokenizer", default=TOK_DEFAULT)
+    ap.add_argument("--ft-ckpt", help="overlay a draft_finetuned.pt onto the model")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     model = build_model(args.weights).cuda().eval()
+    if args.ft_ckpt:
+        import train_draft
+        sd = torch.load(args.ft_ckpt, map_location="cpu")
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        real_missing = [k for k in missing if "embed" not in k and "lm_head" not in k]
+        assert not real_missing and not unexpected, (real_missing, unexpected)
+        print(f"overlaid {args.ft_ckpt}")
     # holdout_sessions=0: baseline eval over all data (train/val split is the
     # trainer's concern; the semantic check wants maximum coverage)
     data = RealData(args.data, window=args.window, holdout_sessions=0, seed=0)

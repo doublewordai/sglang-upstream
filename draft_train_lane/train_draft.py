@@ -101,6 +101,8 @@ def main():
                     help="detach the draft's own hidden feedback (no BPTT through the chain)")
     ap.add_argument("--val-every", type=int, default=50)
     ap.add_argument("--val-windows", type=int, default=16)
+    ap.add_argument("--holdout", type=int, default=6,
+                    help="sessions held out for val (0 = train on everything)")
     ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--strategy", default="fsdp", choices=["fsdp", "ddp", "none"])
@@ -145,10 +147,14 @@ def main():
         train_pick = lambda rng, n: data.windows(n, args.window, rng, "train")
         val_pick = lambda rng, n: data.windows(n, args.window, rng, "val")
     else:
-        data = RealData(args.data, window=args.window, seed=args.seed)
+        data = RealData(args.data, window=args.window, seed=args.seed,
+                        holdout_sessions=args.holdout)
         get = data.get
         train_pick = lambda rng, n: [data.train_idx[i] for i in rng.choice(len(data.train_idx), n)]
-        val_pick = lambda rng, n: [data.val_idx[i] for i in rng.choice(len(data.val_idx), min(n, len(data.val_idx)))]
+        def val_pick(rng, n):
+            if not data.val_idx:
+                return []
+            return [data.val_idx[i] for i in rng.choice(len(data.val_idx), min(n, len(data.val_idx)))]
 
     decay, no_decay = [], []
     for n, p in raw_model.named_parameters():
