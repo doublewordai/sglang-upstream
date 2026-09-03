@@ -1387,6 +1387,87 @@ def prepare_block_fp8_matmul_inputs(
     return M, N, K, C
 
 
+_fp8_blockwise_smallm_enabled: Optional[bool] = None
+
+# (N, K) -> (max M, pad allowed) routed to the CUTLASS sm90 blockwise path.
+# Wins measured end-to-end through the production entry (quant included) on
+# GH200 (bit-exact outputs; see environ.py). "pad allowed = False" shapes only
+# win when the token rows are already a multiple of 4 (the small kernel win
+# does not cover the pad-row copy).
+_FP8_BLOCKWISE_SMALLM_WIN_SET = {
+    (6144, 16384): (16, True),  # o_proj 78 calls/step: +3.2..5.5us/call at all M<=16
+    (6144, 12288): (16, True),  # dense down_proj 3 calls/step: +0.9..3.6us/call
+    (4096, 6144): (4, False),  # shared gate+up 75 calls/step: +1.2us/call at M=4 only
+}
+
+_fp8_blockwise_smallm_sfb_cache: Dict[Tuple[int, Tuple[int, int]], torch.Tensor] = {}
+
+
+def _fp8_blockwise_smallm_sfb(Bs: torch.Tensor) -> torch.Tensor:
+    """[NB, G] fp32 -> [G, NB] row-major (the layout the CUTLASS blockwise
+    kernel expects), cached per weight tensor (weights are static after load;
+    ~24 KB per fp8 weight, e.g. o_proj 128x48 fp32)."""
+    key = (Bs.data_ptr(), tuple(Bs.shape))
+    sfb = _fp8_blockwise_smallm_sfb_cache.get(key)
+    if sfb is None:
+        sfb = Bs.t().contiguous()
+        _fp8_blockwise_smallm_sfb_cache[key] = sfb
+    return sfb
+
+
+def _use_fp8_blockwise_smallm(M, N, K, A, As, Bs, block_size) -> bool:
+    global _fp8_blockwise_smallm_enabled
+    if _fp8_blockwise_smallm_enabled is None:
+        from sglang.srt.environ import envs
+
+        cap = torch.cuda.get_device_capability()
+        _fp8_blockwise_smallm_enabled = bool(
+            envs.SGLANG_GLM_FP8_BLOCKWISE_SMALLM_GEMM.get()
+            and torch.cuda.is_available()
+            and cap >= (9, 0)
+            and cap < (10, 0)
+        )
+    if not _fp8_blockwise_smallm_enabled:
+        return False
+    max_m, pad_ok = _FP8_BLOCKWISE_SMALLM_WIN_SET.get((N, K), (0, False))
+    if not (1 <= M <= max_m):
+        return False
+    if M % 4 != 0 and not pad_ok:
+        return False
+    if list(block_size) != [128, 128]:
+        return False
+    if (
+        A.dtype != torch.float8_e4m3fn
+        or As.dtype != torch.float32
+        or Bs.dtype != torch.float32
+    ):
+        # UE8M0-packed scales or unexpected operand dtypes fall through to DeepGEMM
+        return False
+    if N % 128 != 0 or K % 128 != 0:
+        return False
+    # As must be the production per-token-group quant buffer: [M, K//128]
+    # fp32 column-major over a pad4(M)-row TMA-aligned allocation (the
+    # kernel reads the buffer's row pitch from the stride, so unpadded M is
+    # fine and no pad-row copy is needed).
+    pad = (M + 3) // 4 * 4
+    if As.ndim != 2 or tuple(As.shape) != (M, K // 128):
+        return False
+    if As.stride() != (1, M if M % 4 == 0 else pad):
+        return False
+    return True
+
+
+def _fp8_blockwise_smallm(A, B, As, Bs, M, N, K):
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm_sm90 import (
+        fp8_blockwise_scaled_mm_sm90,
+    )
+
+    # A and As pass through untouched: the kernel consumes the true token
+    # count M and reads the scale buffer's pad4 row pitch from As's stride.
+    out = fp8_blockwise_scaled_mm_sm90(A, B, As, _fp8_blockwise_smallm_sfb(Bs), variant=5)
+    return out.view(*A.shape[:-1], N)
+
+
 def w8a8_block_fp8_matmul_deepgemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1399,6 +1480,9 @@ def w8a8_block_fp8_matmul_deepgemm(
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    if _use_fp8_blockwise_smallm(M, N, K, A, As, Bs, block_size):
+        return _fp8_blockwise_smallm(A, B, As, Bs, M, N, K)
 
     deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 

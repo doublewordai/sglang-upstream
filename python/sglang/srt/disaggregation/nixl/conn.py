@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.cold_trace import cold_trace
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -951,7 +952,15 @@ class NixlKVManager(CommonKVManager):
         self,
         peer_info: KVArgsRegisterInfo,
         mem_segments: List[_KVXferMemSegment],
+        dst_align: Optional[List[int]] = None,
     ):
+        # dst_align: decode entry index per src entry (PP layer-id pairing);
+        # None keeps the previous positional behavior.
+        dst_ptrs_all = peer_info.dst_kv_ptrs
+        dst_item_lens_all = peer_info.dst_kv_item_lens
+        if dst_align is not None:
+            dst_ptrs_all = [dst_ptrs_all[j] for j in dst_align]
+            dst_item_lens_all = [dst_item_lens_all[j] for j in dst_align]
         prepared_segments = []
         for seg in mem_segments:
             src_key = (seg.start, seg.end, seg.src_mem_kind)
@@ -972,13 +981,13 @@ class NixlKVManager(CommonKVManager):
                 if peer_info.dst_num_slots is not None
                 else self._num_slots_src
             )
-            dst_kv_item_lens = peer_info.dst_kv_item_lens[seg.start : seg.end]
+            dst_kv_item_lens = dst_item_lens_all[seg.start : seg.end]
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
             dst_handle = self._prep_equal_tp_dlist(
                 peer_info.agent_name,
-                peer_info.dst_kv_ptrs[seg.start : seg.end],
+                dst_ptrs_all[seg.start : seg.end],
                 dst_kv_item_lens,
                 dst_kv_data_lens,
                 peer_info.gpu_id,
@@ -1021,6 +1030,27 @@ class NixlKVManager(CommonKVManager):
         )
         decode_only_spec_dec = n_dst > n_src and not paired_by_layer_id
 
+        # PP (+spec): the decode list spans ALL prefill stages' layers plus
+        # the draft layer; align it to exactly this rank's entries by layer
+        # id before any positional pairing (homogeneity check, mixed-memory
+        # segmentation, prepped dlists). Equal lengths (pp_size 1) keep the
+        # previous positional behavior.
+        dst_align = None
+        if paired_by_layer_id and n_dst != n_src:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=False,
+            )
+            dst_align = [j for _, j in pairs]
+        aligned_dst_mem_kinds = (
+            [peer_info.dst_kv_mem_kinds[j] for j in dst_align]
+            if dst_align is not None
+            else peer_info.dst_kv_mem_kinds
+        )
+
         if peer_info.requires_dcp_relayout:
             dst_indices = resolve_dcp_dst_entry_indices(
                 self.kv_args.kv_layer_ids,
@@ -1049,7 +1079,7 @@ class NixlKVManager(CommonKVManager):
             dst_mem_kind = None
             try:
                 dst_mem_kind = _homogeneous_kv_mem_kind(
-                    peer_info.dst_kv_mem_kinds, "destination"
+                    aligned_dst_mem_kinds, "destination"
                 )
             except NotImplementedError:
                 if decode_only_spec_dec:
@@ -1058,11 +1088,15 @@ class NixlKVManager(CommonKVManager):
                         "decode-only speculative decoding."
                     )
                 mem_segments = _kv_xfer_mem_segments(
-                    self.kv_args.kv_data_mem_kinds, peer_info.dst_kv_mem_kinds
+                    self.kv_args.kv_data_mem_kinds, aligned_dst_mem_kinds
                 )
                 if not mem_segments:
                     raise ValueError("NIXL KV transfer has no KV memory segments")
-                self._init_mixed_equal_tp_prep_handles(peer_info, mem_segments)
+                self._init_mixed_equal_tp_prep_handles(
+                    peer_info,
+                    mem_segments,
+                    dst_align=dst_align,
+                )
                 return
 
             if decode_only_spec_dec and dst_mem_kind != "VRAM":
@@ -2028,7 +2062,17 @@ class NixlKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
+        # PP + spec: non-last prefill stages skip the spec aux components
+        # (their hidden-state rows use the 16-fp32 padding layout and are
+        # never filled); the last stage is the single writer of those fields.
+        spec_range = getattr(self.kv_args, "aux_spec_buf_range", None)
+        skip_spec = spec_range is not None and not getattr(
+            self.kv_args, "aux_send_spec_bufs", True
+        )
+
         for i, _ in enumerate(dst_aux_ptrs):
+            if skip_spec and spec_range[0] <= i < spec_range[1]:
+                continue
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
@@ -2678,7 +2722,21 @@ class NixlKVManager(CommonKVManager):
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
+                try:
+                    self._handle_bootstrap_message(waiting_req_bytes)
+                except Exception:
+                    # A single malformed message or a failed peer-agent setup
+                    # (e.g. UCCL CXI endpoint handshake timeout against a
+                    # still-booting peer) must NOT kill this thread: it is the
+                    # only bootstrap handler for the whole prefill arm.
+                    logger.exception(
+                        "bootstrap_thread: error handling message "
+                        f"(first frame={waiting_req_bytes[0][:16]!r}); continuing"
+                    )
 
+        threading.Thread(target=bootstrap_thread).start()
+
+    def _handle_bootstrap_message(self, waiting_req_bytes):
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
                     if self.enable_staging:
@@ -2687,7 +2745,7 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
+                    return
 
                 # Staging: decode replies with allocated staging offset
                 if waiting_req_bytes[0] == b"STAGING_RSP":
@@ -2697,10 +2755,10 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
+                    return
 
                 if self._handle_abort_notification(waiting_req_bytes):
-                    continue
+                    return
 
                 assert (
                     waiting_req_bytes[0] == GUARD
@@ -2714,7 +2772,7 @@ class NixlKVManager(CommonKVManager):
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
+                    return
                 room = int(room)
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
@@ -2736,9 +2794,8 @@ class NixlKVManager(CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
+                    cold_trace("pf_room_registered", room=room, senders=len(self.transfer_infos[room]))
                     self.update_status(room, KVPoll.WaitingForInput)
-
-        threading.Thread(target=bootstrap_thread).start()
 
 
 class NixlKVSender(CommonKVSender):
