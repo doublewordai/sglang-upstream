@@ -268,7 +268,34 @@ def test_hugetlb_register_exact_staging_decode_size():
         # bit-exact by construction: only pinning changed; spot-check the tensor
         v = t.view(torch.uint8).flatten()
         v[:1024] = torch.arange(1024, dtype=torch.uint8)
-        assert v[1023].item() == 1023
+        assert v[1023].item() == 255  # uint8 wrap: arange(1024)[1023] = 255
+    finally:
+        _cuda_host_unregister(t)
+
+
+def test_hugetlb_register_chunked_fallback():
+    """The chunked-registration fallback (page-multiple chunks, one VA range)
+    pins and unregisters cleanly through _cuda_host_unregister."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    from sglang.srt.mem_cache.pool_host.common import (
+        HostTensorAllocator,
+        _cuda_host_unregister,
+    )
+    from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+
+    with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"), envs.SGLANG_HUGEPAGE_STRICT.override(True):
+        try:
+            t = alloc_mmap((3 * GIB,), torch.uint8)
+        except OSError as e:
+            pytest.skip(f"2 MiB hugetlbfs unavailable: {e}")
+    from sglang.srt.mem_cache.pool_host.common import _register_chunked
+
+    alloc_bytes = t._sglang_mmap_alloc_bytes
+    _register_chunked(t, alloc_bytes, 2 * MIB)
+    try:
+        assert len(t._sglang_register_chunks) >= 2
+        assert _pattern_roundtrip(t)
     finally:
         _cuda_host_unregister(t)
 
