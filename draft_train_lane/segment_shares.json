@@ -1,0 +1,24 @@
+{
+  "corpus_chars": 19324292,
+  "tokens": 7984344,
+  "shares": {
+    "prose": {
+      "tokens": 5001832,
+      "share": 0.6264549723809495,
+      "chars": 16826703,
+      "segments": 3827
+    },
+    "tool_json": {
+      "tokens": 349863,
+      "share": 0.043818628055103837,
+      "chars": 938467,
+      "segments": 3249
+    },
+    "code": {
+      "tokens": 2632649,
+      "share": 0.32972639956394667,
+      "chars": 8764210,
+      "segments": 997
+    }
+  }
+}

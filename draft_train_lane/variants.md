@@ -13,7 +13,10 @@ source, not output segment type — content classification needed. Crude corpus
 marker density (per 2 MB): 1994 code fences, 3716 `def`, ~315 tool-JSON blocks.
 
 - Gate A (two-drafter): max per-segment accuracy gap > ~5 points top-1 AND the
-  low segment is a large token share (>15%).
+  low segment is a large token share (>15%). Measured shares (full corpus,
+  7.98M tok): prose 62.6%, code 33.0%, tool-JSON 4.4% — tool-JSON alone fails
+  the share threshold; the split to measure is structured {code+JSON} 37.4%
+  vs prose 62.6% (segment_shares.json).
 - Gate B (chain depth): per-depth top-1 (chain_rollout diagnostic) collapses
   faster than linear with depth (i.e. depth-3 marginal token < half of depth-1).
 - Gate C (parallel/block): none measurable pre-hoc; only build if chain results
