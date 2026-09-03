@@ -49,6 +49,7 @@ class SchedulerLoadInquirer:
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
     get_disagg_decode_transfer_queue: Callable
+    get_tree_cache: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
     get_total_prefill_uncached_tokens: Callable
@@ -145,6 +146,25 @@ class SchedulerLoadInquirer:
                     )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # prefill-pool-degrade: the hicache host pool is the retention
+            # constraint on a prefill arm; without this the snapshot reports
+            # host_free_tok=0 unconditionally (staging C10B showed all-zero
+            # host_free_tok from boot - the router was blind).
+            if self.server_args.enable_hierarchical_cache:
+                try:
+                    tree_cache = self.get_tree_cache()
+                except (AttributeError, TypeError) as e:
+                    tree_cache = None
+                    logger.debug(f"tree cache not available: {e}")
+                cc = getattr(tree_cache, "cache_controller", None)
+                if cc is not None:
+                    try:
+                        host_pool = cc.mem_pool_host
+                        host_pool_free_tokens = int(host_pool.available_size())
+                        host_pool_total_tokens = int(host_pool.size)
+                    except (AttributeError, TypeError) as e:
+                        logger.debug(f"HiCache host pool metrics not available: {e}")
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (

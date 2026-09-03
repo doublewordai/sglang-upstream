@@ -2233,6 +2233,7 @@ class Scheduler(
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_tree_cache=lambda: self.tree_cache,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -4820,6 +4821,35 @@ class Scheduler(
                     self.disagg_decode_prealloc_queue.host_pool_wait_events
                 ),
             }
+
+        if self.enable_hierarchical_cache and self.tree_cache is not None:
+            # prefill-pool-degrade: per-rank hicache host-pool state + the
+            # degrade-ladder counters so routers/ops can see the retention
+            # constraint and its pressure.
+            cc = getattr(self.tree_cache, "cache_controller", None)
+            if cc is not None:
+                host_pool = cc.mem_pool_host
+                ret["hicache_host_pool"] = {
+                    "free_tokens": int(host_pool.available_size()),
+                    "total_tokens": int(host_pool.size),
+                    "page_size": int(host_pool.page_size),
+                    "write_skips": int(
+                        getattr(self.tree_cache, "host_pool_write_skips", 0)
+                    ),
+                    "write_skip_tokens": int(
+                        getattr(self.tree_cache, "host_pool_write_skip_tokens", 0)
+                    ),
+                    "force_evicted_tokens": int(
+                        getattr(
+                            self.tree_cache, "host_pool_force_evicted_tokens", 0
+                        )
+                    ),
+                    "exhausted": bool(
+                        getattr(
+                            self.tree_cache, "host_pool_exhausted", lambda: False
+                        )()
+                    ),
+                }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
