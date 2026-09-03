@@ -387,12 +387,17 @@ def capture_prefill_graph(
         or hasattr(lyr, "attention")
         or hasattr(lyr, "mixer")
     )
-    if len(model_runner.attention_layers) < local_real_layers:
+    # With global-id registration the list is padded with None holes, so count
+    # materialized entries instead of using len().
+    recognized_attn = sum(
+        1 for x in model_runner.attention_layers if x is not None
+    )
+    if recognized_attn < local_real_layers:
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,
             f"Disable prefill CUDA graph because some layers do not apply Standard GQA "
-            f"(attn={len(model_runner.attention_layers)} local={local_real_layers} "
+            f"(attn={recognized_attn} local={local_real_layers} "
             f"global={model_runner.model_config.num_hidden_layers})",
         )
         return result(None)
