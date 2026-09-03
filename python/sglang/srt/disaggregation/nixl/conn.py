@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.cold_trace import cold_trace
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -1382,6 +1382,15 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                _xfer_t0 = time.time()
+                if cold_trace_enabled():
+                    cold_trace(
+                        "pf_submit",
+                        room=room,
+                        chunk_id=kv_chunk.chunk_id,
+                        pages=len(kv_chunk.prefill_kv_indices),
+                        last=1 if kv_chunk.is_last_chunk else 0,
+                    )
                 while handles:
                     all_done = True
                     for handle in handles:
@@ -1396,6 +1405,14 @@ class NixlKVManager(CommonKVManager):
                         break
                     time.sleep(0)
 
+                if cold_trace_enabled():
+                    cold_trace(
+                        "pf_xfer_done",
+                        room=room,
+                        chunk_id=kv_chunk.chunk_id,
+                        last=1 if kv_chunk.is_last_chunk else 0,
+                        xfer_ms=(time.time() - _xfer_t0) * 1000,
+                    )
                 self._staging_outstanding[room] -= 1
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
