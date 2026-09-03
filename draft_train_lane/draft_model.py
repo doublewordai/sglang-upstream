@@ -279,6 +279,10 @@ def chain_loss(
     residual_weight: float = 0.0,  # logit-delta matching (residual objective)
     lm_head=None,  # [V, H] snapshot of the (frozen) lm_head; required if
     # residual_weight > 0 (FSDP-safe: pass a detached copy taken pre-wrap)
+    vat: bool = False,  # verification-aware training: weight depth-j loss by
+    # the (detached) probability the chain reached depth j (VAT,
+    # arXiv 2608.30135: sequential verification discards the tail after the
+    # first rejection, so supervision should follow the reach pattern)
 ):
     """residual_weight > 0 adds the residual-draft-distillation objective:
     the chain's consecutive-step logit DELTA must match the target's
@@ -316,6 +320,7 @@ def chain_loss(
             gs = []
             _lg_prev = None
             _lmw = lm_head
+            _reach = 1.0  # VAT: P(chain reaches current depth)
             # prefix start: include window context before the chain so the
             # chain sees the same KV context as real inference (ctx=0 -> all).
             # Convention: prev_hidden[b, i] = target hidden h_{i-1}; the input
@@ -363,6 +368,13 @@ def chain_loss(
                         pred_delta, tgt_delta
                     )
                     _lg_prev = lg
+                if vat and j > 0:
+                    # reweight by reach probability (detached: supervision
+                    # weighting, not differentiable through the accept pattern)
+                    step_loss = step_loss * _reach
+                if vat:
+                    with torch.no_grad():
+                        _reach = _reach * (1.0 if int(lg.argmax()) == int(label) else 0.0)
                 losses.append(step_loss)
                 m["ce"].append(ce.item())
                 m["mse"].append(mse.item())

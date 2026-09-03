@@ -101,6 +101,8 @@ def main():
                     help="detach the draft's own hidden feedback (no BPTT through the chain)")
     ap.add_argument("--chain-residual", type=float, default=0.0,
                     help="logit-delta (residual) objective weight in the chain loss")
+    ap.add_argument("--chain-vat", action="store_true",
+                    help="VAT: reweight chain depth-j supervision by reach probability")
     ap.add_argument("--val-every", type=int, default=50)
     ap.add_argument("--val-windows", type=int, default=16)
     ap.add_argument("--holdout", type=int, default=6,
@@ -234,6 +236,7 @@ def main():
                     return_metrics=True,
                     residual_weight=args.chain_residual,
                     lm_head=lm_snap,
+                    vat=args.chain_vat,
                 )
                 loss = loss + args.chain_weight * closs
                 m = dict(m)
