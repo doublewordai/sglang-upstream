@@ -1293,8 +1293,10 @@ class SchedulerDisaggregationPrefillMixin:
                     row_full = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, :end
                     ]
-                    device_page_size = self.token_to_kv_pool.page_size
-                    dsa = kv_to_page_indices(row_full, device_page_size)
+                    # prefill send_kv_chunk pages the DSA payload with the
+                    # allocator page size (the Scheduler has no
+                    # token_to_kv_pool attribute)
+                    dsa = kv_to_page_indices(row_full, page_size)
                     state_indices = [
                         (
                             dsa
