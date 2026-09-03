@@ -70,6 +70,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 from sglang.srt.managers.delta_tokenizer import DeltaTokenizerCache
 from sglang.srt.managers.parallel_tokenizer import (
     ParallelTokenizer,
@@ -1338,6 +1339,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else {}
             )
             try:
+                _t_r0 = time.perf_counter()
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=False,
@@ -1346,19 +1348,33 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
+                _t_r1 = time.perf_counter()
                 if self.tokenizer_manager.delta_tokenizer is not None:
                     prompt_ids = self.tokenizer_manager.delta_tokenizer.encode(
                         rendered_prompt,
                         DeltaTokenizerCache.session_key(openai_compatible_messages),
                         **encode_kwargs,
                     )
+                    _enc_kind = "delta"
                 elif parallel_tokenize_enabled():
                     prompt_ids = self._parallel_tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
+                    _enc_kind = "parallel"
                 else:
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
+                    )
+                    _enc_kind = "stock"
+                _t_r2 = time.perf_counter()
+                if cold_trace_enabled():
+                    cold_trace(
+                        "fe_tokenize",
+                        rid=str(getattr(request, "rid", "") or ""),
+                        render_ms=(_t_r1 - _t_r0) * 1e3,
+                        encode_ms=(_t_r2 - _t_r1) * 1e3,
+                        ids_len=len(prompt_ids),
+                        enc_kind=_enc_kind,
                     )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
