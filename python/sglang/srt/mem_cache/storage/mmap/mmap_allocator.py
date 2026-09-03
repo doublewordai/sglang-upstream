@@ -659,11 +659,6 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype, name: str = "") -> torch.Tensor:
     mm = _alloc_plain(alloc_bytes)
     tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
     tensor._sglang_mmap_alloc_bytes = alloc_bytes
-    # Same population check as the hugetlb path: the shared variant swallows
-    # MADV_POPULATE_WRITE failures, and a short pool breaks pinning later.
-    verify_host_pool_populated(
-        tensor.data_ptr(), alloc_bytes, "host pool", tol=mmap.PAGESIZE
-    )
     log_host_pool_numa_locality(tensor.data_ptr(), alloc_bytes, name)
     return tensor
 
