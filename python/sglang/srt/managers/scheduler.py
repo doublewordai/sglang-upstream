@@ -15,6 +15,8 @@
 
 import dataclasses
 import faulthandler
+
+from sglang.srt.boot_timeline import mark
 import logging
 import os
 import signal
@@ -1006,6 +1008,7 @@ class Scheduler(
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
+        mark("init_memory_pools_begin")
         self.init_target_memory_pool()
         # Lands the retraction backend on the disagg bag before the draft
         # worker's HiCache plan reads it.
@@ -1019,6 +1022,7 @@ class Scheduler(
             )
             self.draft_worker.init_hicache_draft_plan()
 
+        mark("init_memory_pools_end")
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
@@ -1027,10 +1031,12 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        mark("init_cuda_graphs_begin")
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+        mark("init_cuda_graphs_end")
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -3862,9 +3868,13 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
-        if cold_trace_enabled() and self.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in can_run_list:
-                cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
+        if cold_trace_enabled():
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                for req in can_run_list:
+                    cold_trace("pf_forward_entry", rid=req.rid, room=req.bootstrap_room)
+            else:
+                for req in can_run_list:
+                    cold_trace("sched_forward", rid=req.rid, pc=time.perf_counter())
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4154,10 +4164,25 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if batch.forward_mode.is_decode() and cold_trace_enabled():
+            for req in batch.reqs:
+                if getattr(req, "pdho_first_step", False):
+                    req.pdho_first_step = False
+                    req.pdho_first_result = True
+                    cold_trace(
+                        "dec_step_launch",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        iter=batch.forward_iter,
+                    )
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
+            # pd-handover-latency: stage CPU payloads for the chunk send so the
+            # result-time send does not block behind the next forward.
+            self._pdho_prestage_for_batch(batch)
 
         # Run forward
         if self.is_generation:

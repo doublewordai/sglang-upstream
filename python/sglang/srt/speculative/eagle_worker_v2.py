@@ -152,6 +152,30 @@ NGRAM_MAX_TRACKED_REQS = int(_ng_os.environ.get("SGLANG_NGRAM_MAX_TRACKED_REQS",
 
 
 
+def _pp4sf_slice_local_draft_logits(logits, forward_batch):
+    """DP-attention: the draft lm-head may return DP-gathered logits while the
+    draft's positions are rank-local. Slice to the local rows (no-op when the
+    shapes already match, e.g. under --enable-dp-lm-head's scatter path)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    if not get_parallel().enable_dp_attention:
+        return logits
+    n_local = forward_batch.positions.shape[0]
+    if logits.shape[0] == n_local:
+        return logits
+    from sglang.srt.layers.dp_attention import get_dp_local_info
+
+    start, n = get_dp_local_info(forward_batch)
+    start = int(start)
+    n = int(n)
+    if start + n > logits.shape[0] or n != n_local:
+        raise RuntimeError(
+            f"dp-attention draft logits gather mismatch: logits={tuple(logits.shape)} "
+            f"positions={n_local} local_slice=[{start},{start + n})"
+        )
+    return logits[start : start + n]
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -464,6 +488,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = default_tree_mask_mode()
+
+        # Draft attention window (length-agnostic drafter conditioning):
+        # propagate --speculative-draft-window-size to the DRAFT's backend
+        # instances only (the target's backends are separate objects and never
+        # see this). Used by DeepseekSparseAttnBackend._cal_indexer_k_start_end
+        # to clamp the draft's extend-path indexer candidate range; the
+        # decode/verify-adjacent paged path is masked in the draft model's
+        # Indexer (see DeepseekV3ForCausalLMNextN.__init__).
+        _draft_window = get_spec().speculative_draft_window_size
+        if _draft_window:
+            for _bk in (self.draft_attn_backend, self.draft_extend_attn_backend):
+                if _bk is None:
+                    continue
+                _targets = (
+                    _bk.attn_backends
+                    if hasattr(_bk, "attn_backends")
+                    else [_bk]
+                )
+                for _b in _targets:
+                    if hasattr(_b, "draft_attn_window"):
+                        _b.draft_attn_window = int(_draft_window)
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -784,11 +829,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+            elif forward_batch.forward_mode.is_idle():
+                # DP-attention idle rank: build_eagle_verify_input discards the
+                # draft outputs for idle batches, and the draft runs
+                # attn-TP-local under draft_tp_context, so skip the 0-row
+                # nextn forward entirely (it cannot make collective progress
+                # anyway and crashes on empty metadata/JIT shapes).
+                empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+                parent_list, top_scores_index, draft_tokens, draft_probs = (
+                    empty,
+                    empty,
+                    empty.view(0, 0),
+                    None,
+                )
             else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
+                if self.speculative_num_steps > 1:
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
@@ -947,6 +1002,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
+                    logits_output.next_token_logits = (
+                        _pp4sf_slice_local_draft_logits(
+                            logits_output.next_token_logits, forward_batch
+                        )
+                    )
                 maybe_detect_nan(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )

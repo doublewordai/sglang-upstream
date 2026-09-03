@@ -414,6 +414,14 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        # Draft attention window (see dsa_indexer.Indexer.draft_window): set ONLY
+        # on the draft worker's backend instances (eagle_worker_v2), never the
+        # target's. Restricts the draft's extend-path indexer candidates to the
+        # most recent W keys per query. The sink range is not expressible in the
+        # contiguous [ks, ke) mechanism (noted limitation; positions < W keep
+        # their full local context, which includes any sink rows, and the
+        # decode/verify-adjacent paged path applies the full sink+window mask).
+        self.draft_attn_window: Optional[int] = None
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -1083,6 +1091,29 @@ class DeepseekSparseAttnBackend(
         else:
             draft_token_num = 0
 
+        if forward_batch.seq_lens.numel() == 0:
+            # Idle DP-attention batch: no rows to attend; the draft worker
+            # still forwards an idle batch in collective lockstep, so provide
+            # a minimal (empty) metadata instead of reducing an empty seq_lens.
+            z = torch.zeros((0,), dtype=torch.int32, device=device)
+            self.forward_metadata = DSAMetadata(
+                page_size=1,
+                cache_seqlens_int32=z,
+                max_seq_len_q=0,
+                max_seq_len_k=0,
+                cu_seqlens_q=torch.arange(0, 1, dtype=torch.int32, device=device),
+                cu_seqlens_k=torch.tensor([0], dtype=torch.int32, device=device),
+                page_table_1=None,
+                real_page_table=z.view(0, 1),
+                dsa_cache_seqlens_int32=z,
+                dsa_cu_seqlens_q=torch.arange(0, 1, dtype=torch.int32, device=device),
+                dsa_cu_seqlens_k=torch.tensor([0], dtype=torch.int32, device=device),
+                dsa_extend_seq_lens_list=[],
+                dsa_seqlens_expanded=z,
+                paged_mqa_schedule_metadata=None,
+                paged_mqa_ctx_lens_2d=None,
+            )
+            return
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         if forward_batch.seq_lens_cpu is not None:
@@ -1456,6 +1487,13 @@ class DeepseekSparseAttnBackend(
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
+        if self.draft_attn_window:
+            # Draft attention window: clamp each query's candidate range to the
+            # last W keys (see dsa_indexer.Indexer.draft_window). ks is the
+            # request's flattened-KV start; ke is one past each query's own
+            # position, so ke - W is the window's left edge (clamped by ks for
+            # short sequences).
+            ks = torch.maximum(ks, ke - int(self.draft_attn_window))
         if bs_idx is not None:
             assert can_dsa_prefill_cp_round_robin_split(forward_batch)
             split_per_token = (
@@ -2487,29 +2525,50 @@ class DeepseekSparseAttnBackend(
                 if has_retained_prefix:
                     # warm-local-prefill: the matched prefix is host-resident
                     # (retained); its selections need a union swap-in from host
-                    # pages. Rebuild the table from the raw positions: prefix
-                    # selections point at scratch slots holding the host bytes,
-                    # delta selections translate through the device mapping.
-                    if self.use_fused_topk:
-                        raise NotImplementedError(
-                            "WLP: fused topk is not supported on the "
-                            "retained-prefix extend path (set both arms to the "
-                            "unfused topk for exactness)"
-                        )
+                    # pages. Two top-k index domains reach this branch:
+                    #  - unfused (raw positions): prefix selections point at
+                    #    scratch slots holding the host bytes, delta
+                    #    selections translate through the device mapping;
+                    #  - fused PAGED (slot-resolved logical locs; prod's
+                    #    SGLANG_DSA_FUSE_TOPK=1 + 1PASS): prefix selections
+                    #    are locs with retained host rows, delta selections
+                    #    are locs translated to their device slots directly.
+                    #    Same selection kernel as the prefill arm's warm
+                    #    extends, so PD-path/WLP exactness is preserved.
                     if topk_indices is None:
                         raise AssertionError(
                             "WLP: extend with a retained prefix requires topk_indices"
                         )
-                    padded_positions = self._pad_topk_indices(
-                        topk_indices, q_nope.shape[0]
-                    )
-                    page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        topk_positions=padded_positions,
-                        prefix_lens=forward_batch.extend_prefix_lens,
-                        translated=page_table_1,
-                        layer_id=layer.layer_id,
-                    )
+                    if self.use_fused_topk:
+                        if (
+                            not envs.SGLANG_WLP_FUSED_TOPK.get()
+                            or topk_transform_method != TopkTransformMethod.PAGED
+                        ):
+                            raise AssertionError(
+                                "WLP: fused topk on a retained-prefix extend "
+                                "requires the PAGED transform and "
+                                "SGLANG_WLP_FUSED_TOPK=1 (get_indexer_metadata "
+                                "should have forced the unfused top-k)"
+                            )
+                        page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table_fused(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            topk_locs=self._pad_topk_indices(
+                                topk_indices, q_nope.shape[0]
+                            ),
+                            prefix_lens=forward_batch.extend_prefix_lens,
+                            layer_id=layer.layer_id,
+                        )
+                    else:
+                        padded_positions = self._pad_topk_indices(
+                            topk_indices, q_nope.shape[0]
+                        )
+                        page_table_1 = self.hisparse_coordinator.extend_swap_in_page_table(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            topk_positions=padded_positions,
+                            prefix_lens=forward_batch.extend_prefix_lens,
+                            translated=page_table_1,
+                            layer_id=layer.layer_id,
+                        )
                 else:
                     # flash_mla_sparse_fwd / tilelang require int32 page indices.
                     page_table_1 = (
@@ -4141,6 +4200,28 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
+        # wlp-fused-topk: a retained-prefix extend on a hisparse arm (the
+        # warm-local-prefill local extend) rebuilds its page table from the
+        # top-k output. With the fused PAGED transform that output is
+        # slot-resolved logical locs, which the fused swap-in branch in
+        # forward_extend consumes (SGLANG_WLP_FUSED_TOPK, default on). Every
+        # other transform domain (RAGGED offsets are neither locs nor
+        # positions) or an explicit opt-out still needs raw positions, so
+        # force the unfused top-k there.
+        wlp_extend_unfused = (
+            not forward_batch.forward_mode.is_target_verify()
+            and bool(
+                forward_batch.extend_prefix_lens_cpu
+                and any(forward_batch.extend_prefix_lens_cpu)
+            )
+            and (
+                not envs.SGLANG_WLP_FUSED_TOPK.get()
+                or topk_transform_method != TopkTransformMethod.PAGED
+            )
+        )
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and (
@@ -4149,13 +4230,12 @@ class DeepseekSparseAttnBackend(
                 # per-position swap-in from POSITIONS; the fused topk would
                 # emit logical locs (real-page-table domain) instead.
                 or forward_batch.forward_mode.is_target_verify()
+                or wlp_extend_unfused
             )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(
-                forward_batch.forward_mode
-            ),
+            topk_transform_method=topk_transform_method,
             topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,

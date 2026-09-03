@@ -11,8 +11,12 @@ from typing import (
     Union,
 )
 
+import time
+
 import zmq
 from torch.distributed import barrier
+
+from sglang.srt.disaggregation.cold_trace import cold_trace, cold_trace_enabled
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.environ import envs
@@ -123,6 +127,14 @@ class SchedulerRequestReceiver:
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
+                    if cold_trace_enabled() and isinstance(
+                        recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                    ):
+                        cold_trace(
+                            "sched_recv",
+                            rid=str(recv_req.rid),
+                            pc=time.perf_counter(),
+                        )
 
                 while True:
                     try:
