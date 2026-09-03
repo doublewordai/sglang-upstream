@@ -1423,6 +1423,13 @@ class Envs:
     # batch <= 64, fp32/bf16). Same selection semantics; each row is read
     # exactly twice by the whole grid instead of one block per row.
     SGLANG_DSA_TOPK_DECODE_FG = EnvBool(False)
+    # Byte-floor decode-time top-k (jit/csrc/dsa/topk_decode_floor.cuh): one
+    # persistent launch with in-kernel grid barriers reading each row once
+    # (plus a small sample and a rare fg-equivalent fallback re-read),
+    # replacing both fast_topk_v2 and the fg chain on decode/verify shapes
+    # (same gate domain as SGLANG_DSA_TOPK_DECODE_FG; precedence: floor > fg).
+    # Same selection semantics as the fg kernel.
+    SGLANG_DSA_TOPK_DECODE_FLOOR = EnvBool(False)
 
     # Decode-shaped Triton paged-MQA logits kernel
     # (kernels/ops/attention/dsa/decode_mqa_logits.py) replacing the DeepGEMM

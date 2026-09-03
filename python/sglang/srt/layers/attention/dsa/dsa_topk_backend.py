@@ -62,6 +62,31 @@ class DSATopKBackend(Enum):
             and score.is_cuda
         )
 
+    @staticmethod
+    def _should_use_decode_floor(
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor],
+    ) -> bool:
+        """Gate the byte-floor persistent decode top-k
+        (SGLANG_DSA_TOPK_DECODE_FLOOR).
+
+        Same shape domain as the fg kernel (decode / spec-verify shapes with
+        row_starts None, small expanded batch, fp32/bf16 logits with unit
+        inner stride); takes precedence over it when both flags are set.
+        """
+        return (
+            envs.SGLANG_DSA_TOPK_DECODE_FLOOR.get()
+            and row_starts is None
+            and score.dim() == 2
+            and score.stride(1) == 1
+            and 0 < topk <= 2048
+            and 0 < score.shape[0] <= 64
+            and score.dtype in (torch.float32, torch.bfloat16)
+            and score.is_cuda
+        )
+
     def topk_func(
         self,
         score: torch.Tensor,
@@ -70,6 +95,13 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
+            if self._should_use_decode_floor(score, lengths, topk, row_starts):
+                from sglang.kernels.ops.attention.dsa.topk_decode_floor import (
+                    topk_decode_floor,
+                )
+
+                return topk_decode_floor(score, lengths, topk)
+
             if self._should_use_decode_fg(score, lengths, topk, row_starts):
                 from sglang.kernels.ops.attention.dsa.topk_decode_fg import (
                     topk_decode_fg,
