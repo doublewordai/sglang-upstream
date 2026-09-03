@@ -1256,6 +1256,7 @@ class SchedulerDisaggregationPrefillMixin:
         if not self._pdho_early_send_eligible():
             return
         if not batch.forward_mode.is_extend():
+            cold_trace("pf_prestage_batch", mode=int(batch.forward_mode), n=len(batch.reqs))
             return
         page_size = self.token_to_kv_pool_allocator.page_size
         state_types = (
@@ -1276,6 +1277,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if not last_chunk:
                     end = end - end % page_size
                 if end <= start:
+                    cold_trace("pf_prestage", rid=req.rid, room=req.bootstrap_room, skip="empty", start=start, end=end, ssi=req.start_send_idx, ere=req.extend_range.end if req.extend_range else -1)
                     continue
                 row_raw = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, start:end
@@ -1322,7 +1324,7 @@ class SchedulerDisaggregationPrefillMixin:
                 }
             except Exception as e:  # noqa: BLE001
                 req.pdho_prepped = None
-                logger.debug("pdho prestage failed for %s: %s", req.rid, e)
+                logger.warning("pdho prestage failed for %s: %s", req.rid, e)
 
     def _pdho_early_send(self: Scheduler, req: Req, next_token_id) -> bool:
         """Issue the pre-staged chunk send with no GPU access. Returns False
