@@ -188,11 +188,17 @@ class DraftPrefetchProbe:
             entry = {"l": l, "jac": [], "recall": [], "waste": [],
                      "res_size": [], "base_hit": [], "pref_hit": [],
                      "miss_ct": [], "win_ct": [], "t_us": []}
-            for r in range(pbs):
+            # the stash was sized at the (padded) capture batch; a later
+            # step may run a smaller real batch -- clamp every per-req read
+            for r in range(min(pbs, len(seq), tk_cpu.shape[1])):
                 S = seq[r]
                 seed_set = (
-                    {int(x) for x in seed_cpu[r].tolist() if int(x) >= 0}
-                    if seed_cpu is not None
+                    {
+                        int(x)
+                        for x in seed_cpu[r].tolist()
+                        if int(x) >= 0 and r < seed_cpu.shape[0]
+                    }
+                    if seed_cpu is not None and r < seed_cpu.shape[0]
                     else set()
                 )
                 T = [int(x) for x in tk_cpu[l, r, 0].tolist() if int(x) >= 0]
