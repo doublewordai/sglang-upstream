@@ -220,16 +220,21 @@ class DraftPrefetchProbe:
                 )
                 entry["win_ct"].append(win)
                 entry["miss_ct"].append([int(miss_cpu[l, r, p]) for p in range(n)])
-                entry["t_us"].append(
-                    [
-                        round(
-                            self.events[l][p][0].elapsed_time(self.events[l][p][1])
+                def _t_us(l_, p_):
+                    try:
+                        return round(
+                            self.events[l_][p_][0].elapsed_time(
+                                self.events[l_][p_][1]
+                            )
                             * 1000.0,
                             1,
                         )
-                        for p in range(n)
-                    ]
-                )
+                    except Exception:
+                        # graph-captured event nodes do not support
+                        # elapsed_time queries on this torch/CUDA
+                        return None
+
+                entry["t_us"].append([_t_us(l, p) for p in range(n)])
             layers.append(entry)
 
         row = {
