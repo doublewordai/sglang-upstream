@@ -563,14 +563,27 @@ class FutureMap:
         )
 
         if self.need_topk:
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
-            )
+            # Stateless payloads (bonus-only, e.g. hisparse staging->decode
+            # transitions without draft state) zero-fill: zero confidence ->
+            # verify_len=1 (anchor-only round), dummy draft tokens that are
+            # never accepted (see lane/adaptive-spec PD speculative padding).
+            if payload.topk_p is not None:
+                self.topk_p_buf[indices] = payload.topk_p.to(
+                    self.topk_p_buf.dtype
+                )
+                self.topk_index_buf[indices] = payload.topk_index.to(
+                    self.topk_index_buf.dtype
+                )
+            else:
+                self.topk_p_buf[indices].zero_()
+                self.topk_index_buf[indices].zero_()
         if self.need_hidden_states:
-            self.hidden_states_buf[indices] = payload.hidden_states.to(
-                self.hidden_states_buf.dtype
-            )
+            if payload.hidden_states is not None:
+                self.hidden_states_buf[indices] = payload.hidden_states.to(
+                    self.hidden_states_buf.dtype
+                )
+            else:
+                self.hidden_states_buf[indices].zero_()
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (

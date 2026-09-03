@@ -271,3 +271,138 @@ def chunk_runs(
 # Ops smaller than this (tokens) keep the per-row kernel path even when the
 # bulk flag is on (the index .cpu() sync costs more than the copy).
 BULK_MIN_TOKENS = 64
+
+# SM-store segments engage only above this total segment bytes: below it the
+# host-side tiling + upload overheads exceed the CE gap (measured 8192-token
+# admit = 419 MB: SM 85 GB/s vs CE 138; 131072-token = 6.7 GB: SM 232 vs CE
+# 141; 524288-token = 26.8 GB: SM 329 vs CE 162). The remainder rows kernel
+# follows the segment decision: fully-scattered ops (no big segments) are
+# TLB-bound on ANY path (SM 25 / AOT 36 GB/s at 131k rows over 20 GB pools)
+# and keep the AOT kernel.
+SM_STORE_MIN_SEGMENT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+# ----------------------------------------------------------------------------
+# SM-store D2H variants (SGLANG_D2H_SM_STORES=1).
+#
+# The copy-engine D2H path is capped at ~170 GB/s over C2C on GH200 while
+# warp-coalesced SM stores sustain 381-384 GB/s into the same pinned pool
+# (2.25x, measured nid010161 GPU0 2026-09-03, lane d2h-stores). The helpers
+# below replace (a) the batched-CE segment copies and (b) the AOT remainder
+# kernel of backup_from_device_bulk with coalesced-store SM kernels.
+# Byte-identical over the same inputs; return False when unavailable so the
+# caller falls back to the merged copy-engine path unchanged.
+# ----------------------------------------------------------------------------
+
+_sm_store_modules = {}
+_sm_store_unavailable = False
+
+# Reusable pinned staging for the per-call tile/index uploads (grown on demand).
+_sm_staging = {}
+
+
+def _get_sm_store_module(item_size: int, num_layers: int):
+    """JIT module keyed on (item_size, num_layers); None if unavailable."""
+    global _sm_store_unavailable
+    if _sm_store_unavailable:
+        return None
+    key = (item_size, num_layers)
+    mod = _sm_store_modules.get(key)
+    if mod is None:
+        try:
+            from sglang.kernels.ops.kvcache.d2h_store import jit_d2h_store_module
+
+            mod = jit_d2h_store_module(item_size=item_size, num_layers=num_layers)
+        except Exception as e:  # pragma: no cover - depends on toolchain
+            logger.warning(f"D2H SM-store JIT module unavailable: {e}")
+            _sm_store_unavailable = True
+            return None
+        _sm_store_modules[key] = mod
+    return mod
+
+
+def sm_store_d2h_segments(
+    dst_addrs: torch.Tensor,
+    src_addrs: torch.Tensor,
+    sizes: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+    stream,
+) -> bool:
+    """D2H copy of contiguous segments via warp-coalesced SM stores.
+
+    dst_addrs/src_addrs/sizes: int64 CPU tensors (same convention as
+    batched_memcpy_async). Segments are tiled host-side into <=4 MB work
+    items so grid parallelism is independent of segment count. All sizes and
+    addresses must be 16B multiples (true for token-run segments).
+    Returns False if unavailable (caller falls back to the CE path).
+    """
+    mod = _get_sm_store_module(item_size, num_layers)
+    if mod is None:
+        return False
+    n = sizes.numel()
+    if n == 0:
+        return True
+    if bool((sizes % 16 != 0).any()):
+        return False
+    total = int(sizes.sum())
+    if total <= 0:
+        return True
+
+    # 16B-align the tile so every tile base address stays uint4-aligned
+    # (segment sizes are 16B multiples: tokens * item with item % 16 == 0)
+    tile = max(64 * 1024, min(4 * 1024 * 1024, (total + 8191) // 8192))
+    tile = (tile + 15) & ~15
+    tiles_per_seg = (sizes + (tile - 1)) // tile
+    n_tiles = int(tiles_per_seg.sum())
+    seg_id = torch.repeat_interleave(
+        torch.arange(n, dtype=torch.int64), tiles_per_seg
+    )
+    seg_tile_start = torch.cat(
+        [torch.zeros(1, dtype=torch.int64), torch.cumsum(tiles_per_seg, 0)[:-1]]
+    )
+    tile_in_seg = torch.arange(n_tiles, dtype=torch.int64) - seg_tile_start[seg_id]
+    base = tile_in_seg * tile
+    src_t = src_addrs[seg_id] + base
+    dst_t = dst_addrs[seg_id] + base
+    len_t = torch.clamp(sizes[seg_id] - base, max=tile)
+
+    device = torch.cuda.current_device()
+    st = _sm_staging.get(device)
+    if st is None or st["src"].numel() < n_tiles:
+        st = {
+            "src": torch.empty(n_tiles, dtype=torch.int64, pin_memory=True),
+            "dst": torch.empty(n_tiles, dtype=torch.int64, pin_memory=True),
+            "len": torch.empty(n_tiles, dtype=torch.int64, pin_memory=True),
+        }
+        _sm_staging[device] = st
+    st["src"][:n_tiles].copy_(src_t)
+    st["dst"][:n_tiles].copy_(dst_t)
+    st["len"][:n_tiles].copy_(len_t)
+    d_src = st["src"][:n_tiles].to(device, non_blocking=True)
+    d_dst = st["dst"][:n_tiles].to(device, non_blocking=True)
+    d_len = st["len"][:n_tiles].to(device, non_blocking=True)
+    mod.launch_seg_store(d_src, d_dst, d_len)
+    return True
+
+
+def sm_store_d2h_rows(
+    src_ptr_table: torch.Tensor,
+    dst_ptr_table: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+) -> bool:
+    """Indexed all-layer gather-scatter D2H via warp-coalesced SM stores
+    (replaces the AOT remainder kernel). Same tensor convention as
+    transfer_kv_all_layer_mla. Returns False if unavailable."""
+    mod = _get_sm_store_module(item_size, num_layers)
+    if mod is None:
+        return False
+    if item_size % 16 != 0:
+        return False
+    if src_indices.numel() == 0:
+        return True
+    mod.launch_rows_store(src_ptr_table, dst_ptr_table, src_indices, dst_indices)
+    return True

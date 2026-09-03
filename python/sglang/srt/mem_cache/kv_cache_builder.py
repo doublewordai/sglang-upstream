@@ -139,6 +139,42 @@ def _register_legacy_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def _pool_supports_cpu_tensor_backup(kv_cache) -> bool:
+    """Whether the cpu_tensor retraction backup can actually run for this
+    allocator + pool pair (vs. the raising base-class stubs).
+
+    ``kv_cache`` is the allocator's pool (``allocator.get_kvcache()``). The
+    retraction backup calls ``allocator.get_cpu_copy``/``load_cpu_copy``, so
+    BOTH links must be implemented:
+
+    - ``HiSparseTokenToKVPoolAllocator`` never overrides them (inherits the
+      ``BaseTokenToKVPoolAllocator`` stubs) — every HiSparse decode (the
+      prod GLM-5.3 config) crashed here on retraction.
+    - ``DeepSeekV4TokenToKVPool`` (DSA-V4 family) does not override the pool
+      side (inherits the ``KVCache`` stubs) even though the paged allocator
+      delegates to it.
+    """
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool import KVCache
+
+    return (
+        type(kv_cache).get_cpu_copy is not KVCache.get_cpu_copy
+        and type(kv_cache).load_cpu_copy is not KVCache.load_cpu_copy
+    )
+
+
+def _allocator_supports_cpu_tensor_backup(allocator) -> bool:
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+
+    if (
+        type(allocator).get_cpu_copy is BaseTokenToKVPoolAllocator.get_cpu_copy
+        or type(allocator).load_cpu_copy
+        is BaseTokenToKVPoolAllocator.load_cpu_copy
+    ):
+        return False
+    return _pool_supports_cpu_tensor_backup(allocator.get_kvcache())
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -152,7 +188,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     backend = disagg.disaggregation_decode_retraction_backup
     if backend is None:
-        kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
+        allocator = tp_worker.get_memory_pool()[1]
+        kv_cache = allocator.get_kvcache()
         full_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()[0]
             if tp_worker.is_hybrid_swa
@@ -177,6 +214,16 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             and supports_host_pool
             else "cpu_tensor"
         )
+        if backend == "cpu_tensor" and not _allocator_supports_cpu_tensor_backup(
+            allocator
+        ):
+            # True retraction: the allocator/pool chain (e.g. HiSparse decode,
+            # or the DeepSeekV4 pool family) has no CPU-offload path, so
+            # preserve nothing and let the retracted request re-enter through
+            # the PD rebootstrap (prefill recompute + fresh transfer).
+            # Retraction would otherwise raise NotImplementedError and kill
+            # the scheduler (prod-family outage class).
+            backend = "rebootstrap"
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
