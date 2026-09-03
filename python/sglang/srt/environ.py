@@ -1549,6 +1549,13 @@ class Envs:
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
     SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-kernel native-fp8 SM90 kernel (JIT).  Numerics:
+    # prod-class error vs the fp32 oracle (q per-row fp8 + exact per-group KV
+    # descale on the QK accumulator + bf16 P/V); NOT bit-exact vs FlashMLA.
+    # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
+    # than the production kernel; kept for development/A-B, default OFF.
+    SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
     # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
     # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
     # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV
