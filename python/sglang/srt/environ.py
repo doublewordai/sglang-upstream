@@ -1032,6 +1032,17 @@ class Envs:
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
+    # GLM-5.3 small-M decode GEMMs: route the fp8 block-128 W8A8 GEMM
+    # through the JIT CUTLASS sm90 blockwise kernel (ex-67 recipe, swapAB
+    # orientation, variant 5 = cooperative 128x16x128) instead of DeepGEMM
+    # for the measured-winning (N, K) shapes at small M (GH200 bench,
+    # lane w8a16-gemm 2026-09-02; outputs bit-exact vs DeepGEMM):
+    #   o_proj 16384->6144  0.86x/0.92x/0.92x at M=1/4/16
+    #   d_dn   12288->6144  0.91x/0.94x/0.94x
+    #   sh_gu   6144->4096  0.96x/0.93x/1.10x (M<=4 only)
+    # No effect on other shapes/M or on non-sm90 CUDA.
+    SGLANG_GLM_FP8_BLOCKWISE_SMALLM_GEMM = EnvBool(False)
+
     # Megakernel MoE (doublewordai/megakernel): per-rank decode token capacity
     SGLANG_MEGAKERNEL_NUM_MAX_TOKENS_PER_RANK = EnvInt(64)
 

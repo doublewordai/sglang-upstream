@@ -1387,6 +1387,98 @@ def prepare_block_fp8_matmul_inputs(
     return M, N, K, C
 
 
+_fp8_blockwise_smallm_enabled: Optional[bool] = None
+
+# (N, K) -> max M routed to the CUTLASS sm90 blockwise path. Wins measured
+# vs the DeepGEMM prequant path on GH200 (bit-exact outputs; see environ.py).
+_FP8_BLOCKWISE_SMALLM_WIN_SET = {
+    (6144, 16384): 16,  # o_proj 78 calls/step
+    (6144, 12288): 16,  # dense down_proj 3 calls/step
+    (4096, 6144): 4,  # shared-experts gate+up 75 calls/step (loses at M=16)
+}
+
+_fp8_blockwise_smallm_sfb_cache: Dict[Tuple[int, Tuple[int, int]], torch.Tensor] = {}
+
+
+def _fp8_blockwise_smallm_sfb(Bs: torch.Tensor) -> torch.Tensor:
+    """[NB, G] fp32 -> [G, NB] row-major (the layout the CUTLASS blockwise
+    kernel expects), cached per weight tensor (weights are static after load;
+    ~24 KB per fp8 weight, e.g. o_proj 128x48 fp32)."""
+    key = (Bs.data_ptr(), tuple(Bs.shape))
+    sfb = _fp8_blockwise_smallm_sfb_cache.get(key)
+    if sfb is None:
+        sfb = Bs.t().contiguous()
+        _fp8_blockwise_smallm_sfb_cache[key] = sfb
+    return sfb
+
+
+def _use_fp8_blockwise_smallm(M, N, K, A, As, Bs, block_size) -> bool:
+    global _fp8_blockwise_smallm_enabled
+    if _fp8_blockwise_smallm_enabled is None:
+        from sglang.srt.environ import envs
+
+        cap = torch.cuda.get_device_capability()
+        _fp8_blockwise_smallm_enabled = bool(
+            envs.SGLANG_GLM_FP8_BLOCKWISE_SMALLM_GEMM.get()
+            and torch.cuda.is_available()
+            and cap >= (9, 0)
+            and cap < (10, 0)
+        )
+    if not _fp8_blockwise_smallm_enabled:
+        return False
+    max_m = _FP8_BLOCKWISE_SMALLM_WIN_SET.get((N, K), 0)
+    if not (1 <= M <= max_m):
+        return False
+    if list(block_size) != [128, 128]:
+        return False
+    if (
+        A.dtype != torch.float8_e4m3fn
+        or As.dtype != torch.float32
+        or Bs.dtype != torch.float32
+    ):
+        # UE8M0-packed scales or unexpected operand dtypes fall through to DeepGEMM
+        return False
+    if N % 128 != 0 or K % 128 != 0:
+        return False
+    # As must be the production per-token-group quant buffer: [M, K//128]
+    # fp32 column-major over a pad4(M)-row TMA-aligned allocation.
+    pad = (M + 3) // 4 * 4
+    if As.ndim != 2 or tuple(As.shape) != (M, K // 128):
+        return False
+    if As.stride() not in ((1, M), (1, pad)):
+        return False
+    return True
+
+
+def _fp8_blockwise_smallm(A, B, As, Bs, M, N, K):
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm_sm90 import (
+        fp8_blockwise_scaled_mm_sm90,
+    )
+
+    Mp = (M + 3) // 4 * 4
+    if Mp == M:
+        A_use, As_use = A, As
+    else:
+        # Unpadded token rows (the local-quant path): pad to 4 so the
+        # problem extent matches the quant buffer's padded row stride --
+        # identical to the pre-quantized path, which arrives already padded.
+        A_use = A.new_empty((Mp, K))
+        A_use[:M].copy_(A)
+        if As.stride() == (1, Mp):
+            As_use = As.as_strided((Mp, As.shape[1]), (1, Mp))
+        else:  # non-TMA-aligned scales: copy into a padded col-major buffer
+            As_use = torch.empty_strided(
+                (Mp, As.shape[1]), (1, Mp), device=As.device, dtype=As.dtype
+            )
+            As_use[:M].copy_(As)
+            As_use[M:].zero_()
+    sfb = _fp8_blockwise_smallm_sfb(Bs)
+    out = fp8_blockwise_scaled_mm_sm90(A_use, B, As_use, sfb, variant=5)
+    if Mp != M:
+        out = out[:M]
+    return out.view(*A.shape[:-1], N)
+
+
 def w8a8_block_fp8_matmul_deepgemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1399,6 +1491,9 @@ def w8a8_block_fp8_matmul_deepgemm(
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    if _use_fp8_blockwise_smallm(M, N, K, A, As, Bs, block_size):
+        return _fp8_blockwise_smallm(A, B, As, Bs, M, N, K)
 
     deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 
