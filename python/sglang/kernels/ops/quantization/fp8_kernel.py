@@ -1389,12 +1389,15 @@ def prepare_block_fp8_matmul_inputs(
 
 _fp8_blockwise_smallm_enabled: Optional[bool] = None
 
-# (N, K) -> max M routed to the CUTLASS sm90 blockwise path. Wins measured
-# vs the DeepGEMM prequant path on GH200 (bit-exact outputs; see environ.py).
+# (N, K) -> (max M, pad allowed) routed to the CUTLASS sm90 blockwise path.
+# Wins measured end-to-end through the production entry (quant included) on
+# GH200 (bit-exact outputs; see environ.py). "pad allowed = False" shapes only
+# win when the token rows are already a multiple of 4 (the small kernel win
+# does not cover the pad-row copy).
 _FP8_BLOCKWISE_SMALLM_WIN_SET = {
-    (6144, 16384): 16,  # o_proj 78 calls/step
-    (6144, 12288): 16,  # dense down_proj 3 calls/step
-    (4096, 6144): 4,  # shared-experts gate+up 75 calls/step (loses at M=16)
+    (6144, 16384): (16, True),  # o_proj 78 calls/step: +3.2..5.5us/call at all M<=16
+    (6144, 12288): (16, True),  # dense down_proj 3 calls/step: +0.9..3.6us/call
+    (4096, 6144): (4, False),  # shared gate+up 75 calls/step: +1.2us/call at M=4 only
 }
 
 _fp8_blockwise_smallm_sfb_cache: Dict[Tuple[int, Tuple[int, int]], torch.Tensor] = {}
@@ -1426,8 +1429,10 @@ def _use_fp8_blockwise_smallm(M, N, K, A, As, Bs, block_size) -> bool:
         )
     if not _fp8_blockwise_smallm_enabled:
         return False
-    max_m = _FP8_BLOCKWISE_SMALLM_WIN_SET.get((N, K), 0)
+    max_m, pad_ok = _FP8_BLOCKWISE_SMALLM_WIN_SET.get((N, K), (0, False))
     if not (1 <= M <= max_m):
+        return False
+    if M % 4 != 0 and not pad_ok:
         return False
     if list(block_size) != [128, 128]:
         return False
