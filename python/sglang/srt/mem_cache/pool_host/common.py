@@ -169,7 +169,28 @@ def alloc_with_host_register(
 
     from sglang.srt.environ import envs
 
-    hugepage_mode = bool((envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip())
+    import math
+
+    _n_bytes = int(math.prod(dims)) * torch.empty([], dtype=dtype).element_size()
+    # Size gate (v16-memory-plan): cudaHostRegister on SMALL hugetlb pools
+    # (< ~32 GiB) fails deterministically at every placement tested (3.33 GB
+    # indexer pool x8 addresses, 8.19 GB x19); only the large decode host pool
+    # registers reliably. Small pools stay on base pages.
+    _SMALL_HUGEPAGE_LIMIT = 32 * (1 << 30)
+    hugepage_mode = (
+        bool((envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip())
+        and _n_bytes >= _SMALL_HUGEPAGE_LIMIT
+    )
+    if not hugepage_mode and (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip():
+        _saved = os.environ.get("SGLANG_HUGEPAGE_SIZE")
+        os.environ.pop("SGLANG_HUGEPAGE_SIZE", None)
+        try:
+            buffer = allocator.allocate(dims, dtype=dtype, device=device)
+            if pin_memory:
+                _cuda_host_register(buffer)
+            return buffer
+        finally:
+            os.environ["SGLANG_HUGEPAGE_SIZE"] = _saved
     attempts = 8 if hugepage_mode else 1
     # Placement ladder: attempt 0 kernel-chosen; then fixed hints descending
     # through the low VA region where registrations empirically succeed
@@ -178,7 +199,7 @@ def alloc_with_host_register(
         None,
         0x400E00000000,
         0x400A00000000,
-        0x40060000000,
+        0x400600000000,
         0x400400000000,
         0x300000000000,
         0x200000000000,
