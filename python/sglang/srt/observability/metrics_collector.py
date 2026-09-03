@@ -127,6 +127,14 @@ class SchedulerStats:
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
 
+    # HiSparse host KV pool (decode arm), tokens. -1 = not reported
+    # (non-hisparse or prefill arm). locked = pinned - evictable.
+    hisparse_host_pool_free_tokens: int = -1
+    hisparse_host_pool_total_tokens: int = -1
+    hisparse_host_pool_pinned_tokens: int = -1
+    hisparse_host_pool_evictable_tokens: int = -1
+    hisparse_host_pool_wait_events: int = 0
+
     # Utilization
     utilization: float = 0.0
     fwd_occupancy: float = float("nan")
@@ -525,6 +533,23 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        for _hpb_name, _hpb_doc in (
+            ("free", "free (unallocated) host KV tokens"),
+            ("total", "total host KV tokens"),
+            ("pinned", "host KV tokens held by active reqs + retained radix rows"),
+            ("evictable", "unlocked retained radix rows (freeable by eviction)"),
+            ("wait_events", "cumulative prealloc admission waits (host pool full)"),
+        ):
+            setattr(
+                self,
+                f"hisparse_host_pool_{_hpb_name}_tokens" if _hpb_name != "wait_events" else "hisparse_host_pool_wait_events",
+                Gauge(
+                    name=f"sglang:hisparse_host_pool_{_hpb_name}_tokens" if _hpb_name != "wait_events" else "sglang:hisparse_host_pool_wait_events",
+                    documentation=f"HiSparse host KV pool {_hpb_doc} (decode arm; -1 if not reported).",
+                    labelnames=labels.keys(),
+                    multiprocess_mode="mostrecent",
+                ),
+            )
         self.num_bootstrap_failed_reqs = Counter(
             name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
@@ -1370,6 +1395,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_free_tokens, stats.hisparse_host_pool_free_tokens
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_total_tokens, stats.hisparse_host_pool_total_tokens
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_pinned_tokens, stats.hisparse_host_pool_pinned_tokens
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_evictable_tokens,
+            stats.hisparse_host_pool_evictable_tokens,
+        )
+        self._log_gauge(
+            self.hisparse_host_pool_wait_events, stats.hisparse_host_pool_wait_events
         )
 
         # Utilization

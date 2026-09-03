@@ -450,6 +450,8 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    SGLANG_DSA_IN_GRAPH_METADATA = EnvBool(False)
+    SGLANG_HISPARSE_FAST_BACKUP = EnvBool(False)
     # mtp-debug lane: log the first target-verify step's hisparse page table
     # and the draft pool's transferred rows (diagnosis of spec x hisparse).
     SGLANG_MTP_DEBUG = EnvBool(False)
@@ -459,6 +461,24 @@ class Envs:
     # copies; affects the HiCache H2D load path (page_first host pools) and
     # the layer_first D2H backup path (hisparse staging backup).
     SGLANG_HICACHE_BULK_COPY = EnvBool(False)
+    # D2H bulk backup via warp-coalesced SM stores instead of the copy engine
+    # (the CE D2H path is capped at ~170 GB/s over C2C on GH200; coalesced SM
+    # stores sustain ~383 GB/s into the same pinned pool). Replaces the
+    # segment copies AND the remainder kernel of the bulk backup when
+    # SGLANG_HICACHE_BULK_COPY is also on; byte-identical; falls back to the
+    # merged copy-engine path when the JIT module is unavailable.
+    SGLANG_D2H_SM_STORES = EnvBool(False)
+    # warm-local-prefill (lane warm-local-prefill): decode-rank local extend of
+    # warm-turn appends. Enabled per-request via rid prefix "WLP-"; these gate
+    # eligibility (max new-span tokens, min matched fraction of the prompt) and
+    # tracing.
+    SGLANG_WLP_ENABLE = EnvBool(False)
+    SGLANG_WLP_MAX_NEW_TOKENS = EnvInt(4096)
+    SGLANG_WLP_MIN_MATCH_FRAC = EnvFloat(0.5)
+    # Allow prefix_len == 0 (full local prefill of a short prompt on the decode
+    # rank): rig weight-equality probe + the local-refill fallback variant.
+    SGLANG_WLP_ALLOW_COLD = EnvBool(False)
+    SGLANG_WLP_TRACE = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
@@ -573,6 +593,13 @@ class Envs:
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
     SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
+    # Fuse the post-logits decode pipeline (temperature -> softmax -> token
+    # selection) into one Triton kernel, bit-exact vs the eager reference
+    # (greedy: torch.argmax tie-break; sampled: torch.multinomial's gumbel-max
+    # composite with identical philox RNG consumption). Falls back to the
+    # reference path for top-k/top-p/min-p, seeded/deterministic sampling,
+    # logprob requests, and non-CUDA devices.
+    SGLANG_FUSED_SAMPLING = EnvBool(False)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
@@ -597,10 +624,30 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # draft-prefetch lane probe: per verify step, stash the draft seed top-k,
+    # the target's per-layer/per-position top-k, the per-layer resident tables,
+    # per-(layer,position) swap-in CUDA-event timings and miss counts, then
+    # append one JSON line per step to SGLANG_DPF_PROBE_OUT. Works with the
+    # eager and CUDA-graph verify paths; spec (target_verify) only.
+    SGLANG_DPF_PROBE = EnvBool(False)
+    SGLANG_DPF_PROBE_OUT = EnvStr("")
+    SGLANG_DPF_PROBE_REQS = EnvInt(2)
+    SGLANG_DPF_PROBE_RAW_STEPS = EnvInt(0)
+    # draft-prefetch: after the draft step, prefetch (draft seed top-k -
+    # resident) rows into each layer's device buffer on the coordinator's
+    # side stream, ordered by layer; the verify swap-ins wait per layer.
+    # Exact by construction (cache fill only).
+    SGLANG_DPF_PREFETCH = EnvBool(False)
+    # Diagnostic: log HiSparse verify-step miss counts (per draft position,
+    # last anchor group's plans) every N verify steps; 0 = off.
+    SGLANG_HISPARSE_MISS_LOG = EnvInt(0)
     # Plan-then-IO swap-in split: the fused kernel plans only and a
     # full-GPU-grid kernel copies the recorded miss plan (warp per row).
     # Set False to A/B the fused in-kernel copy (pre-wide-gather path).
     SGLANG_HISPARSE_WIDE_GATHER = EnvBool(True)
+    # mk-batch-curve: size the narrow copy_cache_planned fallback grid by bytes
+    # (one CTA per 64 KiB of worst-case miss bytes, capped at the SM count)
+    SGLANG_HISPARSE_RIGHTSIZE_COPY_GRID = EnvBool(False)
 
     # HiSparse IO streams (write-staging / decode-backup / shared-index
     # prefetch / the swap-in gather) bound to a CUDA green context holding this
@@ -615,6 +662,15 @@ class Envs:
     # is b x 960 threads (<= 5 SMs), so SM isolation buys nothing there while
     # the fork/join adds latency; on by default would change step timing.
     SGLANG_HISPARSE_SWAPIN_GREEN_CTX = EnvBool(False)
+    # Defer the decode hisparse map/eager-backup chain (map_last_loc_to_buffer)
+    # from prepare_for_decode to the forward launch (run_batch), i.e. past the
+    # per-step DP-attention metadata all_gather. A rank still running that chain
+    # is a straggler entering the collective; every other rank then waits in
+    # c10d::Work::wait with its GPU idle (the synchronized 8-12 ms decode
+    # stalls; see lanes hiccup/hiccup-2). Default off.
+    SGLANG_HISPARSE_DEFER_DECODE_MAP = EnvBool(False)
+    # Measurement-only (hiccup-3): path to append per-call eager-backup rows to.
+    SGLANG_HISPARSE_BACKUP_LOG = EnvStr("")
     # Opt-in: allocate DSA index-K only on the layers that compute top-k
     # (shared-index models) under HiSparse / PD disaggregation as well. Set it
     # on both PD arms; the NIXL transport carries nothing for 0-byte layers.
@@ -702,6 +758,7 @@ class Envs:
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_BLOB_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
@@ -720,6 +777,9 @@ class Envs:
     # of MAP_SHARED ones: kernel memory compaction skips pinned anonymous pages but
     # unmaps pinned shared ones on every failed migration, stalling GPU access.
     SGLANG_MAP_HOST_POOL_PRIVATE = EnvBool(False)
+    # Raise (instead of warn) at boot when a host KV pool has <99% of its
+    # populated pages on the GPU-local NUMA node (mmap_allocator check).
+    SGLANG_NUMA_LOCALITY_STRICT = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
@@ -1185,7 +1245,24 @@ class Envs:
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # EAGLE adaptive verify (lane/adaptive-spec): per-request verify lengths from
+    # draft confidence + an SPS cost table. Requires SGLANG_RAGGED_VERIFY_MODE=compact.
+    SGLANG_EAGLE_ADAPTIVE_VERIFY = EnvBool(False)
+    # Lane M3: force every request's verify_len (grid timing measurement).
+    SGLANG_EAGLE_FORCE_VERIFY_LEN = EnvInt(0)
+    # Lane M3: append per-step verify timing rows to this jsonl path.
+    SGLANG_EAGLE_VERIFY_TIMING = EnvStr("")
+    # Lane A/B: cap swap-in positions per layer in the ragged verify page
+    # table build (measurement only; unsafe for mixed-vl graph replays).
+    SGLANG_EAGLE_SWAPIN_MAXPOS = EnvInt(0)
+    # Path to an SPS cost table JSON (SpsCostTable or SpsAdditiveCostTable format,
+    # see dspark_sps.py) for the EAGLE adaptive verify budget scheduler. Without
+    # it the schedule degenerates to verify-all (full width through the ragged
+    # graphs) and a warning is logged.
+    SGLANG_EAGLE_SPS_TABLE = EnvStr("")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Lane debug: log ragged verify page-table shapes/values (one line per call).
+    SGLANG_RAGGED_DEBUG = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
@@ -1430,6 +1507,12 @@ class Envs:
     # (same gate domain as SGLANG_DSA_TOPK_DECODE_FG; precedence: floor > fg).
     # Same selection semantics as the fg kernel.
     SGLANG_DSA_TOPK_DECODE_FLOOR = EnvBool(False)
+    # Warm-start the full-grid decode top-k: carry the previous decode step's
+    # k-th logit minus a delta-sigma margin per (request, layer) as the
+    # threshold seed; 1 streaming pass + exact refine on a hit, full 2-pass
+    # fallback on a miss (requires SGLANG_DSA_TOPK_DECODE_FG).
+    SGLANG_DSA_TOPK_WARMSTART = EnvBool(False)
+    SGLANG_DSA_TOPK_WARMSTART_DELTA = EnvFloat(0.3)
 
     # Decode-shaped Triton paged-MQA logits kernel
     # (kernels/ops/attention/dsa/decode_mqa_logits.py) replacing the DeepGEMM
@@ -1507,6 +1590,13 @@ class Envs:
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
     SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Opt-in: route flashmla_kv DECODE (and target-verify) attention to the
+    # lane sparse-decode-kernel native-fp8 SM90 kernel (JIT).  Numerics:
+    # prod-class error vs the fp32 oracle (q per-row fp8 + exact per-group KV
+    # descale on the QK accumulator + bf16 P/V); NOT bit-exact vs FlashMLA.
+    # Perf (b=1, GH200): ~36 us vs prod 17 us fused-graph — currently SLOWER
+    # than the production kernel; kept for development/A-B, default OFF.
+    SGLANG_DSA_DECODE_FP8_NATIVE = EnvBool(False)
     # Opt-in (lane/sparse-attn): with --dsa-prefill-backend flashmla_auto on
     # SM90 + fp8 KV, route EXTEND prefill batches to the native-fp8 Q8KV8
     # sparse prefill kernel (flashmla_sparse_q8) instead of the fp8-KV

@@ -75,6 +75,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -592,6 +593,13 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        # Poll async HiCache events (write-through acks, load-backs). The
+        # normal loop does this in get_next_batch_to_run; without it the
+        # disagg-prefill loop never releases write-through page locks and the
+        # pool fills with protected (unevictable) pages under sustained load.
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            self.tree_cache.check_hicache_events()
+
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -616,6 +624,11 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -655,6 +668,11 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)

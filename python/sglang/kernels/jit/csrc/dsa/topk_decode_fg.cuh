@@ -53,6 +53,67 @@
  * No host syncs; all launch shapes derive from (stride, B, cap) so the
  * sequence is CUDA-graph safe. Kernels are PDL-enabled (Hopper+): each kernel
  * waits on the previous grid before consuming its output.
+ *
+ * -----------------------------------------------------------------------------
+ * WARM START (TRT-LLM-style temporally-correlated top-k; run_ws / the
+ * `topk_decode_fg_ws` entry, used when the caller passes a thresholds tensor).
+ *
+ * Consecutive decode steps of one (request, layer) select nearly the same
+ * tokens: the k-th largest logit is a concentrated order statistic (measured:
+ * across fully independent queries the k-th of 1M logits drifts only
+ * ~0.1-0.35 sigma). The caller carries one fp32 per (request, layer) across
+ * steps -- the previous step's k-th value minus a margin, `thr = kth - delta *
+ * sigma` -- and the select becomes a single streaming pass + exact refine:
+ *
+ *   WS1 ws_gather grid (chunks, B) x 256: row read #1 (and the only one when
+ *              the warm start hits): every x >= thr (NaN included, matching
+ *              production's fp16 key) is appended to the candidate list with
+ *              its FULL 16-bit fp16-sortable key (cand_sub); the candidates'
+ *              256-bin coarse histogram goes to hist; total/stored counters
+ *              and the row's sum / sum-of-squares (for sigma) accumulate in
+ *              the same pass. Naive rows write their output directly.
+ *   WS2 ws_check grid (B,) x 256: n = #{x >= thr}. Miss (n < topk: threshold
+ *              too high, e.g. a cold +inf seed; n > cap: distribution shifted
+ *              far) -> ws_flags = 0, hist re-zeroed, and the full 2-pass
+ *              chain K1..K3 runs for the row (the wasted WS1 pass is the miss
+ *              cost). Hit (topk <= n <= cap): the top-k is a subset of the
+ *              candidates (k-th largest >= thr), so the selection continues
+ *              exactly over the candidate list: suffix-scan hist -> coarse
+ *              threshold bin tc with #{coarse > tc} <= topk <= #{coarse >=
+ *              tc}; scan the candidate keys once more -> hist2 = sub-bin
+ *              (key low byte) histogram of the coarse == tc candidates;
+ *              plan = {tc, n_gt = #{coarse > tc}, r = topk - n_gt, n}. The
+ *              two-level (coarse bin, then low byte) refinement is required:
+ *              candidates span MANY coarse bins (unlike the 2-pass path,
+ *              where they all share K2's threshold bin), and the low byte
+ *              only orders within one coarse bin.
+ *   K1..K3     gated: skip the row entirely when ws_flags[row] != 0.
+ *   plan2      runs unchanged for both paths (warm rows: r0 = topk - n_gt
+ *              over hist2; out-slot base 0 -- the warm select0 writes all
+ *              output slots itself).
+ *   sel0       per-row branch: warm rows compare the full 16-bit key against
+ *              (tc, t2): coarse > tc or (coarse == tc and low > t2) -> output
+ *              (block-reserved), coarse == tc and low == t2 -> residual
+ *              cand_b. Fallback rows keep the 2-pass low-byte logic.
+ *   refine     runs unchanged (residual list + full fp32 key radix).
+ *   WS3 thr_out grid (B,) x 256: min over the selected values = the exact
+ *              k-th value; writes the next call's seed
+ *              `thr' = kth - delta * sigma` (sigma from WS1's sums; +inf for
+ *              naive rows), and re-zeros hist / hist2 / counters / the sum
+ *              accumulators for the next call. The thresholds tensor is
+ *              caller-owned (persistent across CUDA-graph replays); garbage
+ *              seeds (NaN, +-inf, stale) only ever cause a miss, never a
+ *              wrong answer.
+ *
+ * The plan2/refine suffix-scan conditions use `>=` (not `>`) so that the
+ * exactly-covered case (count == remaining slots, reached on the warm path
+ * when n == topk or when a boundary bin is fully consumed) selects the
+ * boundary bin instead of bailing; for the 2-pass path this case is
+ * unreachable (n_eq > r strictly by K2's choice of t) and plateaus at the
+ * threshold value are tie-equivalent, so the plain 2-pass behavior is
+ * unchanged. plan2 initializes the K4a slot counters BEFORE its early-exit so
+ * warm rows with r == 0 (all slots from coarse > tc) still get a valid
+ * out-slot base.
  */
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -74,7 +135,7 @@ namespace {
 
 constexpr uint32_t kRadix = 256;
 constexpr uint32_t kBlock = 256;      // all kernels use 256-thread blocks
-constexpr uint32_t kChunk = 4096;     // elements per K1/K3 block (16/thread)
+constexpr uint32_t kChunk = 4096;     // elements per K1/K3/WS1 blocks (16/thread)
 constexpr uint32_t kSlice = 2048;     // candidates per K4a block (8/thread)
 constexpr uint32_t kMaxTopK = 2048;
 
@@ -87,10 +148,16 @@ struct FGTopKParams {
   int32_t* __restrict__ plan;          // [B, 4] {t, n_gt, r, n_eq}
   int32_t* __restrict__ plan2;         // [B, 4] {t2, out_base, r2, n_gt2}
   int32_t* __restrict__ counters;      // [B, 4] {gt, eq, out, c2}
-  int32_t* __restrict__ cand_a;        // [B, cap] coarse-threshold positions
-  int32_t* __restrict__ cand_sub;      // [B, cap] ... and their round-0 sub-bins
+  int32_t* __restrict__ cand_a;        // [B, cap] candidate positions
+  int32_t* __restrict__ cand_sub;      // [B, cap] ... 16-bit key (see sel0)
   int32_t* __restrict__ cand_b;        // [B, cap] round-0 residual positions
-  int32_t* __restrict__ stats;         // optional [B, 4] {n_eq, eq_appended, r, inconsistent}
+  int32_t* __restrict__ stats;         // optional [B, stats_stride]
+  // --- warm start only (thresholds == nullptr otherwise) ---
+  float* __restrict__ thresholds;      // [B] in: seed, out: next seed
+  int32_t* __restrict__ ws_flags;      // [B] 1 = warm path taken
+  float* __restrict__ ws_f;            // [B, 2] {sum, sumsq} accumulators
+  float delta;                         // seed margin, in units of sigma
+  uint32_t stats_stride;               // 4 (plain) or 6 (warm)
   int64_t stride;
   uint32_t topk;
   uint32_t cap;
@@ -170,10 +237,14 @@ SGL_DEVICE void suffix_scan_257(int* buf_a, int* buf_b) {
 
 // --- K1: coarse histogram (row read #1) ---
 
-template <bool kUsePDL, typename T>
+template <bool kUsePDL, bool kWarm, typename T>
 __global__ __launch_bounds__(kBlock) void fg_hist_kernel(const FGTopKParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t row = blockIdx.y;
+  if (kWarm && p.ws_flags[row]) { // warm path already selected this row
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   const int32_t length = p.lengths[row];
   if (length <= static_cast<int32_t>(p.topk)) { // naive row: no read needed
     device::PDLTriggerSecondary<kUsePDL>();
@@ -218,10 +289,14 @@ __global__ __launch_bounds__(kBlock) void fg_hist_kernel(const FGTopKParams p) {
 
 // --- K2: per-row plan (one block per row) ---
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kWarm>
 __global__ __launch_bounds__(kBlock) void fg_plan_kernel(const FGTopKParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t row = blockIdx.x;
+  if (kWarm && p.ws_flags[row]) {
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   __shared__ int s_scan[2][kRadix + 1];
   s_scan[0][kRadix] = 0;
   s_scan[1][kRadix] = 0;
@@ -274,10 +349,14 @@ __global__ __launch_bounds__(kBlock) void fg_plan_kernel(const FGTopKParams p) {
 
 // --- K3: gather (row read #2), block-local aggregation ---
 
-template <bool kUsePDL, typename T>
+template <bool kUsePDL, bool kWarm, typename T>
 __global__ __launch_bounds__(kBlock) void fg_gather_kernel(const FGTopKParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t row = blockIdx.y;
+  if (kWarm && p.ws_flags[row]) {
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   const int32_t length = p.lengths[row];
   if (length <= static_cast<int32_t>(p.topk)) { // naive (also covers length <= 0)
     if (blockIdx.x == 0) {
@@ -370,6 +449,200 @@ __global__ __launch_bounds__(kBlock) void fg_gather_kernel(const FGTopKParams p)
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// --- WS1: warm-start gather (the only row read when the warm start hits) ---
+// Predicate: x >= thresholds[row] (NaN logits included, matching production's
+// fp16 key ordering). Every match goes to the candidate list with its FULL
+// 16-bit fp16-sortable key; the candidates' coarse histogram, the
+// total/stored counters, and the row's sum/sum-of-squares (for the next
+// seed's sigma) accumulate in the same streaming pass.
+
+template <bool kUsePDL, typename T>
+__global__ __launch_bounds__(kBlock) void fg_ws_gather_kernel(const FGTopKParams p) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const uint32_t row = blockIdx.y;
+  const int32_t length = p.lengths[row];
+  if (length <= static_cast<int32_t>(p.topk)) { // naive (also covers length <= 0)
+    if (blockIdx.x == 0) {
+      for (uint32_t j = threadIdx.x; j < p.topk; j += kBlock)
+        p.out[static_cast<int64_t>(row) * p.topk + j] =
+            (static_cast<int32_t>(j) < length) ? static_cast<int32_t>(j) : -1;
+    }
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  const float thr = p.thresholds[row];
+  const int64_t beg = static_cast<int64_t>(blockIdx.x) * kChunk;
+  if (beg >= length) {
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  const int64_t end = min(beg + kChunk, static_cast<int64_t>(length));
+  const T* rowp = reinterpret_cast<const T*>(p.scores) + static_cast<int64_t>(row) * p.stride;
+
+  __shared__ int s_eq_pos[kChunk];
+  __shared__ int s_eq_key[kChunk];
+  __shared__ int s_histc[kRadix];
+  __shared__ int s_eq_n, s_eq_base;
+  __shared__ float s_red[2][kBlock];
+  if (threadIdx.x == 0) s_eq_n = 0;
+  for (uint32_t i = threadIdx.x; i < kRadix; i += kBlock) s_histc[i] = 0;
+  __syncthreads();
+
+  float acc1 = 0.f, acc2 = 0.f;
+  auto process = [&](int64_t pos, float x) {
+    acc1 += x;
+    acc2 += x * x;
+    if (x >= thr || isnan(x)) { // NaN sorts above everything, like production
+      const uint16_t key = sortable_f16(x);
+      const int slot = atomicAdd(&s_eq_n, 1);
+      s_eq_pos[slot] = static_cast<int32_t>(pos);
+      s_eq_key[slot] = static_cast<int>(key);
+      atomicAdd(&s_histc[key >> 8], 1);
+    }
+  };
+  if (p.aligned) {
+    const int64_t n4 = (end - beg) >> 2;
+    for (int64_t g = threadIdx.x; g < n4; g += kBlock) {
+      float x[4];
+      load4<T>(rowp + beg + g * 4, x);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) process(beg + g * 4 + e, x[e]);
+    }
+    for (int64_t i = beg + (n4 << 2) + threadIdx.x; i < end; i += kBlock)
+      process(i, to_float(rowp[i]));
+  } else {
+    for (int64_t i = beg + threadIdx.x; i < end; i += kBlock) process(i, to_float(rowp[i]));
+  }
+  __syncthreads();
+  // block-reduce the sums, then one global atomic per counter/slot per block
+  s_red[0][threadIdx.x] = acc1;
+  s_red[1][threadIdx.x] = acc2;
+  __syncthreads();
+  for (int off = kBlock / 2; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      s_red[0][threadIdx.x] += s_red[0][threadIdx.x + off];
+      s_red[1][threadIdx.x] += s_red[1][threadIdx.x + off];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicAdd(&p.counters[row * 4 + 0], s_eq_n); // total candidates
+    s_eq_base = atomicAdd(&p.counters[row * 4 + 1], s_eq_n); // stored slots
+    atomicAdd(&p.ws_f[row * 2 + 0], s_red[0][0]);
+    atomicAdd(&p.ws_f[row * 2 + 1], s_red[1][0]);
+  }
+  __syncthreads();
+  if (threadIdx.x < kRadix) {
+    const int v = s_histc[threadIdx.x];
+    if (v != 0)
+      atomicAdd(&p.hist[static_cast<int64_t>(row) * kRadix + threadIdx.x], v);
+  }
+
+  if (s_eq_base < static_cast<int32_t>(p.cap)) {
+    const int n_store = min(s_eq_n, static_cast<int32_t>(p.cap) - s_eq_base);
+    int32_t* cand = p.cand_a + static_cast<int64_t>(row) * p.cap + s_eq_base;
+    int32_t* cand_sub = p.cand_sub + static_cast<int64_t>(row) * p.cap + s_eq_base;
+    for (int i = threadIdx.x; i < n_store; i += kBlock) {
+      cand[i] = s_eq_pos[i];
+      cand_sub[i] = s_eq_key[i];
+    }
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+// --- WS2: warm-start verify + two-level plan (one block per row) ---
+// n = total candidate count. Miss (n < topk or n > cap) -> ws_flags = 0,
+// hist re-zeroed (WS1 wrote the candidates-only coarse histogram into it),
+// full 2-pass fallback. Hit: suffix-scan hist -> coarse threshold bin tc
+// with #{coarse > tc} <= topk <= #{coarse >= tc}; build hist2 = sub-bin
+// histogram of the coarse == tc candidates from their stored keys; plan =
+// {tc, n_gt, r = topk - n_gt, n}. Two levels are required because the
+// candidates span many coarse bins and the key low byte only orders within
+// one bin.
+
+template <bool kUsePDL>
+__global__ __launch_bounds__(kBlock) void fg_ws_check_kernel(const FGTopKParams p) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const uint32_t row = blockIdx.x;
+  const int32_t length = p.lengths[row];
+  if (length <= static_cast<int32_t>(p.topk)) {
+    // naive row: output already written by WS1; reuse the 2-pass naive plan
+    // so plan2/sel0/refine early-exit; K1..K3 skip the row.
+    if (threadIdx.x == 0) {
+      p.ws_flags[row] = 1;
+      p.plan[row * 4 + 0] = -1;
+      p.plan[row * 4 + 1] = length;
+      p.plan[row * 4 + 2] = 0;
+      p.plan[row * 4 + 3] = length;
+      if (p.stats != nullptr && p.stats_stride >= 6) {
+        p.stats[row * p.stats_stride + 4] = 1;
+        p.stats[row * p.stats_stride + 5] = 0;
+      }
+    }
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  const int n = p.counters[row * 4 + 0];
+  const bool ok = (n >= static_cast<int>(p.topk) && n <= static_cast<int>(p.cap));
+  if (!ok) {
+    if (threadIdx.x < kRadix) // K1 will rebuild the full-row histogram
+      p.hist[static_cast<int64_t>(row) * kRadix + threadIdx.x] = 0;
+    if (threadIdx.x == 0) {
+      p.ws_flags[row] = 0;
+      if (p.stats != nullptr && p.stats_stride >= 6) {
+        p.stats[row * p.stats_stride + 4] = 0;
+        p.stats[row * p.stats_stride + 5] = n;
+      }
+    }
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  __shared__ int s_scan[2][kRadix + 1];
+  __shared__ int s_sub[kRadix];
+  __shared__ int s_tc, s_ngt;
+  s_scan[0][kRadix] = 0;
+  s_scan[1][kRadix] = 0;
+  for (uint32_t i = threadIdx.x; i < kRadix; i += kBlock) s_sub[i] = 0;
+  if (threadIdx.x < kRadix)
+    s_scan[0][threadIdx.x] = p.hist[static_cast<int64_t>(row) * kRadix + threadIdx.x];
+  if (threadIdx.x == 0) p.ws_flags[row] = 1;
+  __syncthreads();
+  suffix_scan_257(s_scan[0], s_scan[1]); // s_scan[0][i] = #{coarse >= i}
+  if (threadIdx.x < kRadix) {
+    const int topk = static_cast<int>(p.topk);
+    // '>=': the exactly-covered case (suf == topk) must select a bin, not
+    // bail; plateau choices are tie-equivalent (empty bins give r == 0).
+    if (s_scan[0][threadIdx.x] >= topk && s_scan[0][threadIdx.x + 1] <= topk) {
+      s_tc = static_cast<int>(threadIdx.x);
+      s_ngt = s_scan[0][threadIdx.x + 1];
+    }
+  }
+  __syncthreads();
+  const int tc = s_tc;
+  const int n_gt = s_ngt;
+  // sub-histogram of the coarse == tc candidates (keys: full 16-bit)
+  const int n_stored = min(p.counters[row * 4 + 1], static_cast<int>(p.cap));
+  const int32_t* cand_sub = p.cand_sub + static_cast<int64_t>(row) * p.cap;
+  for (int i = threadIdx.x; i < n_stored; i += kBlock) {
+    const int key = cand_sub[i];
+    if ((key >> 8) == tc) atomicAdd(&s_sub[key & 0xFFu], 1);
+  }
+  __syncthreads();
+  if (threadIdx.x < kRadix)
+    p.hist2[static_cast<int64_t>(row) * kRadix + threadIdx.x] = s_sub[threadIdx.x];
+  if (threadIdx.x == 0) {
+    p.plan[row * 4 + 0] = tc;
+    p.plan[row * 4 + 1] = n_gt;
+    p.plan[row * 4 + 2] = static_cast<int>(p.topk) - n_gt;
+    p.plan[row * 4 + 3] = n;
+    if (p.stats != nullptr && p.stats_stride >= 6) {
+      p.stats[row * p.stats_stride + 4] = 1;
+      p.stats[row * p.stats_stride + 5] = n;
+    }
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 // --- K4 plan2: round-0 threshold from hist2 ---
 
 template <bool kUsePDL>
@@ -379,11 +652,20 @@ __global__ __launch_bounds__(kBlock) void fg_plan2_kernel(const FGTopKParams p) 
   const int32_t length = p.lengths[row];
   const int32_t r0 = p.plan[row * 4 + 2];
   const int32_t n_gt = p.plan[row * 4 + 1];
+  const bool warm = (p.thresholds != nullptr) && (p.ws_flags[row] != 0);
+  // K4a slot counters. Initialized BEFORE the early exit: warm rows with
+  // r0 == 0 still run sel0 (it writes ALL output slots: the coarse > tc
+  // candidates), and its out-slot base is 0 (fallback rows: K3 already
+  // wrote [0, n_gt), so their base is n_gt).
+  if (threadIdx.x == 0) {
+    p.counters[row * 4 + 2] = warm ? 0 : n_gt; // out slot base
+    p.counters[row * 4 + 3] = 0;               // residual list appends
+  }
   if (threadIdx.x == 0 && p.stats != nullptr) {
-    p.stats[row * 4 + 0] = p.plan[row * 4 + 3];
-    p.stats[row * 4 + 1] = p.counters[row * 4 + 1];
-    p.stats[row * 4 + 2] = r0;
-    p.stats[row * 4 + 3] = 0;
+    p.stats[row * p.stats_stride + 0] = p.plan[row * 4 + 3];
+    p.stats[row * p.stats_stride + 1] = p.counters[row * 4 + 1];
+    p.stats[row * p.stats_stride + 2] = r0;
+    p.stats[row * p.stats_stride + 3] = 0;
   }
   if (length <= static_cast<int32_t>(p.topk) || r0 <= 0) {
     if (threadIdx.x == 0) {
@@ -403,7 +685,11 @@ __global__ __launch_bounds__(kBlock) void fg_plan2_kernel(const FGTopKParams p) 
   __syncthreads();
   suffix_scan_257(s_scan[0], s_scan[1]); // s_scan[0][i] = #{sub-bin >= i}
   if (threadIdx.x < kRadix) {
-    if (s_scan[0][threadIdx.x] > r0 && s_scan[0][threadIdx.x + 1] <= r0) {
+    // '>=' (not '>'): the exactly-covered case (total == r0, reached on the
+    // warm path when a boundary bin is fully consumed) must select the
+    // boundary bin instead of bailing; unreachable on the 2-pass path
+    // (n_eq > r strictly).
+    if (s_scan[0][threadIdx.x] >= r0 && s_scan[0][threadIdx.x + 1] <= r0) {
       const int t2 = static_cast<int>(threadIdx.x);
       const int n_gt2 = s_scan[0][t2 + 1];
       p.plan2[row * 4 + 0] = t2;
@@ -412,22 +698,23 @@ __global__ __launch_bounds__(kBlock) void fg_plan2_kernel(const FGTopKParams p) 
       p.plan2[row * 4 + 3] = n_gt2;
     }
   }
-  // K4a slot counters
-  if (threadIdx.x == 0) {
-    p.counters[row * 4 + 2] = n_gt; // out slot base for round-0 selections
-    p.counters[row * 4 + 3] = 0;    // residual list appends
-  }
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
 // --- K4a: round-0 selection over the candidate list (multi-block, streaming) ---
+// Fallback rows (2-pass): cand_sub holds the fp16-key LOW byte of the K3
+// candidates (which all share the coarse threshold bin); select sub-bin > t2.
+// Warm rows: cand_sub holds the FULL 16-bit key (candidates span many coarse
+// bins); select coarse > tc, or coarse == tc with low byte > t2; the
+// coarse == tc / low == t2 elements become the refine residual.
 
 template <bool kUsePDL>
 __global__ __launch_bounds__(kBlock) void fg_select0_kernel(const FGTopKParams p) {
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t row = blockIdx.y;
+  const bool warm = (p.thresholds != nullptr) && (p.ws_flags[row] != 0);
   const int32_t r0 = p.plan[row * 4 + 2];
-  if (r0 <= 0) {
+  if (!warm && r0 <= 0) { // 2-pass: nothing left to select (K3 wrote all)
     device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
@@ -438,8 +725,8 @@ __global__ __launch_bounds__(kBlock) void fg_select0_kernel(const FGTopKParams p
   }
   const int32_t t2 = p.plan2[row * 4 + 0];
   const int32_t r2 = p.plan2[row * 4 + 2];
-  if (t2 < 0) { // inconsistent (proved impossible when r0 > 0)
-    if (threadIdx.x == 0 && p.stats != nullptr) p.stats[row * 4 + 3] = 1;
+  if (!warm && t2 < 0) { // inconsistent (proved impossible when r0 > 0)
+    if (threadIdx.x == 0 && p.stats != nullptr) p.stats[row * p.stats_stride + 3] = 1;
     device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
@@ -460,15 +747,30 @@ __global__ __launch_bounds__(kBlock) void fg_select0_kernel(const FGTopKParams p
   }
   __syncthreads();
 
+  const int32_t tc = p.plan[row * 4 + 0]; // warm: coarse threshold bin
   const int32_t* cand = p.cand_a + static_cast<int64_t>(row) * p.cap;
   const int32_t* cand_sub = p.cand_sub + static_cast<int64_t>(row) * p.cap;
   for (int i = static_cast<int>(beg) + threadIdx.x; i < end; i += kBlock) {
     const int32_t pos = cand[i];
-    const int32_t bin = cand_sub[i];
-    if (bin > t2) {
-      s_gt_pos[atomicAdd(&s_gt_n, 1)] = pos;
-    } else if (bin == t2 && r2 > 0) {
-      s_eq_pos[atomicAdd(&s_eq_n, 1)] = pos;
+    const int key = cand_sub[i];
+    if (warm) {
+      const int c = key >> 8;
+      if (c > tc) {
+        s_gt_pos[atomicAdd(&s_gt_n, 1)] = pos;
+      } else if (c == tc && t2 >= 0) {
+        const int low = key & 0xFFu;
+        if (low > t2) {
+          s_gt_pos[atomicAdd(&s_gt_n, 1)] = pos;
+        } else if (low == t2 && r2 > 0) {
+          s_eq_pos[atomicAdd(&s_eq_n, 1)] = pos;
+        }
+      }
+    } else {
+      if (key > t2) {
+        s_gt_pos[atomicAdd(&s_gt_n, 1)] = pos;
+      } else if (key == t2 && r2 > 0) {
+        s_eq_pos[atomicAdd(&s_eq_n, 1)] = pos;
+      }
     }
   }
   __syncthreads();
@@ -486,9 +788,9 @@ __global__ __launch_bounds__(kBlock) void fg_select0_kernel(const FGTopKParams p
 }
 
 // --- K4b: exact fp32 radix refinement over the small residual list ---
-// The residual shares only its fp16-key low byte, so the selection is refined
-// from scratch on the full fp32 sortable key (4 x 8-bit rounds, exactly the
-// production refinement) over a small list (typically tens of entries).
+// The residual shares only its 16-bit boundary key, so the selection is
+// refined from scratch on the full fp32 sortable key (4 x 8-bit rounds,
+// exactly the production refinement) over a small list.
 
 template <bool kUsePDL, typename T>
 __global__ __launch_bounds__(kBlock) void fg_refine_kernel(const FGTopKParams p) {
@@ -534,7 +836,8 @@ __global__ __launch_bounds__(kBlock) void fg_refine_kernel(const FGTopKParams p)
     suffix_scan_257(s_hist[round & 1], s_hist[1 - (round & 1)]);
     if (threadIdx.x < kRadix) {
       const int* suf = s_hist[round & 1];
-      if (suf[threadIdx.x] > topk_rem && suf[threadIdx.x + 1] <= topk_rem) {
+      // '>=' for the same exactly-covered reason as fg_plan2_kernel.
+      if (suf[threadIdx.x] >= topk_rem && suf[threadIdx.x + 1] <= topk_rem) {
         s_t = static_cast<int>(threadIdx.x);
         s_last_remain = topk_rem - suf[threadIdx.x + 1];
       }
@@ -542,7 +845,7 @@ __global__ __launch_bounds__(kBlock) void fg_refine_kernel(const FGTopKParams p)
     __syncthreads();
     const int t = s_t;
     if (t < 0) { // inconsistent (proved impossible); bail without writing
-      if (threadIdx.x == 0 && p.stats != nullptr) p.stats[row * 4 + 3] = 1;
+      if (threadIdx.x == 0 && p.stats != nullptr) p.stats[row * p.stats_stride + 3] = 1;
       device::PDLTriggerSecondary<kUsePDL>();
       return;
     }
@@ -581,6 +884,57 @@ __global__ __launch_bounds__(kBlock) void fg_refine_kernel(const FGTopKParams p)
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// --- WS3: threshold out (one block per row) ---
+// The exact k-th value is the min over the selected values; write the next
+// call's seed `kth - delta * sigma` (sigma from WS1's sums; +inf for naive
+// rows) and re-zero hist / hist2 / counters[0..1] / the sum accumulators so
+// the next call's WS1 starts clean (the buffers are self-cleaning across
+// calls and CUDA-graph replays).
+
+template <bool kUsePDL, typename T>
+__global__ __launch_bounds__(kBlock) void fg_ws_thr_out_kernel(const FGTopKParams p) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const uint32_t row = blockIdx.x;
+  const int32_t length = p.lengths[row];
+  // capture the sum accumulators BEFORE re-zeroing them (sigma for the seed)
+  const float s1 = p.ws_f[row * 2 + 0];
+  const float s2 = p.ws_f[row * 2 + 1];
+  for (uint32_t i = threadIdx.x; i < kRadix; i += kBlock) {
+    p.hist[static_cast<int64_t>(row) * kRadix + i] = 0;
+    p.hist2[static_cast<int64_t>(row) * kRadix + i] = 0;
+  }
+  if (threadIdx.x == 0) {
+    p.counters[row * 4 + 0] = 0;
+    p.counters[row * 4 + 1] = 0;
+    p.ws_f[row * 2 + 0] = 0.f;
+    p.ws_f[row * 2 + 1] = 0.f;
+  }
+  if (length <= static_cast<int32_t>(p.topk)) { // no k-th value exists
+    if (threadIdx.x == 0) p.thresholds[row] = __int_as_float(0x7f800000); // +inf
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  const T* rowp = reinterpret_cast<const T*>(p.scores) + static_cast<int64_t>(row) * p.stride;
+  const int32_t* out_row = p.out + static_cast<int64_t>(row) * p.topk;
+  __shared__ float s_min[kBlock];
+  float m = __int_as_float(0x7f800000);
+  for (uint32_t j = threadIdx.x; j < p.topk; j += kBlock)
+    m = fminf(m, to_float(rowp[out_row[j]]));
+  s_min[threadIdx.x] = m;
+  __syncthreads();
+  for (int off = kBlock / 2; off > 0; off >>= 1) {
+    if (threadIdx.x < off) s_min[threadIdx.x] = fminf(s_min[threadIdx.x], s_min[threadIdx.x + off]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float kth = s_min[0];
+    const float len = static_cast<float>(length);
+    const float var = fmaxf(0.f, s2 / len - (s1 / len) * (s1 / len));
+    p.thresholds[row] = kth - p.delta * sqrtf(var);
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 } // namespace
 
 template <bool kUsePDL>
@@ -594,7 +948,10 @@ struct TopKDecodeFG {
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView workspace,
       const uint32_t cap,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> stats) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> stats,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> thresholds,
+      const double delta,
+      const bool warm) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
@@ -609,9 +966,20 @@ struct TopKDecodeFG {
     TensorMatcher({W}).with_dtype<int32_t>().with_device(device).verify(workspace);
 
     int32_t* stats_ptr = nullptr;
+    uint32_t stats_stride = 4;
     if (stats.has_value()) {
-      TensorMatcher({B, 4}).with_dtype<int32_t>().with_device(device).verify(stats.value());
+      stats_stride = warm ? 6u : 4u;
+      TensorMatcher({B, static_cast<int64_t>(stats_stride)})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(stats.value());
       stats_ptr = static_cast<int32_t*>(stats.value().data_ptr());
+    }
+
+    float* thresholds_ptr = nullptr;
+    if (warm) {
+      TensorMatcher({B}).with_dtype<fp32_t>().with_device(device).verify(thresholds.value());
+      thresholds_ptr = static_cast<float*>(thresholds.value().data_ptr());
     }
 
     const auto batch = static_cast<uint32_t>(B.unwrap());
@@ -621,9 +989,10 @@ struct TopKDecodeFG {
     RuntimeCheck(batch > 0 && batch <= kMaxRows, "batch too large for grid.y");
     RuntimeCheck(cap > topk, "cap must exceed topk");
 
-    // [hist | hist2 | plan | plan2 | counters | cand_a | cand_sub | cand_b]
+    // [hist | hist2 | plan | plan2 | counters | ws_flags | ws_f | cand_a | cand_sub | cand_b]
     const int64_t n_hist = static_cast<int64_t>(batch) * kRadix;
-    const int64_t n_small = static_cast<int64_t>(batch) * (2 * kRadix + 4 + 4 + 4);
+    const int64_t n_small =
+        static_cast<int64_t>(batch) * (2 * kRadix + 4 + 4 + 4 + (warm ? 1 + 2 : 0));
     const int64_t need = n_small + 3 * static_cast<int64_t>(batch) * cap;
     RuntimeCheck(static_cast<int64_t>(W.unwrap()) >= need, "workspace too small");
 
@@ -645,6 +1014,11 @@ struct TopKDecodeFG {
         .cand_sub = ws + n_small + static_cast<int64_t>(batch) * cap,
         .cand_b = ws + n_small + 2 * static_cast<int64_t>(batch) * cap,
         .stats = stats_ptr,
+        .thresholds = thresholds_ptr,
+        .ws_flags = warm ? ws + 2 * n_hist + 12 * batch : nullptr,
+        .ws_f = warm ? reinterpret_cast<float*>(ws + 2 * n_hist + 13 * batch) : nullptr,
+        .delta = static_cast<float>(delta),
+        .stats_stride = stats_stride,
         .stride = stride,
         .topk = topk,
         .cap = cap,
@@ -655,12 +1029,26 @@ struct TopKDecodeFG {
     const uint32_t slices = (cap + kSlice - 1) / kSlice;
     const dim3 grid_row_chunks(chunks, batch);
     const dim3 grid_slices(slices, batch);
-    LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_hist_kernel<kUsePDL, T>, p);
-    LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_plan_kernel<kUsePDL>, p);
-    LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_gather_kernel<kUsePDL, T>, p);
-    LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_plan2_kernel<kUsePDL>, p);
-    LaunchKernel(grid_slices, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_select0_kernel<kUsePDL>, p);
-    LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_refine_kernel<kUsePDL, T>, p);
+
+    if (!warm) {
+      LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_hist_kernel<kUsePDL, false, T>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_plan_kernel<kUsePDL, false>, p);
+      LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_gather_kernel<kUsePDL, false, T>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_plan2_kernel<kUsePDL>, p);
+      LaunchKernel(grid_slices, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_select0_kernel<kUsePDL>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_refine_kernel<kUsePDL, T>, p);
+    } else {
+      // WS1 -> WS2 -> (gated 2-pass fallback) -> plan2/sel0/refine -> WS3
+      LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_ws_gather_kernel<kUsePDL, T>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_ws_check_kernel<kUsePDL>, p);
+      LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_hist_kernel<kUsePDL, true, T>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_plan_kernel<kUsePDL, true>, p);
+      LaunchKernel(grid_row_chunks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_gather_kernel<kUsePDL, true, T>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_plan2_kernel<kUsePDL>, p);
+      LaunchKernel(grid_slices, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_select0_kernel<kUsePDL>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_refine_kernel<kUsePDL, T>, p);
+      LaunchKernel(batch, kBlock, device.unwrap()).enable_pdl(kUsePDL)(fg_ws_thr_out_kernel<kUsePDL, T>, p);
+    }
   }
 
   static void run(
@@ -670,11 +1058,31 @@ struct TopKDecodeFG {
       const tvm::ffi::TensorView workspace,
       const uint32_t cap,
       const tvm::ffi::Optional<tvm::ffi::TensorView> stats) {
+    const tvm::ffi::Optional<tvm::ffi::TensorView> no_thresholds;
     const auto dt = scores.dtype();
     if (dt.code == DLDataTypeCode::kDLFloat && dt.bits == 32 && dt.lanes == 1) {
-      run_t<fp32_t>(scores, lengths, out, workspace, cap, stats);
+      run_t<fp32_t>(scores, lengths, out, workspace, cap, stats, no_thresholds, 0.0, false);
     } else if (dt.code == DLDataTypeCode::kDLBfloat && dt.bits == 16 && dt.lanes == 1) {
-      run_t<bf16_t>(scores, lengths, out, workspace, cap, stats);
+      run_t<bf16_t>(scores, lengths, out, workspace, cap, stats, no_thresholds, 0.0, false);
+    } else {
+      host::RuntimeCheck(false, "scores must be fp32 or bf16");
+    }
+  }
+
+  static void run_ws(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView workspace,
+      const uint32_t cap,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> stats,
+      const tvm::ffi::TensorView thresholds,
+      const double delta) {
+    const auto dt = scores.dtype();
+    if (dt.code == DLDataTypeCode::kDLFloat && dt.bits == 32 && dt.lanes == 1) {
+      run_t<fp32_t>(scores, lengths, out, workspace, cap, stats, thresholds, delta, true);
+    } else if (dt.code == DLDataTypeCode::kDLBfloat && dt.bits == 16 && dt.lanes == 1) {
+      run_t<bf16_t>(scores, lengths, out, workspace, cap, stats, thresholds, delta, true);
     } else {
       host::RuntimeCheck(false, "scores must be fp32 or bf16");
     }

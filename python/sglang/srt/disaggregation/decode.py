@@ -20,7 +20,9 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -356,6 +358,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # /server_info + load snapshots so it can be charted/dispatched on).
         self.host_pool_wait_events: int = 0
         self._host_pool_wait_last_log_ts: float = 0.0
+        # Starvation follow-up (2026-09-03, prod 6256482 DP9):
+        # per-request wait age since the first failed host-pool
+        # admission. After SGLANG_HISPARSE_STARVE_S (default 5 s)
+        # admission escalates to starvation-honoring deficit
+        # eviction -- retained-idle rows LRU-first; running /
+        # in-transfer rows are never evictable, so never taken.
+        self._host_pool_wait_since: Dict[str, float] = {}
+        self.host_pool_starve_evictions: int = 0
+        try:
+            self._host_pool_starve_s = max(
+                0.0,
+                float(os.environ.get("SGLANG_HISPARSE_STARVE_S", "5.0")),
+            )
+        except ValueError:
+            self._host_pool_starve_s = 5.0
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -719,6 +736,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self.queue.clear()
+        self._host_pool_wait_since.clear()
         for req in self.retracted_queue:
             retraction_discard(
                 req,
@@ -1147,12 +1165,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse and not self._host_pool_admission(
                 decode_req, self._pre_alloc_fill_len(decode_req.req), prefix_len
             ):
-                # Host KV pool full: leave the request queued (head order is
-                # kept by the break) and retry on a later tick, after the
-                # eviction inside _host_pool_admission has freed host rows.
+                # Host KV pool full for THIS request: skip it (it stays queued,
+                # head order preserved among the waiting) and try the next
+                # queued request. Skipping — not breaking — matters: a giant
+                # no-prefix request that cannot fit must not head-of-line block
+                # small cache-hit requests behind it (prod 23:10Z: a 9,510-
+                # page waiter stalled a 173-page hit for ~15 min until it
+                # aborted). The skipped request is retried next tick; if the
+                # pool stays full it eventually hits the bootstrap timeout.
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                break
+                continue
 
             _pa_t0 = time.perf_counter()
             try:
@@ -1163,14 +1186,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     total_prefix_len,
                 )
             except HostPoolExhaustedError:
-                # Safety net: the admission pre-check above should break
+                # Safety net: the admission pre-check above should skip
                 # first. Keep the failure non-fatal anyway — the partial
                 # pre-allocation was rolled back inside _pre_alloc, so leave
-                # the request queued and retry on a later tick.
+                # the request queued, skip to the next queued request and
+                # retry on a later tick.
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 self._note_host_pool_wait(0)
-                break
+                continue
             if cold_trace_enabled():
                 cold_trace(
                     "dec_prealloc_alloc",
@@ -1396,6 +1420,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if self._host_pool_wait_since:
+            live_rids = {entry.req.rid for entry in self.queue}
+            for stale_rid in set(self._host_pool_wait_since) - live_rids:
+                self._host_pool_wait_since.pop(stale_rid, None)
 
         return preallocated_reqs, failed_reqs
 
@@ -1634,6 +1662,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # request's own host-row table is still empty at this point.
         needed_pages = host_pool.host_pages_needed(start_pos, num_tokens, 0)
         if needed_pages <= 0 or host_pool.has_free_pages(needed_pages):
+            self._host_pool_wait_since.pop(decode_req.req.rid, None)
             return True
 
         # Host pressure, unlike logical-pool pressure, frees nothing by
@@ -1648,12 +1677,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 EvictParams(num_tokens=min(deficit_tokens, evictable))
             )
             if host_pool.has_free_pages(needed_pages):
+                self._host_pool_wait_since.pop(decode_req.req.rid, None)
                 return True
 
-        self._note_host_pool_wait(needed_pages)
+        rid = decode_req.req.rid
+        now = time.monotonic()
+        wait_since = self._host_pool_wait_since.setdefault(rid, now)
+        wait_age = now - wait_since
+        if wait_age > self._host_pool_starve_s:
+            # Starvation override (SGLANG_HISPARSE_STARVE_S, default
+            # 5 s): evict retained-idle rows LRU-first regardless
+            # of retention age until the deficit is covered. This
+            # retention design has no TTL; idle rows are exactly
+            # the unlocked ones, and running / in-transferring
+            # pages are locked chains or private reservations, so
+            # the eviction below can never take them.
+            if self._evict_starved(deficit_tokens) and host_pool.has_free_pages(
+                needed_pages
+            ):
+                self._host_pool_wait_since.pop(rid, None)
+                return True
+
+        self._note_host_pool_wait(needed_pages, wait_age)
         return False
 
-    def _note_host_pool_wait(self, needed_pages: int) -> None:
+    def _note_host_pool_wait(
+        self, needed_pages: int, wait_age: float = -1.0
+    ) -> None:
         """Count one host-pool admission skip; rate-limit the log line."""
         self.host_pool_wait_events += 1
         now = time.monotonic()
@@ -1664,13 +1714,54 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         logger.warning(
             "HiSparse: host mem pool full; prealloc request waits "
             "(need=%d pages, free=%d pages, queue_len=%d, evictable=%d tok, "
-            "wait_events=%d)",
+            "wait_events=%d, wait_age_s=%.1f, starve_evictions=%d)",
             needed_pages,
             host_pool.available_size() // host_pool.page_size,
             len(self.queue),
             self.tree_cache.evictable_size(),
             self.host_pool_wait_events,
+            wait_age,
+            self.host_pool_starve_evictions,
         )
+
+    def _evict_starved(self, deficit_tokens: int) -> bool:
+        """Starvation-honoring deficit eviction (2026-09-03 follow-up).
+
+        Runs only after a prealloc has waited past
+        ``SGLANG_HISPARSE_STARVE_S``: evict retained-idle radix
+        rows LRU-first until the deficit is covered. Rows of
+        running or in-transferring requests are never taken: they
+        are either locked radix chains (``lock_ref > 0``, excluded
+        from ``evictable_leaves``) or the requests' own
+        pre-allocated host rows (not radix rows at all). One log
+        line per evicted node records the cost -- a later turn of
+        an evicted session re-prefills exactly those tokens.
+        """
+        tree_cache = self.tree_cache
+        if tree_cache.evictable_size() <= 0:
+            return False
+
+        def _note_evicted_node(node) -> None:
+            key_head = ",".join(str(t) for t in list(node.key.token_ids)[:8])
+            sid = hashlib.sha1(key_head.encode()).hexdigest()[:12]
+            idle_s = max(0.0, time.monotonic() - node.last_access_time)
+            self.host_pool_starve_evictions += 1
+            logger.warning(
+                "HiSparse: starve eviction sid=%s tokens=%d idle_s=%.1f",
+                sid,
+                len(node.key),
+                idle_s,
+            )
+
+        # The hook is armed only around this evict() call: base
+        # RadixCache.evict() fires _record_remove_event exactly
+        # once per evicted leaf node, with the node still intact.
+        tree_cache._starve_on_evict = _note_evicted_node
+        try:
+            tree_cache.evict(EvictParams(num_tokens=deficit_tokens))
+        finally:
+            tree_cache._starve_on_evict = None
+        return True
 
     def _pre_alloc(
         self,
@@ -2326,6 +2417,11 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2365,6 +2461,11 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # lane rank-migration: drain scheduler-thread work for the
+            # session-migration agent (tree ops must run on this thread).
+            if getattr(self, "session_migration_agent", None) is not None:
+                self.session_migration_agent.poll()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2443,6 +2544,36 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+
+        # warm-local-prefill: transition staged local extends into decode
+        # (mirror of the normal scheduler's hisparse block in
+        # get_next_batch_to_run), then run at most one local extend as its
+        # own eager step. The extend step replaces this iteration's decode
+        # step (separate-step design: decode keeps its CUDA graphs; the
+        # co-resident decodes stall for the extend chunk's duration).
+        if self.enable_hisparse:
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if len(ready_reqs) > 0:
+                new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                # The PD-prebuilt running batch carries multimodal_inputs as a
+                # per-req list; _build_hisparse_decode_batch leaves it None and
+                # merge_batch concatenates the two. Align the shapes.
+                if new_batch.multimodal_inputs is None:
+                    new_batch.multimodal_inputs = [None] * len(ready_reqs)
+                if running_batch.is_empty():
+                    running_batch = new_batch
+                else:
+                    running_batch.merge_batch(new_batch)
+                running_batch.hisparse_coordinator = self.hisparse_coordinator
+                running_batch.batch_is_full = False
+
+            if self.wlp_enable and self.chunked_req is None:
+                extend_batch = self._wlp_build_extend_batch()
+                if extend_batch is not None:
+                    set_schedule_time_batch(extend_batch)
+                    return NextBatchPlan(
+                        batch_to_run=extend_batch, running_batch=running_batch
+                    )
 
         # Schedule decode batch
         if running_batch.is_empty():

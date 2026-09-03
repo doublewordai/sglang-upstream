@@ -391,12 +391,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dev_cpu = device_indices
         dev_cpu = dev_cpu.to(torch.int64).contiguous()
 
+        from sglang.srt.environ import envs
+
         h_starts, d_starts, lens, positions = bulk_copy.find_joint_runs(
             host_cpu, dev_cpu
         )
         seg_mask = lens * item >= bulk_copy.BULK_MIN_SEGMENT_BYTES
 
         stream = torch.cuda.current_stream(device_pool.device)
+        seg_done = False
         if bool(seg_mask.any()):
             sel_h = h_starts[seg_mask]
             sel_d = d_starts[seg_mask]
@@ -417,28 +420,38 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ).reshape(-1)
             sizes = sel_len[:, None].expand(-1, L).reshape(-1) * item
             n_seg = sizes.numel()
-            step = bulk_copy.BULK_MAX_SEGMENTS_PER_CALL
-            for i in range(0, n_seg, step):
-                ok = bulk_copy.batched_memcpy_async(
-                    dst[i : i + step],
-                    src[i : i + step],
-                    sizes[i : i + step],
-                    stream,
-                    src_is_device=True,
-                    dst_is_device=False,
+            if (
+                envs.SGLANG_D2H_SM_STORES.get()
+                and int(sizes.sum()) >= bulk_copy.SM_STORE_MIN_SEGMENT_BYTES
+            ):
+                # coalesced SM stores: ~383 GB/s vs the ~170 GB/s CE cap;
+                # only for big admits (see SM_STORE_MIN_SEGMENT_BYTES)
+                seg_done = bulk_copy.sm_store_d2h_segments(
+                    dst, src, sizes, item, L, stream
                 )
-                if not ok:
-                    # per-run fallback: torch D2H copies, layer by layer
-                    for j in range(sel_h.numel()):
-                        h0 = int(sel_h[j])
-                        d0 = int(sel_d[j])
-                        n = int(sel_len[j])
-                        for l in range(L):
-                            self.kv_buffer[l][h0 : h0 + n].copy_(
-                                device_pool.kv_buffer[l][d0 : d0 + n],
-                                non_blocking=True,
-                            )
-                    break
+            if not seg_done:
+                step = bulk_copy.BULK_MAX_SEGMENTS_PER_CALL
+                for i in range(0, n_seg, step):
+                    ok = bulk_copy.batched_memcpy_async(
+                        dst[i : i + step],
+                        src[i : i + step],
+                        sizes[i : i + step],
+                        stream,
+                        src_is_device=True,
+                        dst_is_device=False,
+                    )
+                    if not ok:
+                        # per-run fallback: torch D2H copies, layer by layer
+                        for j in range(sel_h.numel()):
+                            h0 = int(sel_h[j])
+                            d0 = int(sel_d[j])
+                            n = int(sel_len[j])
+                            for l in range(L):
+                                self.kv_buffer[l][h0 : h0 + n].copy_(
+                                    device_pool.kv_buffer[l][d0 : d0 + n],
+                                    non_blocking=True,
+                                )
+                        break
 
         # remainder rows (not covered by an eligible joint run) -> AOT kernel
         # (vectorized: find_joint_runs tiles [0, n) exactly, so the flat
@@ -451,14 +464,34 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             rem_h = host_cpu[rem_pos].to(device_pool.device, non_blocking=True)
             rem_d = dev_cpu[rem_pos].to(device_pool.device, non_blocking=True)
             device_data_ptrs, _ = self._resolve_device_transfer_buffers(device_pool)
-            transfer_kv_all_layer_mla(
-                src_layers=device_data_ptrs,
-                dst_layers=self.data_ptrs,
-                src_indices=rem_d,
-                dst_indices=rem_h,
-                item_size=self.token_stride_size,
-                num_layers=L,
+            # SM rows win when the HOST index set is chunky (mean run >= 2
+            # pages: coalesced dst spans); fully page-scattered writes are
+            # TLB-bound on every path (SM 25 / AOT 36 GB/s at 131k scattered
+            # rows over 20 GB pools) and keep the AOT kernel.
+            _hr_starts, _hr_lens = bulk_copy.find_runs(host_cpu)
+            _mean_host_run = (
+                float(_hr_lens.float().mean()) if _hr_lens.numel() else 0.0
             )
+            if not (
+                envs.SGLANG_D2H_SM_STORES.get()
+                and _mean_host_run >= 2 * self.page_size
+                and bulk_copy.sm_store_d2h_rows(
+                    device_data_ptrs,
+                    self.data_ptrs,
+                    rem_d,
+                    rem_h,
+                    self.token_stride_size,
+                    L,
+                )
+            ):
+                transfer_kv_all_layer_mla(
+                    src_layers=device_data_ptrs,
+                    dst_layers=self.data_ptrs,
+                    src_indices=rem_d,
+                    dst_indices=rem_h,
+                    item_size=self.token_stride_size,
+                    num_layers=L,
+                )
 
     def load_to_device_per_layer(
         self,
