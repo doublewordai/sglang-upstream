@@ -52,6 +52,8 @@ void sparse_mla_fp8_decode_dispatch(
     int64_t topk,
     int64_t tail_sentinel,
     int64_t fused,
+    int64_t head_splits,
+    int64_t phase_mask,
     double sm_scale,
     int64_t cuda_stream) {
   SparseMlaFp8DecodeParams params;
@@ -75,6 +77,8 @@ void sparse_mla_fp8_decode_dispatch(
   params.q_rope_out = reinterpret_cast<cutlass::bfloat16_t*>(q_rope.data_ptr());
   params.q_scale_out = static_cast<float*>(q_scale.data_ptr());
   params.fused = (int)fused;
+  params.head_splits = (int)head_splits;
+  params.phase_mask = (int)phase_mask;
   params.counter = fused ? static_cast<int*>(counter.data_ptr()) : nullptr;
   params.out_fused = reinterpret_cast<cutlass::bfloat16_t*>(out_fused.data_ptr());
   sm90::decode::SparseMlaFp8DecodeKernel::run(params);
@@ -126,6 +130,8 @@ void sparse_mla_fp8_qprep_dispatch(
   params.debug = nullptr;
   params.use_qprep = 0;
   params.fused = 0;
+  params.head_splits = 1;
+  params.phase_mask = 0;
   params.counter = static_cast<int*>(counter.data_ptr());
   params.out_fused = nullptr;
   params.q_fp8_out = static_cast<uint8_t*>(q_fp8.data_ptr());

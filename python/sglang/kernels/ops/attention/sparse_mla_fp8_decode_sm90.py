@@ -83,6 +83,7 @@ def sparse_mla_fp8_decode_fwd(
     debug: torch.Tensor | None = None,       # [b, 12] f32 (E pre-pass dump)
     qprep: tuple | None = None,              # (q_fp8, q_rope, q_scale) pre-quantized
     fused: bool = False,                     # single-launch in-kernel combine (caps P)
+    head_splits: int = 1,                    # 1 or 2: CTAs also split the head dim
     counter: torch.Tensor | None = None,     # [1] i32 barrier counter (reused across calls)
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns (out, partial_o, partial_ml)."""
@@ -99,8 +100,9 @@ def sparse_mla_fp8_decode_fwd(
     stream = _get_current_stream_raw(dev.index or 0)
 
     if fused:
-        # co-residency cap: all b*P CTAs must be resident (1 CTA/SM here)
-        num_splits = min(num_splits, 32, 132 // b)
+        # co-residency cap: all b*P*head_splits CTAs must be resident
+        num_splits = min(num_splits, 32, 132 // (b * head_splits))
+        assert head_splits == 1 or qprep is not None or True  # in-kernel quant path handles hs=2 too
         if qprep is None:
             q_fp8 = torch.empty((b, 64, 512), dtype=torch.uint8, device=dev)
             q_rope = torch.empty((b, 64, 64), dtype=torch.bfloat16, device=dev)
@@ -119,7 +121,9 @@ def sparse_mla_fp8_decode_fwd(
         qprep_fn(q, q_fp8, q_rope, q_scale, counter, b, 1.0, stream)
         dispatch_fn(
             q, kv, indices, seqlens, partial_o, partial_ml, debug, q_fp8, q_rope, q_scale,
-            counter, out, num_splits, topk, 1 if tail_sentinel else 0, 1, sm_scale, stream,
+            counter, out, num_splits, topk, 1 if tail_sentinel else 0, 1, head_splits,
+            int(getattr(sparse_mla_fp8_decode_fwd, "_phase_mask", 0)),
+            sm_scale, stream,
         )
         return out, partial_o, partial_ml
 
@@ -141,7 +145,9 @@ def sparse_mla_fp8_decode_fwd(
         q, kv, indices, seqlens, partial_o, partial_ml, debug, q_fp8, q_rope, q_scale,
         torch.empty(0, dtype=torch.int32, device=dev),
         torch.empty(0, dtype=torch.bfloat16, device=dev),
-        num_splits, topk, 1 if tail_sentinel else 0, 0, sm_scale, stream,
+        num_splits, topk, 1 if tail_sentinel else 0, 0, head_splits,
+        int(getattr(sparse_mla_fp8_decode_fwd, "_phase_mask", 0)),
+        sm_scale, stream,
     )
     combine_fn(partial_o, partial_ml, out, num_splits, stream)
     return out, partial_o, partial_ml

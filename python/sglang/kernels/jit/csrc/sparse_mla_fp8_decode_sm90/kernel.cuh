@@ -85,10 +85,11 @@ struct SparseMlaFp8DecodeKernel {
   using bf16_t = cutlass::bfloat16_t;
 
   enum NamedBarriers : uint32_t {
-    kv_ready = 1,  // 384 arrivals: producer published K/rope/scales/V/valid
+    kv_ready = 1,  // 384 arrivals: producer published K/rope/scales/valid
     p_ready = 2,   // 256 arrivals: WG0 published p + scale_row
     blk_done = 3,  // 384 arrivals: both WGs finished PV for this block
     blk_end = 4,   // 384 arrivals: fused-mode gather/release around the barrier
+    v_ready = 5,   // 256 arrivals: WG1 published dequantized V (gates PV)
   };
 
   // ------------------------------------------------------------------
@@ -110,11 +111,12 @@ struct SparseMlaFp8DecodeKernel {
   using SmemLayoutKRope = decltype(tile_to_shape(
       GMMA::Layout_K_SW128_Atom<bf16_t>{}, Shape<Int<B_TOPK>, Int<D_ROPE>>{}, Step<_1, _2>{}));
 
-  // V group layout (PV B operand, MN-major): (N=128 d, K=64 j), d contiguous.
-  // The producer dequantizes (raw fp8 * s_v) to TRUE bf16 values here.
-  using SmemLayoutVGroupMN = decltype(tile_to_shape(
-      GMMA::Layout_MN_SW128_Atom<bf16_t>{}, Shape<_128, Int<B_TOPK>>{}));
-  static constexpr int V_GROUP_ELEMS = cosize_v<SmemLayoutVGroupMN>;  // 8192 bf16 = 16 KB
+  // V half layout (PV B operand, MN-major): (N=256 d, K=64 j), d contiguous.
+  // WG1 dequantizes (raw fp8 * s_v) to TRUE bf16 values here; each consumer
+  // WG runs ONE N=256 PV GEMM (rO = 128 regs, no spills).
+  using SmemLayoutVHalfMN = decltype(tile_to_shape(
+      GMMA::Layout_MN_SW128_Atom<bf16_t>{}, Shape<_256, Int<B_TOPK>>{}));
+  static constexpr int V_HALF_ELEMS = cosize_v<SmemLayoutVHalfMN>;  // 16384 bf16 = 32 KB
 
   // P tile (PV A operand, K-major in j): (64 h, 64 j) bf16. WG0 writes the
   // post-softmax p ONCE per block; both consumer WGs read it for their PV
@@ -128,7 +130,7 @@ struct SparseMlaFp8DecodeKernel {
   using TiledMMA_QK_Rope = decltype(make_tiled_mma(
       SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{}, Layout<Shape<_1, _1, _1>>{}));
   using TiledMMA_PV = decltype(make_tiled_mma(
-      SM90_64x128x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));
+      SM90_64x256x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));
 
   struct SharedMemoryPlan {
     array_aligned<fp8_t, cosize_v<SmemLayoutQ>> q;             // 32 KB
@@ -136,7 +138,7 @@ struct SparseMlaFp8DecodeKernel {
     array_aligned<fp8_t, cosize_v<SmemLayoutK>> k;             // 32 KB
     array_aligned<bf16_t, cosize_v<SmemLayoutKRope>> k_rope;   // 8 KB
     array_aligned<float, NUM_GROUPS * B_TOPK> k_scales;        // [g][j] 1 KB
-    array_aligned<bf16_t, NUM_GROUPS * V_GROUP_ELEMS> v;       // 4 x (128d,64j) bf16 = 64 KB
+    array_aligned<bf16_t, 2 * V_HALF_ELEMS> v;                 // 2 x (256d,64j) bf16 = 64 KB
     array_aligned<bf16_t, cosize_v<SmemLayoutP>> p;            // (64 h, 64 j) bf16 = 8 KB
     array_aligned<float, B_H> scale_row;                       // per-head rO rescale factor
     array_aligned<bool, B_TOPK> valid;                         // index >= 0?
@@ -154,7 +156,7 @@ struct SparseMlaFp8DecodeKernel {
     auto kernel = &sparse_mla_fp8_decode_kernel<SparseMlaFp8DecodeKernel>;
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size));
-    dim3 grid(params.num_reqs, params.num_splits);
+    dim3 grid(params.num_reqs, params.num_splits, params.head_splits);
     kernel<<<grid, NUM_THREADS, smem_size, params.stream>>>(params);
     KU_CHECK_KERNEL_LAUNCH();
   }
@@ -166,6 +168,9 @@ struct SparseMlaFp8DecodeKernel {
     const int req = blockIdx.x;
     const int part = blockIdx.y;
     const int P = params.num_splits;
+    const int HS = params.head_splits;             // 1 or 2 head-halves
+    const int HLOC = B_H / HS;                     // heads per CTA (64 or 32)
+    const int h0 = blockIdx.z * HLOC;              // first head of this CTA
     const int nblocks_max = params.topk / B_TOPK;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
     const int idx_in_warpgroup = threadIdx.x % 128;
@@ -185,7 +190,9 @@ struct SparseMlaFp8DecodeKernel {
     // ----------------------------------------------------------------
     if (warpgroup_idx == 2) {
       if (params.use_qprep) {
-        // cp.async ready-made fp8 q + bf16 rope; direct s_q loads
+        // cp.async ready-made fp8 q + bf16 rope; direct s_q loads.
+        // Head-split CTAs load only their half; the other rows are zfilled
+        // (finite garbage in never-stored rows).
         Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ{});
         Tensor sQR = make_tensor(make_smem_ptr(plan.q_rope.data()), SmemLayoutQRope{});
         const uint8_t* q8 = params.q_fp8_out + (int64_t)req * B_H * D_NOPE;
@@ -196,17 +203,20 @@ struct SparseMlaFp8DecodeKernel {
         for (int ch = idx_in_warpgroup; ch < B_H * 32; ch += 128) {
           int row = ch / 32;
           int c = ch % 32;
-          cp_async_cacheglobal_l2_prefetch_256B(q8 + row * 512 + c * 16, &sQ(row, c * 16), true, qpol);
+          bool row_mine = (row >= h0) && (row < h0 + HLOC);
+          cp_async_cacheglobal_l2_prefetch_256B(q8 + row * 512 + c * 16, &sQ(row, c * 16), row_mine, qpol);
         }
         CUTE_UNROLL
         for (int ch = idx_in_warpgroup; ch < B_H * 8; ch += 128) {
           int row = ch / 8;
           int c = ch % 8;
-          cp_async_cacheglobal_l2_prefetch_256B(qr + row * 128 + c * 16, &sQR(row, c * 8), true, qpol);
+          bool row_mine = (row >= h0) && (row < h0 + HLOC);
+          cp_async_cacheglobal_l2_prefetch_256B(qr + row * 128 + c * 16, &sQR(row, c * 8), row_mine, qpol);
         }
         if (idx_in_warpgroup < 64) {
+          bool row_mine = (idx_in_warpgroup >= h0) && (idx_in_warpgroup < h0 + HLOC);
           plan.qmax_scratch[idx_in_warpgroup] =
-              __ldg(params.q_scale_out + (int64_t)req * B_H + idx_in_warpgroup);
+              row_mine ? __ldg(params.q_scale_out + (int64_t)req * B_H + idx_in_warpgroup) : 1.0f;
         }
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
@@ -284,17 +294,15 @@ struct SparseMlaFp8DecodeKernel {
     // WG1: rescale by WG0's factors -> PV groups 2,3 (no QK at all)
     // ----------------------------------------------------------------
     if (warpgroup_idx == 0 || warpgroup_idx == 1) {
-      cutlass::arch::warpgroup_reg_alloc<232>();
+      if (!(params.phase_mask & 128)) cutlass::arch::warpgroup_reg_alloc<232>();
 
       const float sm_scale = params.sm_scale_log2e;
-      const int my_g0 = warpgroup_idx * 2;  // first V group of this WG
-      Tensor rO_g0 = partition_fragment_C(TiledMMA_PV{}, Shape<Int<B_H>, Int<128>>{});  // 64 f32
-      Tensor rO_g1 = partition_fragment_C(TiledMMA_PV{}, Shape<Int<B_H>, Int<128>>{});  // 64 f32
-      cute::fill(rO_g0, 0.0f);
-      cute::fill(rO_g1, 0.0f);
+      const int my_d0 = warpgroup_idx * 256;  // first V dim of this WG
+      Tensor rO = partition_fragment_C(TiledMMA_PV{}, Shape<Int<B_H>, Int<256>>{});  // 128 f32
+      cute::fill(rO, 0.0f);
 
       ThrMMA thr_mma_pv = TiledMMA_PV{}.get_slice(idx_in_warpgroup);
-      Tensor cIdentityPV = make_identity_tensor(Shape<Int<B_H>, Int<128>>{});
+      Tensor cIdentityPV = make_identity_tensor(Shape<Int<B_H>, Int<256>>{});
       Tensor cPV = thr_mma_pv.partition_C(cIdentityPV);
       Tensor sP = make_tensor(make_smem_ptr(plan.p.data()), SmemLayoutP{});
 
@@ -317,10 +325,10 @@ struct SparseMlaFp8DecodeKernel {
         }
 
         for (int blk = part; blk < nblocks; blk += P) {
-          NamedBarrier::arrive_and_wait(384, NamedBarriers::kv_ready);
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(384, NamedBarriers::kv_ready);
 
           // ---- QK: fp8 groups (clear per group, drain, exact descale) + rope ----
-          {
+          if (!(params.phase_mask & 1)) {
             Tensor sKR = make_tensor(make_smem_ptr(plan.k_rope.data()), SmemLayoutKRope{});
             cute::fill(rP, 0.0f);
             CUTE_UNROLL
@@ -372,11 +380,9 @@ struct SparseMlaFp8DecodeKernel {
           {
             const int r0_head = get_AorC_row_idx(0, idx_in_warpgroup);
             CUTE_UNROLL
-            for (int i = 0; i < size(rO_g0); ++i) {
+            for (int i = 0; i < size(rO); ++i) {
               int rsel = (get<0>(cPV(i)) == r0_head) ? 0 : 1;
-              float s = exp2f(rM[rsel] - new_max[rsel]);
-              rO_g0(i) *= s;
-              rO_g1(i) *= s;
+              rO(i) *= exp2f(rM[rsel] - new_max[rsel]);
             }
             if (idx_in_warpgroup % 4 == 0) {
               plan.scale_row[r0_head] = exp2f(rM[0] - new_max[0]);
@@ -391,8 +397,10 @@ struct SparseMlaFp8DecodeKernel {
               float cur_sum = 0.f;
               CUTE_UNROLL
               for (int i = r * 2; i < size(rP); i += 4) {
-                float p0 = exp2f(rP(i) * sm_scale - new_max[r]);
-                float p1 = exp2f(rP(i + 1) * sm_scale - new_max[r]);
+                float a0 = rP(i) * sm_scale - new_max[r];
+                float a1 = rP(i + 1) * sm_scale - new_max[r];
+                float p0 = (params.phase_mask & 2) ? a0 : exp2f(a0);
+                float p1 = (params.phase_mask & 2) ? a1 : exp2f(a1);
                 rP(i) = p0;
                 rP(i + 1) = p1;
                 cur_sum += p0 + p1;
@@ -411,19 +419,18 @@ struct SparseMlaFp8DecodeKernel {
             rM[1] = new_max[1];
           }
           // p is read by WGMMA (async proxy) in BOTH WGs: fence before the barrier
-          fence_view_async_shared();
-          NamedBarrier::arrive_and_wait(256, NamedBarriers::p_ready);
+          if (!(params.phase_mask & 16)) fence_view_async_shared();
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(256, NamedBarriers::p_ready);
 
-          // ---- PV groups 0,1 (SS: A = shared p tile, B = V groups) ----
-          {
-            Tensor sVg0 = make_tensor(make_smem_ptr(plan.v.data() + 0 * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
-            Tensor sVg1 = make_tensor(make_smem_ptr(plan.v.data() + 1 * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
-            gemm_ss(false, TiledMMA_PV{}, sP, sVg0, rO_g0, idx_in_warpgroup);
-            gemm_ss(false, TiledMMA_PV{}, sP, sVg1, rO_g1, idx_in_warpgroup);
+          // ---- PV: A = shared p tile, B = this WG's V half (N=256) ----
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(256, NamedBarriers::v_ready);
+          if (!(params.phase_mask & 4)) {
+            Tensor sVh = make_tensor(make_smem_ptr(plan.v.data() + 0 * V_HALF_ELEMS), SmemLayoutVHalfMN{});
+            gemm_ss(false, TiledMMA_PV{}, sP, sVh, rO, idx_in_warpgroup);
             warpgroup_commit_batch();
             warpgroup_wait<0>();
           }
-          NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_done);
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_done);
         }
 
         // ---- partial store (o by BOTH WGs happens below; m/l by WG0) ----
@@ -436,54 +443,80 @@ struct SparseMlaFp8DecodeKernel {
           if (idx_in_warpgroup % 4 == 0) {
             int r0 = get_AorC_row_idx(0, idx_in_warpgroup);
             int r1 = get_AorC_row_idx(1, idx_in_warpgroup);
-            params.partial_ml[pm_base + r0 * 2 + 0] = rM[0];
-            params.partial_ml[pm_base + r0 * 2 + 1] = rL[0];
-            params.partial_ml[pm_base + r1 * 2 + 0] = rM[1];
-            params.partial_ml[pm_base + r1 * 2 + 1] = rL[1];
+            if (r0 >= h0 && r0 < h0 + HLOC) {
+              params.partial_ml[pm_base + r0 * 2 + 0] = rM[0];
+              params.partial_ml[pm_base + r0 * 2 + 1] = rL[0];
+            }
+            if (r1 >= h0 && r1 < h0 + HLOC) {
+              params.partial_ml[pm_base + r1 * 2 + 0] = rM[1];
+              params.partial_ml[pm_base + r1 * 2 + 1] = rL[1];
+            }
           }
         }
       } else {
-        // ================= WG1: rescale by published factors + PV g2/g3 =================
+        // ============ WG1: V dequant (overlapped with WG0's QK) + rescale + PV ============
+        Tensor sKfull = make_tensor(make_smem_ptr(plan.k.data()), SmemLayoutK{});
         for (int blk = part; blk < nblocks; blk += P) {
-          NamedBarrier::arrive_and_wait(384, NamedBarriers::kv_ready);
-          NamedBarrier::arrive_and_wait(256, NamedBarriers::p_ready);
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(384, NamedBarriers::kv_ready);
+          // ---- V dequant: v_true = fp8 * s_v[j,g] -> bf16 (both halves) ----
+          // vectorized: 8-d chunks; overlapped with WG0's QK+softmax (the
+          // producer already signaled kv_ready before this).
+          if (!(params.phase_mask & 8)) {
+            CUTE_UNROLL
+            for (int g = 0; g < NUM_GROUPS; ++g) {
+              Tensor sVh = make_tensor(
+                  make_smem_ptr(plan.v.data() + (g / 2) * V_HALF_ELEMS), SmemLayoutVHalfMN{});
+              const int d_in_half = (g % 2) * 128;  // group g maps to d [g*128, g*128+128)
+              CUTE_UNROLL
+              for (int e = 0; e < 8; ++e) {
+                int chunk = idx_in_warpgroup + e * 128;  // 1024 chunks of 8 d per group
+                int j = chunk / 16;
+                int d8 = d_in_half + (chunk % 16) * 8;
+                const uint2 raw = *reinterpret_cast<const uint2*>(&sKfull(j, g * 128 + ((chunk % 16) * 8)));
+                const __nv_fp8_e4m3* f8 = reinterpret_cast<const __nv_fp8_e4m3*>(&raw);
+                const float s0 = plan.k_scales[g * B_TOPK + j];
+                uint4 outv;
+                __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&outv);
+                CUTE_UNROLL
+                for (int t = 0; t < 8; ++t) {
+                  ob[t] = __float2bfloat16((float)f8[t] * s0);
+                }
+                *reinterpret_cast<uint4*>(&sVh(d8, j)) = outv;
+              }
+            }
+            // V is read by BOTH WGs' WGMMA: fence before the v_ready rendezvous
+            if (!(params.phase_mask & 16)) fence_view_async_shared();
+          }
+          // arrive-only: WG0's arrive_and_wait pairs with this (a wait here
+          // would deadlock against WG0's p_ready wait)
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive(256, NamedBarriers::v_ready);
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(256, NamedBarriers::p_ready);
           // rescale rO by WG0's per-row factors
           CUTE_UNROLL
-          for (int i = 0; i < size(rO_g0); ++i) {
-            float s = plan.scale_row[get<0>(cPV(i))];
-            rO_g0(i) *= s;
-            rO_g1(i) *= s;
+          for (int i = 0; i < size(rO); ++i) {
+            rO(i) *= plan.scale_row[get<0>(cPV(i))];
           }
-          {
-            Tensor sVg2 = make_tensor(make_smem_ptr(plan.v.data() + 2 * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
-            Tensor sVg3 = make_tensor(make_smem_ptr(plan.v.data() + 3 * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
-            gemm_ss(false, TiledMMA_PV{}, sP, sVg2, rO_g0, idx_in_warpgroup);
-            gemm_ss(false, TiledMMA_PV{}, sP, sVg3, rO_g1, idx_in_warpgroup);
+          if (!(params.phase_mask & 4)) {
+            Tensor sVh1 = make_tensor(make_smem_ptr(plan.v.data() + 1 * V_HALF_ELEMS), SmemLayoutVHalfMN{});
+            gemm_ss(false, TiledMMA_PV{}, sP, sVh1, rO, idx_in_warpgroup);
             warpgroup_commit_batch();
             warpgroup_wait<0>();
           }
-          NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_done);
+          if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_done);
         }
       }
 
-      // ---- partial o store (both WGs, disjoint V-dim halves; adjacent-d
-      // pairs packed to u64) ----
+      // ---- partial o store (both WGs, disjoint 256-dim halves; u64 pairs) ----
       {
         const int64_t po_base = ((int64_t)req * P + part) * B_H * D_V;
         CUTE_UNROLL
-        for (int i = 0; i < size(rO_g0); i += 2) {
+        for (int i = 0; i < size(rO); i += 2) {
           auto cc = cPV(i);
-          float2 f2 = make_float2(rO_g0(i), rO_g0(i + 1));
+          int hrow = get<0>(cc);
+          if (hrow < h0 || hrow >= h0 + HLOC) continue;
+          float2 f2 = make_float2(rO(i), rO(i + 1));
           *reinterpret_cast<uint64_t*>(
-              &params.partial_o[po_base + (int64_t)get<0>(cc) * D_V + my_g0 * 128 + get<1>(cc)]) =
-              *reinterpret_cast<uint64_t*>(&f2);
-        }
-        CUTE_UNROLL
-        for (int i = 0; i < size(rO_g1); i += 2) {
-          auto cc = cPV(i);
-          float2 f2 = make_float2(rO_g1(i), rO_g1(i + 1));
-          *reinterpret_cast<uint64_t*>(
-              &params.partial_o[po_base + (int64_t)get<0>(cc) * D_V + (my_g0 + 1) * 128 + get<1>(cc)]) =
+              &params.partial_o[po_base + (int64_t)hrow * D_V + my_d0 + get<1>(cc)]) =
               *reinterpret_cast<uint64_t*>(&f2);
         }
       }
@@ -491,7 +524,7 @@ struct SparseMlaFp8DecodeKernel {
       // ================================================================
       // Producer WG: per-block K/rope/scales load + V dequant
       // ================================================================
-      cutlass::arch::warpgroup_reg_dealloc<40>();
+      if (!(params.phase_mask & 128)) cutlass::arch::warpgroup_reg_dealloc<40>();
 
       const int64_t kv_idx_base = (int64_t)req * params.topk;
       for (int blk = part; blk < nblocks; blk += P) {
@@ -501,29 +534,34 @@ struct SparseMlaFp8DecodeKernel {
           plan.valid[idx_in_warpgroup] = (t >= 0);
           plan.row_idx[idx_in_warpgroup] = (t >= 0) ? t : 0;
         }
-        asm volatile("bar.sync 7, 128;\n" ::: "memory");
+        if (!(params.phase_mask & 64)) asm volatile("bar.sync 7, 128;\n" ::: "memory");
 
         Tensor sK = make_tensor(make_smem_ptr(plan.k.data()), SmemLayoutK{});
         Tensor sKR = make_tensor(make_smem_ptr(plan.k_rope.data()), SmemLayoutKRope{});
-        int64_t cache_policy = createpolicy_evict_last();
-        constexpr int TOTAL_CHUNKS = B_TOPK * CHUNKS_PER_ROW;
-        for (int ch = idx_in_warpgroup; ch < TOTAL_CHUNKS; ch += 128) {
-          int row = ch / CHUNKS_PER_ROW;
-          int c = ch % CHUNKS_PER_ROW;
+        // divisionless mapping: thread pair (2r, 2r+1) covers row r's 41
+        // chunks: even thread c in [0, 21), odd thread c in [21, 41)
+        {
+          const int row = idx_in_warpgroup >> 1;
+          const int c0 = (idx_in_warpgroup & 1) ? 21 : 0;
+          const int c1 = (idx_in_warpgroup & 1) ? 41 : 21;
           int t = plan.row_idx[row];
           const uint8_t* src = params.kv + (int64_t)t * ROW_BYTES;
-          if (c < 32) {
-            cp_async_cacheglobal_l2_prefetch_256B(src + c * 16, &sK(row, c * 16), true, cache_policy);
-          } else if (c == 32) {
+          for (int c = c0; c < 32 && c < c1; ++c) {
+            uint32_t dsta = cute::cast_smem_ptr_to_uint(&sK(row, c * 16));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dsta), "l"(src + c * 16));
+          }
+          if (c0 <= 32 && c1 > 32) {
             float4 s4 = __ldg(reinterpret_cast<const float4*>(src + SCALE_OFF));
             plan.k_scales[0 * B_TOPK + row] = s4.x;
             plan.k_scales[1 * B_TOPK + row] = s4.y;
             plan.k_scales[2 * B_TOPK + row] = s4.z;
             plan.k_scales[3 * B_TOPK + row] = s4.w;
-          } else {
+          }
+          for (int c = (c0 > 33 ? c0 : 33); c < c1; ++c) {
             int rc = c - 33;
             // 16-B chunk = 8 bf16 ELEMENTS: dest element offset is rc*8
-            cp_async_cacheglobal_l2_prefetch_256B(src + ROPE_OFF + rc * 16, &sKR(row, rc * 8), true, cache_policy);
+            uint32_t dsta = cute::cast_smem_ptr_to_uint(&sKR(row, rc * 8));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dsta), "l"(src + ROPE_OFF + rc * 16));
           }
         }
         asm volatile("cp.async.commit_group;\n" ::);
@@ -531,39 +569,11 @@ struct SparseMlaFp8DecodeKernel {
         fence_view_async_shared();
         asm volatile("bar.sync 7, 128;\n" ::: "memory");
 
-        // ---- V dequant: v_true = fp8 * s_v[j,g] -> bf16 (4 group tiles) ----
-        // vectorized: one 8-B fp8 chunk -> one 16-B bf16 chunk (16x fewer smem
-        // ops than the scalar version; the scalar path was 55% of all L1
-        // wavefronts). Chunk = 8 consecutive d within one (g, j) row.
-        {
-          Tensor sKfull = make_tensor(make_smem_ptr(plan.k.data()), SmemLayoutK{});
-          CUTE_UNROLL
-          for (int g = 0; g < NUM_GROUPS; ++g) {
-            Tensor sVg = make_tensor(
-                make_smem_ptr(plan.v.data() + g * V_GROUP_ELEMS), SmemLayoutVGroupMN{});
-            CUTE_UNROLL
-            for (int e = 0; e < 8; ++e) {
-              int chunk = idx_in_warpgroup + e * 128;  // 1024 chunks of 8 d
-              int j = chunk / 16;
-              int d8 = (chunk % 16) * 8;
-              // 8 fp8 bytes at (j, g*128 + d8): contiguous under the swizzle
-              const uint2 raw = *reinterpret_cast<const uint2*>(&sKfull(j, g * 128 + d8));
-              const __nv_fp8_e4m3* f8 = reinterpret_cast<const __nv_fp8_e4m3*>(&raw);
-              const float s0 = plan.k_scales[g * B_TOPK + j];
-              uint4 outv;
-              __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&outv);
-              CUTE_UNROLL
-              for (int t = 0; t < 8; ++t) {
-                ob[t] = __float2bfloat16((float)f8[t] * s0);
-              }
-              *reinterpret_cast<uint4*>(&sVg(d8, j)) = outv;
-            }
-          }
-        }
-        // generic-proxy writes must be visible to WGMMA readers
-        fence_view_async_shared();
-        NamedBarrier::arrive_and_wait(384, NamedBarriers::kv_ready);
-        NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_done);
+        // V dequant now lives in WG1 (overlapped with WG0's QK); the producer
+        // only loads. K cp.async data must be visible to WGMMA readers.
+        if (!(params.phase_mask & 16)) fence_view_async_shared();
+        if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(384, NamedBarriers::kv_ready);
+        if (!(params.phase_mask & 64)) NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_done);
       }
     }
 
@@ -577,7 +587,7 @@ struct SparseMlaFp8DecodeKernel {
       if (threadIdx.x == 0) {
         __threadfence();
         atomicAdd(params.counter, 1);
-        const int total = gridDim.x * gridDim.y;
+        const int total = gridDim.x * gridDim.y * gridDim.z;
         volatile int* c = reinterpret_cast<volatile int*>(params.counter);
         while (*c < total) __nanosleep(64);
         __threadfence();
@@ -585,8 +595,8 @@ struct SparseMlaFp8DecodeKernel {
       NamedBarrier::arrive_and_wait(384, NamedBarriers::blk_end);
       // parallel combine: flat work items (unit, d4), unit = req*64 + head
       {
-        const int T = gridDim.x * gridDim.y;
-        const int g = blockIdx.x * gridDim.y + blockIdx.y;
+        const int T = gridDim.x * gridDim.y * gridDim.z;
+        const int g = (blockIdx.x * gridDim.y + blockIdx.y) * gridDim.z + blockIdx.z;
         const int P = params.num_splits;
         const int total_items = params.num_reqs * 64 * 128;
         for (int w = g * NUM_THREADS + threadIdx.x; w < total_items; w += (int64_t)T * NUM_THREADS) {

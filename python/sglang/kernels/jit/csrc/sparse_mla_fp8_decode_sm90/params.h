@@ -42,6 +42,9 @@ struct SparseMlaFp8DecodeParams {
   float* __restrict__ q_scale_out;       // [num_reqs, 64]
   int use_qprep;                         // 1: main kernel loads pre-quantized q
   int fused;                             // 1: in-kernel combine behind an atomic barrier
+  int head_splits;                       // 1 or 2: CTAs also split the head dim (z axis)
+  int phase_mask;                        // debug: bit0 skip QK, bit1 skip softmax-exp,
+                                         // bit2 skip PV, bit3 skip V-dequant
   int* __restrict__ counter;             // [1] i32 fused barrier counter (qprep zeroes it)
   cutlass::bfloat16_t* __restrict__ out_fused;  // [num_reqs, 64, 512] fused-mode output
 
