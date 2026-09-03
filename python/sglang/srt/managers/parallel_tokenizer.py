@@ -4,13 +4,13 @@ Agentic prompts re-send the whole transcript every turn; the HF fast tokenizer
 encodes them single-threaded at ~0.8 Mtok/s, which is 0.4-1.3 s of pure CPU on
 the serving event loop for 300k-1M-token prompts. This module splits the
 rendered prompt at provably-safe token boundaries and encodes the chunks
-concurrently via the tokenizer's own batch API (rayon thread pool), then
-concatenates. Output is token-identical to the single-shot encode.
+concurrently via the Rust tokenizer's encode_batch (rayon), then concatenates.
+Output is token-identical to the single-shot encode.
 
 Exactness argument (GLM-5.3, verified against its tokenizer.json):
   * pre_tokenizer = Sequence[Split(regex=Llama3-style, Isolated), ByteLevel].
-    Every position p with text[p-1] == '\n' and text[p] non-whitespace is a
-    pre-token boundary: the only pre-token patterns that can contain '\n'
+    Every position p with text[p-1] == '\\n' and text[p] non-whitespace is a
+    pre-token boundary: the only pre-token patterns that can contain '\\n'
     (`\\s*[\\r\\n]+`, ` ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*`, `\\s+(?!\\S)`, `\\s+`)
     always end at the last '\\n'/'\\r' of a whitespace run, and a '\\n'
     immediately followed by non-whitespace is exactly that last position.
@@ -21,9 +21,7 @@ Exactness argument (GLM-5.3, verified against its tokenizer.json):
     none of GLM-5.3's added tokens contain '\\n' (asserted at init), so no
     split point can fall inside one.
   * The post-processor is ByteLevel (adds no tokens), so add_special_tokens
-    does not change the id sequence; chunks are encoded with
-    add_special_tokens=False and the result is identical either way (asserted
-    once at init on a probe string).
+    does not change the id sequence (asserted once at init on a probe string).
   * Belt and braces: every split point is re-verified per request by
     re-encoding a local window straddling the boundary both ways (split vs
     single-shot, batched); any mismatch falls back to a full single-shot
@@ -58,12 +56,28 @@ def parallel_tokenize_enabled() -> bool:
 
 
 class ParallelTokenizer:
-    """Wraps an HF fast tokenizer with an exact chunked-parallel encode."""
+    """Wraps an HF fast tokenizer with an exact chunked-parallel encode.
+
+    ``last_path`` records what the previous encode() call actually did:
+    "passthrough" (below threshold), "stock" (no safe split points), "parallel"
+    (chunked), "fallback" (verification failed -> single-shot re-encode).
+    """
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+        self._raw = None
         self._checked = False
         self._usable = False
+        self.last_path = "unused"
+
+    def _raw_tokenizer(self):
+        if self._raw is None:
+            t = self.tokenizer
+            # unwrap HF PreTrainedTokenizerFast -> tokenizers.Tokenizer
+            if hasattr(t, "_tokenizer"):
+                t = t._tokenizer
+            self._raw = t
+        return self._raw
 
     def _check_usable(self) -> bool:
         """One-time structural check of the tokenizer config."""
@@ -73,16 +87,18 @@ class ParallelTokenizer:
         try:
             import tokenizers  # HF fast tokenizers
 
-            if not isinstance(self.tokenizer, tokenizers.Tokenizer):
+            raw = self._raw_tokenizer()
+            if not isinstance(raw, tokenizers.Tokenizer):
                 return False
-            for t in self.tokenizer.get_added_tokens_decoder().values():
+            added = raw.get_added_tokens_decoder()
+            for t in added.values():
                 if "\n" in t.content or "\r" in t.content:
                     # a split after '\n' could fall inside an added token
                     return False
             # post-processor must not inject tokens (ByteLevel doesn't)
             probe = "hello world"
-            a = self.tokenizer.encode(probe, add_special_tokens=True).ids
-            b = self.tokenizer.encode(probe, add_special_tokens=False).ids
+            a = raw.encode(probe, add_special_tokens=True).ids
+            b = raw.encode(probe, add_special_tokens=False).ids
             if a != b:
                 return False
             self._usable = True
@@ -116,10 +132,13 @@ class ParallelTokenizer:
     def encode(self, text: str, **kwargs) -> List[int]:
         """Drop-in for tokenizer.encode(): token-identical, parallel for long text."""
         if not _ENABLED or len(text) < _MIN_CHARS or not self._check_usable():
+            self.last_path = "passthrough"
             return self.tokenizer.encode(text, **kwargs)
 
+        raw = self._raw_tokenizer()
         pts = self._split_points(text)
         if len(pts) < 2:
+            self.last_path = "stock"
             return self.tokenizer.encode(text, **kwargs)
 
         chunks: List[str] = []
@@ -139,7 +158,7 @@ class ParallelTokenizer:
                 batch.append(text[lo:p])
                 batch.append(text[p:hi])
 
-        encodings = self.tokenizer.encode_batch(batch, add_special_tokens=False)
+        encodings = raw.encode_batch(batch, add_special_tokens=False)
 
         if _VERIFY:
             k = len(chunks)
@@ -154,8 +173,10 @@ class ParallelTokenizer:
                         len(text),
                         k,
                     )
+                    self.last_path = "fallback"
                     return self.tokenizer.encode(text, **kwargs)
 
+        self.last_path = "parallel"
         ids: List[int] = []
         for e in encodings[:k]:
             ids.extend(e.ids)

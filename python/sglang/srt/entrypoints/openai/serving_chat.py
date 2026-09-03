@@ -1360,12 +1360,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self._parallel_tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                    _enc_kind = "parallel"
+                    pass
                 else:
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                    _enc_kind = "stock"
+                _enc_kind = (
+                    self._parallel_tokenizer.last_path
+                    if parallel_tokenize_enabled()
+                    else "stock"
+                )
                 _t_r2 = time.perf_counter()
                 if cold_trace_enabled():
                     cold_trace(
