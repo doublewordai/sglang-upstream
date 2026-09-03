@@ -6,6 +6,8 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
+
+from sglang.srt.boot_timeline import mark, wrap_weights_iterator
 import concurrent.futures
 import dataclasses
 import fnmatch
@@ -1016,6 +1018,8 @@ class DefaultModelLoader(BaseModelLoader):
             and not quant_config.is_checkpoint_nvfp4_serialized
         )
         is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        weights = wrap_weights_iterator(weights)
+        mark("weights_apply_begin")
         if is_mxfp8:
             weights = (
                 (
@@ -1053,6 +1057,8 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         for _, module in model.named_modules():
+        mark("weights_apply_end")
+        mark("post_load_weights_begin")
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -2607,6 +2613,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     with device_loading_context(module, target_device):
+        mark("post_load_weights_end")
                         quant_method.process_weights_after_loading(module)
 
             rank, _ = self._world_rank_and_size()

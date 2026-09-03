@@ -26,6 +26,8 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+
+from sglang.srt.boot_timeline import mark
 import inspect
 import logging
 import os
@@ -995,6 +997,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        mark("graph_capture_begin")
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1094,6 +1097,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
+                mark("capture_bs", bs=bs)
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
@@ -1114,6 +1118,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                                 bs, forward, stream_idx, variant_label, dsa_variant
                             )
         _set_capture_dsa_variant(None)
+        mark("graph_capture_end")
 
     def capture_one_shape(
         self,

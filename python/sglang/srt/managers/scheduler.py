@@ -15,6 +15,8 @@
 
 import dataclasses
 import faulthandler
+
+from sglang.srt.boot_timeline import mark
 import logging
 import os
 import signal
@@ -966,6 +968,7 @@ class Scheduler(
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
+        mark("init_memory_pools_begin")
         self.init_target_memory_pool()
         # Lands the retraction backend on the disagg bag before the draft
         # worker's HiCache plan reads it.
@@ -978,6 +981,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+        mark("init_memory_pools_end")
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -987,9 +991,11 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        mark("init_cuda_graphs_begin")
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+        mark("init_cuda_graphs_end")
 
     def init_model_worker(self):
         # Load model weights.

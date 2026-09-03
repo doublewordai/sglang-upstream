@@ -9,12 +9,14 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.boot_timeline import mark
 
 suppress_noisy_warnings()
 
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    mark("run_server_entry")
     if server_args.encoder_only:
         # For encoder disaggregation
         if server_args.smg_grpc_mode or server_args.grpc_mode:
