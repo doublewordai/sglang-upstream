@@ -24,6 +24,9 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.scheduler_components.pool_lock_breakdown import (
+    maybe_log_pool_locks,
+)
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -36,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -241,6 +244,15 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+
+                # Poll async HiCache events (write-through acks, load-backs).
+                # The non-PP disagg-prefill loop does this in
+                # get_next_disagg_prefill_batch_to_run, which this loop does
+                # not call; without it write-through page locks are never
+                # released and the device pool fills with protected pages.
+                if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+                    self.tree_cache.check_hicache_events()
+                maybe_log_pool_locks(self)
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
