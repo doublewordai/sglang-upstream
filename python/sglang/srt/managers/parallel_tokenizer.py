@@ -1,7 +1,7 @@
-"""Exact parallel chunked tokenization for long prompts (SGLANG_PARALLEL_TOKENIZE=1).
+"""Exact parallel chunked tokenization (SGLANG_PARALLEL_TOKENIZE, default on; =0 to disable).
 
 Agentic prompts re-send the whole transcript every turn; the HF fast tokenizer
-encodes them single-threaded at ~0.8 Mtok/s, which is 0.4-1.3 s of pure CPU on
+encodes them single-threaded at ~0.8 Mtok/s, which is 0.4-1.4 s of pure CPU on
 the serving event loop for 300k-1M-token prompts. This module splits the
 rendered prompt at provably-safe token boundaries and encodes the chunks
 concurrently via the Rust tokenizer's encode_batch (rayon), then concatenates.
@@ -16,7 +16,7 @@ Exactness argument (GLM-5.3, verified against its tokenizer.json):
     immediately followed by non-whitespace is exactly that last position.
   * Byte-level BPE encodes each pre-token independently, so concatenating the
     chunk encodings equals the single-shot encoding when every split point is
-    a pre-token boundary.
+    a pre-token boundary. The same argument applies to the offset mappings.
   * Added/special tokens are matched before pre-tokenization and are atomic;
     none of GLM-5.3's added tokens contain '\\n' (asserted at init), so no
     split point can fall inside one.
@@ -27,8 +27,8 @@ Exactness argument (GLM-5.3, verified against its tokenizer.json):
     single-shot, batched); any mismatch falls back to a full single-shot
     encode, so the returned ids can never diverge from the stock tokenizer.
 
-Env flags (all default off):
-  SGLANG_PARALLEL_TOKENIZE=1            enable
+Env flags:
+  SGLANG_PARALLEL_TOKENIZE=0            disable (default on)
   SGLANG_PARALLEL_TOKENIZE_MIN_CHARS    minimum prompt length to parallelize (default 262144)
   SGLANG_PARALLEL_TOKENIZE_CHUNK_CHARS  target chunk size in chars (default 131072)
   SGLANG_PARALLEL_TOKENIZE_MAX_CHUNKS   max chunks (default 16)
@@ -39,16 +39,18 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List
+from itertools import chain
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_ENABLED = os.environ.get("SGLANG_PARALLEL_TOKENIZE", "0") == "1"
+_ENABLED = os.environ.get("SGLANG_PARALLEL_TOKENIZE", "1") == "1"
 _MIN_CHARS = int(os.environ.get("SGLANG_PARALLEL_TOKENIZE_MIN_CHARS", 262144))
 _CHUNK_CHARS = int(os.environ.get("SGLANG_PARALLEL_TOKENIZE_CHUNK_CHARS", 131072))
 _MAX_CHUNKS = int(os.environ.get("SGLANG_PARALLEL_TOKENIZE_MAX_CHUNKS", "16"))
 _VERIFY = os.environ.get("SGLANG_PARALLEL_TOKENIZE_VERIFY", "1") == "1"
 _VERIFY_WINDOW = 128
+_SHARED: Optional["ParallelTokenizer"] = None
 
 
 def parallel_tokenize_enabled() -> bool:
@@ -59,8 +61,8 @@ class ParallelTokenizer:
     """Wraps an HF fast tokenizer with an exact chunked-parallel encode.
 
     ``last_path`` records what the previous encode() call actually did:
-    "passthrough" (below threshold), "stock" (no safe split points), "parallel"
-    (chunked), "fallback" (verification failed -> single-shot re-encode).
+    "passthrough" (below threshold), "stock" (no safe split points),
+    "parallel" (chunked), "fallback" (verification failed -> single-shot).
     """
 
     def __init__(self, tokenizer):
@@ -90,8 +92,7 @@ class ParallelTokenizer:
             raw = self._raw_tokenizer()
             if not isinstance(raw, tokenizers.Tokenizer):
                 return False
-            added = raw.get_added_tokens_decoder()
-            for t in added.values():
+            for t in raw.get_added_tokens_decoder().values():
                 if "\n" in t.content or "\r" in t.content:
                     # a split after '\n' could fall inside an added token
                     return False
@@ -129,17 +130,21 @@ class ParallelTokenizer:
             pts = [pts[round(i * (len(pts) - 1) / m)] for i in range(m)]
         return pts
 
-    def encode(self, text: str, **kwargs) -> List[int]:
-        """Drop-in for tokenizer.encode(): token-identical, parallel for long text."""
+    def encode_ids_and_ends(
+        self, text: str, **kwargs
+    ) -> Tuple[List[int], Optional[List[int]]]:
+        """Token-identical encode; also returns per-token end offsets when the
+        chunked path runs (offsets stitched per chunk; None on fallback paths).
+        """
         if not _ENABLED or len(text) < _MIN_CHARS or not self._check_usable():
             self.last_path = "passthrough"
-            return self.tokenizer.encode(text, **kwargs)
+            return self.tokenizer.encode(text, **kwargs), None
 
         raw = self._raw_tokenizer()
         pts = self._split_points(text)
         if len(pts) < 2:
             self.last_path = "stock"
-            return self.tokenizer.encode(text, **kwargs)
+            return self.tokenizer.encode(text, **kwargs), None
 
         chunks: List[str] = []
         prev = 0
@@ -174,9 +179,34 @@ class ParallelTokenizer:
                         k,
                     )
                     self.last_path = "fallback"
-                    return self.tokenizer.encode(text, **kwargs)
+                    return self.tokenizer.encode(text, **kwargs), None
 
         self.last_path = "parallel"
-        from itertools import chain
+        ids: List[int] = list(chain.from_iterable(e.ids for e in encodings[:k]))
+        ends: List[int] = list(
+            chain.from_iterable(
+                chunk_start + e.offsets[i][1]
+                for chunk_start, e in zip(
+                    [0] + pts, encodings[:k]
+                )
+                for i in range(len(e.ids))
+            )
+        )
+        return ids, ends
 
-        return list(chain.from_iterable(e.ids for e in encodings[:k]))
+    def encode(self, text: str, **kwargs) -> List[int]:
+        """Drop-in for tokenizer.encode(): token-identical, parallel for long text."""
+        return self.encode_ids_and_ends(text, **kwargs)[0]
+
+
+def parallel_encode_exact(tokenizer, text: str, **kwargs):
+    """Module-level helper: returns (ids, ends) with single-shot-identical ids.
+
+    Used by the delta-tokenizer cache's miss path so cold sessions also get the
+    parallel encode. `ends` is None when the parallel path did not run; callers
+    must then compute offsets with the stock call.
+    """
+    global _SHARED
+    if _SHARED is None or _SHARED.tokenizer is not tokenizer:
+        _SHARED = ParallelTokenizer(tokenizer)
+    return _SHARED.encode_ids_and_ends(text, **kwargs)

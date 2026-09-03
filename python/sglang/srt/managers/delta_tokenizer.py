@@ -37,6 +37,11 @@ import json
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
+from sglang.srt.managers.parallel_tokenizer import (
+    parallel_encode_exact,
+    parallel_tokenize_enabled,
+)
+
 
 class DeltaTokenizerCache:
     VERIFY_WINDOW = 8
@@ -129,8 +134,14 @@ class DeltaTokenizerCache:
                     self.stats["bytes_saved"] += c
                     return ids
             self.stats["fallback"] += 1
-        # miss (or no usable boundary): full encode, remember for next time
-        enc = self.tokenizer(text, return_offsets_mapping=True, **encode_kwargs)
+        # miss (or no usable boundary): full encode, remember for next time.
+        # Composes with the parallel chunked tokenizer (SGLANG_PARALLEL_TOKENIZE):
+        # the parallel path is token-identical, so the cached entry is identical.
+        ids, ends = parallel_encode_exact(self.tokenizer, text, **encode_kwargs)
+        if ends is None:
+            enc = self.tokenizer(text, return_offsets_mapping=True, **encode_kwargs)
+            ids = enc["input_ids"]
+            ends = [e for _, e in enc["offset_mapping"]]
         ids = enc["input_ids"]
         ends = [e for _, e in enc["offset_mapping"]]
         if key:
