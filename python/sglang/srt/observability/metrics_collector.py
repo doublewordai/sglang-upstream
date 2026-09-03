@@ -2489,6 +2489,10 @@ _ALL_RANKS_PREALLOC_QUEUE_FAMILY = (
     "sglang:num_decode_prealloc_queue_reqs",
     "The number of requests in the decode prealloc queue.",
 )
+_ALL_RANKS_SNAPSHOT_AGE_FAMILY = (
+    "sglang:load_snapshot_age_seconds",
+    "Age of the rank's newest load snapshot (scheduler liveness tripwire: a rank whose age keeps growing has stopped publishing -- hung scheduler or dead zmq path -- while its budget values silently freeze at the last snapshot).",
+)
 
 
 class AllRanksLoadSnapshotCollector:
@@ -2614,23 +2618,13 @@ class AllRanksLoadSnapshotCollector:
             s.disaggregation is not None for s in snapshots
         )
 
-        mp = self._mp.collect() if self._mp is not None else iter(())
-        if not (take_pool or take_queue or take_prealloc):
-            yield from mp
-            return
-
-        for metric in mp:
-            name = metric.name
-            if (
-                (take_pool and name in _ALL_RANKS_POOL_FAMILY_NAMES)
-                or (take_pool and name == _ALL_RANKS_WAIT_FAMILY[0])
-                or (take_pool and name == _ALL_RANKS_WAIT_AGE_FAMILY[0])
-                or (take_queue and name == _ALL_RANKS_QUEUE_FAMILY[0])
-                or (take_prealloc and name == _ALL_RANKS_PREALLOC_QUEUE_FAMILY[0])
-            ):
-                continue
-            yield metric
-
+        # Liveness tripwire: emitted for EVERY rank with a snapshot (new family,
+        # no mmdb counterpart, so no takeover gating needed -- including the
+        # single-node case). A rank whose age grows without bound has stopped
+        # publishing while consumers (DP budget, /v1/loads, this exporter)
+        # silently hold its last values -- the quietest failure mode of this
+        # channel (found in the 09-03 silent-discard audit; the zmq CONFLATE
+        # bug was another instance of the same class).
         labelnames = [
             "model_name",
             "engine_type",
@@ -2642,6 +2636,31 @@ class AllRanksLoadSnapshotCollector:
         if self._priority:
             labelnames.append("priority")
         self._labelnames = labelnames
+        if snapshots:
+            name, doc = _ALL_RANKS_SNAPSHOT_AGE_FAMILY
+            family = GaugeMetricFamily(name, doc, labels=labelnames)
+            now = time.time()
+            for s in snapshots:
+                family.add_metric(
+                    self._label_values(s), max(0.0, now - s.timestamp)
+                )
+            yield family
+
+        mp = self._mp.collect() if self._mp is not None else iter(())
+        if not (take_pool or take_queue or take_prealloc):
+            yield from mp
+            return
+        for metric in mp:
+            name = metric.name
+            if (
+                (take_pool and name in _ALL_RANKS_POOL_FAMILY_NAMES)
+                or (take_pool and name == _ALL_RANKS_WAIT_FAMILY[0])
+                or (take_pool and name == _ALL_RANKS_WAIT_AGE_FAMILY[0])
+                or (take_queue and name == _ALL_RANKS_QUEUE_FAMILY[0])
+                or (take_prealloc and name == _ALL_RANKS_PREALLOC_QUEUE_FAMILY[0])
+            ):
+                continue
+            yield metric
 
         if take_pool:
             for name, doc, field in _ALL_RANKS_POOL_FAMILIES:
