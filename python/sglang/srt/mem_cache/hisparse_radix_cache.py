@@ -63,6 +63,19 @@ class HiSparseRadixCache(RadixCache):
     def owns_hisparse_release(self) -> bool:
         return True
 
+    # Starvation-deficit eviction hook (host-pool backpressure
+    # follow-up, 2026-09-03): armed only around
+    # DecodePreallocQueue._evict_starved's evict() call; base
+    # RadixCache.evict() invokes _record_remove_event exactly once
+    # per evicted leaf node, so the hook sees every eviction with
+    # the node still intact.
+    _starve_on_evict = None
+
+    def _record_remove_event(self, node, medium=None):
+        super()._record_remove_event(node, medium)
+        if self._starve_on_evict is not None:
+            self._starve_on_evict(node)
+
     def reset(self):
         super().reset()
         # flush_cache resets the tree, then the allocator rebuilds its free
