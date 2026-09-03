@@ -901,6 +901,10 @@ class HiCacheBlob(HiCacheStorage):
         # main objects: only groups whose FIRST page is within this write range
         futures = []
         kv_name = PoolName.KV.value
+        # drafts may have been added to self._pools while planning this very
+        # call (per-pool objects); the group object only requires the pools
+        # of the main poolset.
+        required_pools = [n for n in self._pools if not n.startswith("draft")]
         for g, pool_pages in main_plan.items():
             p0 = g * self.blob_pages
             if p0 < start or p0 >= end:
@@ -908,10 +912,10 @@ class HiCacheBlob(HiCacheStorage):
             np_avail = min(self.blob_pages, end - p0)
             missing = [
                 n
-                for n in self._pools
+                for n in required_pools
                 if n not in pool_pages or len(pool_pages[n]) < np_avail
             ]
-            if missing or len(pool_pages) != len(self._pools):
+            if missing or len(pool_pages) != len(required_pools):
                 logger.info(
                     "[blob] group %d incomplete (missing %s of %s); skipped",
                     g,
