@@ -182,6 +182,14 @@ class HiCacheBlob(HiCacheStorage):
         self.blob_pages = int(cfg.get("blob_pages", 16))
         if self.blob_pages < 1:
             raise ValueError("blob_pages must be >= 1")
+        # header content must hold blob_pages page keys; keep within the
+        # on-disk 64 KiB header block so segment offsets stay DIO-aligned
+        self._header_size = _PAGE_KEYS_OFF + self.blob_pages * KEY_HEX_LEN
+        if self._header_size > HEADER_BLOCK:
+            raise ValueError(
+                f"blob_pages={self.blob_pages} exceeds header block "
+                f"({_PAGE_KEYS_OFF + self.blob_pages * KEY_HEX_LEN} > {HEADER_BLOCK})"
+            )
         self.io_streams = int(cfg.get("io_streams", 8))
         self.use_direct_io = bool(cfg.get("direct_io", True))
         self.stripe_count = int(cfg.get("stripe_count", 8))
@@ -325,7 +333,7 @@ class HiCacheBlob(HiCacheStorage):
         poolset: str,
         page_keys: Sequence[str],
     ) -> bytearray:
-        buf = bytearray(HEADER_SIZE)
+        buf = bytearray(self._header_size)
         seg_off = HEADER_BLOCK
         seg_lens = []
         for geo in pool_geos:
@@ -798,8 +806,10 @@ class HiCacheBlob(HiCacheStorage):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             header = self._pack_header(num_pages, geos, poolset, page_keys)
-            mv[:HEADER_SIZE] = bytes(header)
-            mv[HEADER_SIZE:HEADER_BLOCK] = bytes(HEADER_BLOCK - HEADER_SIZE)
+            mv[: self._header_size] = bytes(header)
+            mv[self._header_size : HEADER_BLOCK] = bytes(
+                HEADER_BLOCK - self._header_size
+            )
             for name, targets in pool_pages.items():
                 geo = self._pools[name]
                 pool = geo.host_pool
