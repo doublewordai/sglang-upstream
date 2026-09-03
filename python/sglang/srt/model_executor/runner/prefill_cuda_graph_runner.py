@@ -1350,6 +1350,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             global_num_tokens_gpu = num_tokens_tensor
             global_num_tokens_for_logprob_gpu = num_tokens_tensor
+            # lane prefill-graphs: captured DP kernels read this tensor at its
+            # capture-time address; retain it so replay can refresh content.
+            if getattr(self, "_dp_global_nums_retained", None) is None:
+                self._dp_global_nums_retained = {}
+            self._dp_global_nums_retained[num_tokens] = num_tokens_tensor
         else:
             global_dp_buffer_len = None
             global_num_tokens_gpu = None
@@ -1536,6 +1541,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
+    def _refresh_retained_dp_nums(self, live, static_num_tokens: int):
+        """Copy live per-rank token counts into the retained capture tensor."""
+        if live is None:
+            return None
+        retained = (getattr(self, "_dp_global_nums_retained", None) or {}).get(
+            static_num_tokens
+        )
+        if retained is None or tuple(live.shape) != tuple(retained.shape):
+            return live
+        retained.copy_(live)
+        return retained
+
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
@@ -1657,8 +1674,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
-            global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            # lane prefill-graphs: captured DP kernels read the capture-time
+            # global-nums tensor at its recorded address; refresh its content
+            # from the live batch so replay sizes match live per-rank counts
+            # (uneven DP splits otherwise desync captured segments vs the
+            # eager glue that reads static_forward_batch). Falls back to the
+            # live tensor when shapes do not match the captured one.
+            global_num_tokens_gpu=self._refresh_retained_dp_nums(
+                forward_batch.global_num_tokens_gpu, static_num_tokens
+            ),
+            global_num_tokens_for_logprob_gpu=self._refresh_retained_dp_nums(
+                forward_batch.global_num_tokens_for_logprob_gpu, static_num_tokens
+            ),
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
