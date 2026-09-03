@@ -79,6 +79,7 @@ class DisaggMetrics:
 @dataclass
 class Snap:
     dp_rank: int = 0
+    timestamp: float = 0.0
     tp_rank: int = 0
     pp_rank: int = 0
     moe_ep_rank: int = 0
@@ -157,10 +158,13 @@ def check(name, cond, extra=""):
         print(f"  FAIL {name} {extra}")
 
 
+# ---- case 0: snapshot age gauge present for every rank (incl. single-node) ---
+AGE = "sglang:load_snapshot_age_seconds"
+
 # ---- case 1: single-node (all node_rank 0) -> pure passthrough -------------
 print("case 1: single-node passthrough")
 c = AllRanksLoadSnapshotCollector(
-    FakeReader([Snap(dp_rank=0), Snap(dp_rank=1, queues=QueueMetrics(3))]),
+    FakeReader([Snap(dp_rank=0, timestamp=__import__('time').time()), Snap(dp_rank=1, timestamp=__import__('time').time(), queues=QueueMetrics(3))]),
     model_name="m",
     engine_type="decode",
     local_node_rank=0,
@@ -169,7 +173,9 @@ c = AllRanksLoadSnapshotCollector(
 )
 c.attach_multiprocess_collector(FakeMP(POOL_NAMES | {QUEUE, "sglang:other"}))
 fams = families(c)
-check("mmdb families all pass through", fams == POOL_NAMES | {QUEUE, "sglang:other"}, fams)
+check("mmdb families all pass through", fams == POOL_NAMES | {QUEUE, AGE, "sglang:other"}, fams)
+ages = sorted(v for (n, l, v) in collect_text(c) if n == AGE)
+check("age gauge emitted for both ranks (single-node too)", len(ages) == 2, ages)
 
 # ---- case 2: 2-node decode+hisparse: takeover, all ranks, one family -------
 print("case 2: 2-node decode+hisparse takeover")
@@ -197,7 +203,7 @@ c = AllRanksLoadSnapshotCollector(
 c.attach_multiprocess_collector(FakeMP(POOL_NAMES | {QUEUE, PREALLOC_Q, "sglang:other"}))
 txt = collect_text(c)
 fams = families(c)
-check("pool+queue families emitted once", fams == POOL_NAMES | {QUEUE, PREALLOC_Q, "sglang:other"}, fams)
+check("pool+queue families emitted once", fams == POOL_NAMES | {QUEUE, PREALLOC_Q, AGE, "sglang:other"}, fams)
 wa = sorted(v for (n, l, v) in txt if n == "sglang:hisparse_host_pool_wait_age_s")
 check("wait_age both ranks (0.0 / 130.5)", wa == [0.0, 130.5], wa)
 pq = sorted(v for (n, l, v) in txt if n == PREALLOC_Q)
@@ -224,7 +230,7 @@ check("labels exact scheduler set", lbls == want, lbls)
 # ---- case 3: decode arm WITHOUT hisparse -> -1s ----------------------------
 print("case 3: decode without hisparse -> -1 convention")
 c = AllRanksLoadSnapshotCollector(
-    FakeReader([Snap(dp_rank=0), Snap(dp_rank=1, node_rank=1)]),
+    FakeReader([Snap(dp_rank=0, timestamp=__import__('time').time()), Snap(dp_rank=1, node_rank=1, timestamp=__import__('time').time())]),
     model_name="m", engine_type="decode", local_node_rank=0,
     enable_priority_scheduling=False, decode_hisparse=False,
 )
@@ -276,7 +282,7 @@ check("priority label present", all(l.get("priority") == "" for l in lbls), lbls
 # ---- case 6: remote snapshot without queues -> queue passes through --------
 print("case 6: no queues in snapshots -> mmdb queue passthrough")
 c = AllRanksLoadSnapshotCollector(
-    FakeReader([Snap(dp_rank=0), Snap(dp_rank=1, node_rank=1)]),
+    FakeReader([Snap(dp_rank=0, timestamp=__import__('time').time()), Snap(dp_rank=1, node_rank=1, timestamp=__import__('time').time())]),
     model_name="m", engine_type="decode", local_node_rank=0,
     enable_priority_scheduling=False, decode_hisparse=True,
 )
