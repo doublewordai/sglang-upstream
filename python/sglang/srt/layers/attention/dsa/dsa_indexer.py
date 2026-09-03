@@ -331,6 +331,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
+        # Draft attention window (length-agnostic drafter conditioning,
+        # OWL 2510.07535 / LongSpec 2502.17421 / Windowed-MTP 2607.21535):
+        # when set (only on a DRAFT model's indexers, from
+        # --speculative-draft-window-size / --speculative-draft-attn-sink), the
+        # drafter's candidate keys are restricted to the union of the first
+        # `draft_sink` positions and the most recent `draft_window` positions.
+        # Selection-only: kept keys stay roped at their true positions (RoPE is
+        # translation-invariant, so their scores are unchanged), and the target
+        # model / verify path never sees these attributes.
+        self.draft_window: Optional[int] = None
+        self.draft_sink: Optional[int] = None
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
@@ -942,6 +953,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _mask_draft_window(
+        self, logits: torch.Tensor, lengths: torch.Tensor
+    ) -> torch.Tensor:
+        """Restrict draft top-k candidates to [0, sink) u [len-W, len) per row.
+
+        Graph-safe: pure device ops on the static logits shape, no host sync.
+        `lengths` is per-logit-row (decode: one row per request; verify /
+        draft-extend-v2: one row per token), matching the paged-mqa logits rows.
+        Rows in `logits` beyond len(lengths) (attn-tp padding) are left as-is;
+        the caller's topk padding path marks them invalid anyway.
+        """
+        W = int(self.draft_window)
+        A = int(self.draft_sink or 0)
+        n = lengths.shape[0]
+        pos = torch.arange(
+            logits.shape[1], device=logits.device, dtype=lengths.dtype
+        )[None, :]
+        keep = (pos >= (lengths[:, None] - W)) | (pos < A)
+        masked = logits[:n].masked_fill(~keep, float("-inf"))
+        out = logits.clone()
+        out[:n] = masked
+        return out
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1129,6 +1163,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
+        if self.draft_window:
+            logits = self._mask_draft_window(logits, seqlens_32)
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
