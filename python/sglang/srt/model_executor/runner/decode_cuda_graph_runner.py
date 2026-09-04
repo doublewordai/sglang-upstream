@@ -1232,6 +1232,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     run_lm_head=True,
                 )
                 mark("cos_autotune_done", bs=bs)
+                mark("cos_warmups_done", bs=bs)
                 self.backend.capture_one(
                     shape_key,
                     run_once,
