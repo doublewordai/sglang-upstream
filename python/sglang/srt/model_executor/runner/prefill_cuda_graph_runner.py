@@ -647,6 +647,101 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             yield
 
     @torch.no_grad()
+    def _pp_capture_input_proxy(self, num_tokens: int):
+        """Static input proxy slots for non-first PP stages (lane prefill-graphs).
+
+        The captured graph reads hidden_states/residual (+ shared DSA topk when
+        the previous stage forwards it) from these fixed-address buffers; at
+        replay the live recv'd tensors are copied in (see replay_layer_forward).
+        Returns None on the first PP rank and for non-PP rigs.
+        """
+        if getattr(self, "_pp_input_slots", None) is None:
+            self._pp_input_slots = {}
+            self._pp_needs_input = False
+            try:
+                pp_group = self.model_runner.pp_group
+                self._pp_needs_input = (
+                    pp_group is not None and not pp_group.is_first_rank
+                )
+            except Exception:
+                self._pp_needs_input = False
+            self._pp_needs_topk = False
+            if self._pp_needs_input:
+                lm = self.layer_model
+                cfg = getattr(lm, "config", None)
+                if (
+                    getattr(lm, "use_dsa", False)
+                    and cfg is not None
+                    and getattr(cfg, "index_topk", None) is not None
+                ):
+                    try:
+                        from sglang.srt.configs.model_config import (
+                            dsa_layer_skips_topk,
+                        )
+
+                        uses_topk = bool(
+                            lm._dsa_forward_uses_topk()
+                        ) if hasattr(lm, "_dsa_forward_uses_topk") else True
+                        self._pp_needs_topk = uses_topk and dsa_layer_skips_topk(
+                            cfg, getattr(lm, "start_layer", 0)
+                        )
+                    except Exception:
+                        # Present-but-unneeded is harmless (the share state only
+                        # reads the initial topk at skip layers); absent-but-
+                        # needed breaks capture. Default to present.
+                        self._pp_needs_topk = True
+        if not self._pp_needs_input:
+            return None
+        slots = self._pp_input_slots.get(num_tokens)
+        if slots is None:
+            lm = self.layer_model
+            hidden = lm.config.hidden_size
+            # Activation dtype, NOT a weight dtype: on fp8-quantized models a
+            # PP stage's first parameter can be an fp8 weight while
+            # hidden_states/residual are bf16 (found by the PP2 dummy-rig repro:
+            # sgl_fused_add_rmsnorm failed to dispatch Float8_e4m3fn).
+            dtype = getattr(
+                getattr(self.model_runner, "model_config", None), "dtype", None
+            )
+            if dtype is None:
+                dtype = next(lm.parameters()).dtype
+            device = next(lm.parameters()).device
+            tensors = {
+                "hidden_states": torch.zeros(
+                    (num_tokens, hidden), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (num_tokens, hidden), dtype=dtype, device=device
+                ),
+            }
+            if self._pp_needs_topk:
+                from sglang.srt.configs.model_config import get_dsa_index_topk
+
+                tensors["topk_indices"] = torch.zeros(
+                    (num_tokens, get_dsa_index_topk(lm.config)),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+            slots = PPProxyTensors(tensors)
+            self._pp_input_slots[num_tokens] = slots
+        return slots
+
+    def _pp_copy_replay_inputs(self, pp_proxy_tensors, static_num_tokens: int):
+        """Copy the live incoming PP proxy tensors into the static slots."""
+        if pp_proxy_tensors is None:
+            return
+        slots = self._pp_input_slots.get(static_num_tokens)
+        if slots is None:
+            return
+        for key, live in pp_proxy_tensors.tensors.items():
+            slot = slots.tensors.get(key)
+            if slot is None or live is None:
+                continue
+            rows = min(slot.shape[0], live.shape[0])
+            slot[:rows].copy_(live[:rows])
+
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
         """Run forward inside the prefill set_tc_piecewise_forward_context.
 
@@ -678,6 +773,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                pp_proxy = self._pp_capture_input_proxy(num_tokens)
+                if pp_proxy is not None:
+                    return self.layer_model.forward(
+                        forward_batch.input_ids,
+                        positions,
+                        forward_batch,
+                        forward_batch.input_embeds,
+                        pp_proxy_tensors=pp_proxy,
+                    )
                 return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
@@ -1246,6 +1350,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             global_num_tokens_gpu = num_tokens_tensor
             global_num_tokens_for_logprob_gpu = num_tokens_tensor
+            # lane prefill-graphs: captured DP kernels read this tensor at its
+            # capture-time address; retain it so replay can refresh content.
+            if getattr(self, "_dp_global_nums_retained", None) is None:
+                self._dp_global_nums_retained = {}
+            self._dp_global_nums_retained[num_tokens] = num_tokens_tensor
         else:
             global_dp_buffer_len = None
             global_num_tokens_gpu = None
@@ -1432,6 +1541,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
+    def _refresh_retained_dp_nums(self, live, static_num_tokens: int):
+        """Copy live per-rank token counts into the retained capture tensor."""
+        if live is None:
+            return None
+        retained = (getattr(self, "_dp_global_nums_retained", None) or {}).get(
+            static_num_tokens
+        )
+        if retained is None or tuple(live.shape) != tuple(retained.shape):
+            return live
+        retained.copy_(live)
+        return retained
+
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
@@ -1553,8 +1674,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
-            global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            # lane prefill-graphs: captured DP kernels read the capture-time
+            # global-nums tensor at its recorded address; refresh its content
+            # from the live batch so replay sizes match live per-rank counts
+            # (uneven DP splits otherwise desync captured segments vs the
+            # eager glue that reads static_forward_batch). Falls back to the
+            # live tensor when shapes do not match the captured one.
+            global_num_tokens_gpu=self._refresh_retained_dp_nums(
+                forward_batch.global_num_tokens_gpu, static_num_tokens
+            ),
+            global_num_tokens_for_logprob_gpu=self._refresh_retained_dp_nums(
+                forward_batch.global_num_tokens_for_logprob_gpu, static_num_tokens
+            ),
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
@@ -1680,6 +1811,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
+            pp_in = layer_kwargs.get("pp_proxy_tensors")
+            if pp_in is None and len(args) > 4:
+                pp_in = args[4]
+            self._pp_copy_replay_inputs(pp_in, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
@@ -1760,8 +1895,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        raise NotImplementedError(
-            "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
+        # lane prefill-graphs: non-last PP stages return the proxy they sent;
+        # trim to the raw row count like the logits path.
+        return PPProxyTensors(
+            {
+                key: (t[: self.raw_num_tokens] if t.shape[0] >= self.raw_num_tokens else t)
+                for key, t in output.tensors.items()
+            }
         )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:

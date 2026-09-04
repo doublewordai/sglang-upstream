@@ -1543,6 +1543,7 @@ def moe_ep_deepgemm_preprocess(
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
     use_mxfp8: bool = False,
+    input_scale: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
@@ -1607,7 +1608,16 @@ def moe_ep_deepgemm_preprocess(
         )
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
     elif is_fp8:
-        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        if input_scale is not None:
+            # lane prefill-graphs: input is already per-token-group fp8 (worst-case
+            # DeepEP dispatch pre-quantizes with the same 128-group quantizer) —
+            # gather rows+scales as-is, no requant roundtrip. Only the plain
+            # row-major scale layout is supported (not UE8M0/mxfp8 packing).
+            assert hidden_states.dtype == torch.float8_e4m3fn
+            assert not (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+            scale = input_scale
+        else:
+            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
             device=hidden_states.device,

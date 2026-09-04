@@ -93,6 +93,29 @@ def _is_mnnvl_fabric_supported() -> bool:
     return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
+# lane prefill-graphs: worst-case (CPU-sync-free) normal-mode dispatch is the
+# DEFAULT for deep_ep normal mode (measured: holder-F rig exactness within the
+# engine's own nondeterminism envelope at 32k/200k/1M; conc1 prefill wall -8%,
+# conc4 +1.7%; removes the intranode_prepare host sync that blocked CUDA-graph
+# capture). deep_ep's num_worst_tokens path sizes recv buffers to the bound,
+# skips the host sync, and returns no per-expert list -- the masked grouped-GEMM
+# layout is derived on device downstream (moe_runner/deep_gemm.py).
+# The bound defaults to a safe over-estimate: every rank in the dispatch group
+# receives every other rank's tokens (group_size x per-rank chunk). The legacy
+# host-sync path remains as the documented fallback for the memory-constrained
+# regime: set SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS=0 to restore it (saves
+# ~6.4 GiB/rank of worst-case recv + masked-layout buffers at the 4-rank /
+# 2k-chunk shape, at the cost of the dispatch host sync). A positive value
+# overrides the derived bound for tuning.
+_deepep_worst_case_recv_tokens_env = int(
+    __import__("os").environ.get("SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS", "") or -1
+)
+
+
+def deepep_worst_case_enabled() -> bool:
+    return _deepep_worst_case_recv_tokens_env != 0
+
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -578,6 +601,38 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.src2dst = None
         self.quant_config = {}
 
+    def _worst_case_recv_bound(self) -> int:
+        # Default bound: every group rank receives every other rank's tokens.
+        # Per-rank dispatched tokens are bounded by the dp-attn local chunk
+        # (chunked_prefill_size / dp_size); fall back to 8192 when server args
+        # are unreachable (e.g. unit tests).
+        if _deepep_worst_case_recv_tokens_env > 0:
+            return _deepep_worst_case_recv_tokens_env
+        per_rank = 8192
+        try:
+            from sglang.srt.layers.dp_attention import get_attention_dp_size
+            from sglang.srt.runtime_context import get_context
+
+            sa = getattr(get_context(), "server_args", None)
+            if sa is not None:
+                dp = max(get_attention_dp_size(), 1)
+                chunk = sa.chunked_prefill_size or (sa.max_prefill_tokens or 8192)
+                # The runtime chunked_prefill_size is already dp-adjusted
+                # (8192 global -> 2048/rank); dividing again under-sizes the
+                # bound and overflows the recv buffers under load. Take the
+                # max of both interpretations: oversizing costs memory,
+                # undersizing crashes.
+                per_rank = max(chunk, chunk // dp, 1024)
+        except Exception:
+            pass
+        bound = per_rank * self.group.size()
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "worst-case recv bound: per_rank=%d group=%d bound=%d (env=%d)",
+            per_rank, self.group.size(), bound, _deepep_worst_case_recv_tokens_env,
+        )
+        return bound
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -710,6 +765,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            num_worst_tokens=(
+                self._worst_case_recv_bound()
+                if self.deepep_mode.is_normal()
+                and deepep_worst_case_enabled()
+                and self.group.size() > 1
+                else 0
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
