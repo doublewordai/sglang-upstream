@@ -3831,16 +3831,19 @@ class Scheduler(
                     and (req.rid, str(res)) not in self._kvu_admit_logged
                 ):
                     self._kvu_admit_logged.add((req.rid, str(res)))
+                _pi = getattr(req, "prefix_indices", None)
                 logger.info(
                     "[kvu-admit] rid=%s len=%d res=%s can_run=%d chunked=%s "
-                    "prefix=%s extend=%s",
+                    "prefix_len=%s fill_len=%s rem_total=%s cur_rem=%s",
                     req.rid,
                     len(req.origin_input_ids) if req.origin_input_ids else -1,
                     res,
                     len(adder.can_run_list),
                     self.chunked_req is not None,
-                    getattr(req, "prefix_indices", None) is not None,
-                    getattr(req, "extend_input_len", None),
+                    len(_pi) if _pi is not None else None,
+                    len(req.fill_ids) if getattr(req, "fill_ids", None) is not None else None,
+                    getattr(adder, "rem_total_tokens", "?"),
+                    getattr(adder, "cur_rem_tokens", "?"),
                 )
 
             if self.enable_lora:
