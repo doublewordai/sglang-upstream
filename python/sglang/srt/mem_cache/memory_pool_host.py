@@ -548,6 +548,29 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def set_from_flat_data_pages_bulk(self, index, data_pages, n_pages):
+        """kv-unit: run-batched restore scatter. `index` is the first page's
+        token index (same convention as set_from_flat_data_page);
+        `data_pages` is a [n_pages, layer_num, item_bytes] VIEW (possibly
+        strided across padded segment slots) of n_pages consecutive pages.
+        Replaces n_pages x layer_num small copy_ calls with layer_num range
+        copies (layer_first) or one range copy (page_first) — the D2.6
+        decomposition showed the per-page scatter is ~49% of restore wall.
+        Raises for unknown layouts so callers fall back to the per-page path.
+        """
+        first = int(index) // self.slot_page_size
+        if self.layout == "layer_first":
+            for i in range(self.layer_num):
+                self.kv_buffer[i][first : first + n_pages].copy_(data_pages[:, i, :])
+        elif self.layout == "page_first":
+            self.kv_buffer[first : first + n_pages].copy_(data_pages)
+        elif self.layout == "page_first_direct":
+            self.kv_buffer[first : first + n_pages].copy_(
+                data_pages.reshape(n_pages, self.layer_num, 1, self.item_bytes)
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
     def get_page_buffer_meta(self, indices):
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()

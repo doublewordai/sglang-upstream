@@ -1304,7 +1304,24 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            #
+            # kv-unit (regression found on the rank-free rig, 2026-09-04):
+            # the request's OWN lock just removed its matched prefix from the
+            # evictable pool, and `total_tokens` still contains that prefix
+            # (the true-locked-cost charge). Re-billing it here double-charges
+            # the one mass the request itself made unavailable: a warm return
+            # to a rank whose evictable mass is mostly the session ITSELF can
+            # never satisfy the check (245,760-token session, 307,200-token
+            # pool: 247,936 >= 61,440 forever, 238k+ silent NO_TOKEN retries;
+            # the same shape as park-1m-wedge). Bill only the INCREMENT the
+            # admission still needs beyond the already-locked prefix. The
+            # pre-lock check above is unchanged and remains the stacking
+            # protection (a later request's full charge against a pool that
+            # already excludes earlier requests' locks); locks taken by
+            # OTHER requests during this acquisition still shrink
+            # rem_total_tokens and are caught by the increment check.
+            increment_tokens = total_tokens - len(req.prefix_indices)
+            if increment_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:

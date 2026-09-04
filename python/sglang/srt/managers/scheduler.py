@@ -3844,6 +3844,16 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
+                    if not hasattr(self, "_kvu_admit_logged"):
+                        self._kvu_admit_logged = set()
+                    if (
+                        os.environ.get("SGLANG_KVU_ADMIT_LOG", "0") == "1"
+                        and req.rid not in self._kvu_admit_logged
+                    ):
+                        self._kvu_admit_logged.add(req.rid)
+                        logger.info(
+                            "[kvu-admit] rid=%s SKIP: ongoing prefetch", req.rid
+                        )
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
@@ -3857,6 +3867,28 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if res != AddReqResult.CONTINUE:
+                if not hasattr(self, "_kvu_admit_logged"):
+                    self._kvu_admit_logged = set()
+                if (
+                    os.environ.get("SGLANG_KVU_ADMIT_LOG", "0") == "1"
+                    and (req.rid, str(res)) not in self._kvu_admit_logged
+                ):
+                    self._kvu_admit_logged.add((req.rid, str(res)))
+                _pi = getattr(req, "prefix_indices", None)
+                logger.info(
+                    "[kvu-admit] rid=%s len=%d res=%s can_run=%d chunked=%s "
+                    "prefix_len=%s fill_len=%s rem_total=%s cur_rem=%s",
+                    req.rid,
+                    len(req.origin_input_ids) if req.origin_input_ids else -1,
+                    res,
+                    len(adder.can_run_list),
+                    self.chunked_req is not None,
+                    len(_pi) if _pi is not None else None,
+                    len(req.fill_ids) if getattr(req, "fill_ids", None) is not None else None,
+                    getattr(adder, "rem_total_tokens", "?"),
+                    getattr(adder, "cur_rem_tokens", "?"),
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
