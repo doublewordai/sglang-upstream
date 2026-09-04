@@ -7018,9 +7018,18 @@ class ServerArgs:
                         "--deepep-mode low_latency or auto."
                     )
             if self.deepep_mode == "normal":
-                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                # lane prefill-graphs: DeepEP normal dispatch is CPU-sync-free
+                # when a worst-case recv bound is set (num_worst_tokens path),
+                # so CUDA graphs stay capturable; only disable in the legacy
+                # host-sync path.
+                if os.environ.get(
+                    "SGLANG_DEEPEP_WORST_CASE_RECV_TOKENS", ""
+                ) == "0":  # default-on; explicit 0 = memory-constrained fallback
+                    logger.warning(
+                        "Cuda graph is disabled because deepep_mode=`normal`"
+                    )
+                    self.cuda_graph_config.decode.backend = Backend.DISABLED
+                    self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if (
             self.moe_a2a_backend == "none" and is_npu()

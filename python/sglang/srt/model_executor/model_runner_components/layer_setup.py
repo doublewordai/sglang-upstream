@@ -27,7 +27,19 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
         layers = layers.values()
-    for layer in layers:
+
+    def _place(registry: list, gid: int, value) -> None:
+        # lane prefill-graphs: PP stages hold a slice of the model, but
+        # BCG capture contexts index these registries by the layer's GLOBAL
+        # layer_id (radix_attention.py _unified_attention_with_output_impl).
+        # Register at the global id, leaving None holes for other stages.
+        while len(registry) <= gid:
+            registry.append(None)
+        if value is not None:
+            registry[gid] = value
+
+    for pos, layer in enumerate(layers):
+        gid = getattr(layer, "layer_id", pos)
         attn_layer = None
         mha_companion_layer = None
         if hasattr(layer, "self_attn"):
@@ -63,11 +75,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 attn_layer = layer
 
         if attn_layer is not None:
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
+            _place(attention_layers, gid, attn_layer)
+            _place(mha_companion_layers, gid, mha_companion_layer)
         elif hasattr(layer, "mixer"):
-            attention_layers.append(None)
-            mha_companion_layers.append(None)
+            _place(attention_layers, gid, None)
+            _place(mha_companion_layers, gid, None)
 
         moe_block = None
         moe_fusion = None
@@ -86,13 +98,13 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
             moe_block = layer.mixer.experts
             moe_fusion = layer.mixer
-        moe_layers.append(moe_block)
-        moe_fusions.append(moe_fusion)
+        _place(moe_layers, gid, moe_block)
+        _place(moe_fusions, gid, moe_fusion)
         # NSA indexers (None for layers without NSA)
         dsa_indexer = None
         if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
             dsa_indexer = layer.self_attn.indexer
-        dsa_indexers.append(dsa_indexer)
+        _place(dsa_indexers, gid, dsa_indexer)
 
     return AttentionAndMoeLayers(
         attention_layers,

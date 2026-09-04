@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from array import array
 from collections import deque
@@ -685,6 +686,14 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        # boot-path: join the deferred tokenizer load here — everything above
+        # (weights, pools, graph capture) has run concurrently with it.
+        if self._tokenizer_thread is not None:
+            self._tokenizer_thread.join()
+            self._tokenizer_thread = None
+            if self._tokenizer_error is not None:
+                raise self._tokenizer_error
+
         self.is_initializing = False
         self.init_startup_timing_summary()
 
@@ -837,6 +846,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        self._tokenizer_thread = None
 
         if self.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -852,6 +862,36 @@ class Scheduler(
                     model_name=get_model().model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
+            elif os.environ.get("SGLANG_TOK_DEFER", "1") == "1":
+                # boot-path: the tokenizer load (fast+slow retries; the biggest
+                # slice of the prod config->dist-init gap) is deferred to a
+                # daemon thread and joined at the end of __init__ — it overlaps
+                # weight load + pools + graph capture and is not used before
+                # the event loop. SGLANG_TOK_DEFER=0 restores the sync load.
+                mark("tok_defer_begin")
+                self.tokenizer = None
+                self._tokenizer_error = None
+
+                def _deferred_tokenizer_load():
+                    try:
+                        tok = get_tokenizer(
+                            get_serving().tokenizer_path,
+                            tokenizer_mode=get_serving().tokenizer_mode,
+                            trust_remote_code=get_model().trust_remote_code,
+                            revision=get_model().revision,
+                            tokenizer_backend=get_serving().tokenizer_backend,
+                        )
+                    except BaseException as e:  # surfaced at the join
+                        self._tokenizer_error = e
+                        return
+                    self.tokenizer = tok
+                    mark("tok_defer_done")
+                    self._init_reasoning_parser()
+
+                self._tokenizer_thread = threading.Thread(
+                    target=_deferred_tokenizer_load, daemon=True, name="bp-tok"
+                )
+                self._tokenizer_thread.start()
             else:
                 self.tokenizer = get_tokenizer(
                     get_serving().tokenizer_path,
@@ -860,6 +900,7 @@ class Scheduler(
                     revision=get_model().revision,
                     tokenizer_backend=get_serving().tokenizer_backend,
                 )
+                self._init_reasoning_parser()
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
@@ -883,6 +924,9 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
+        self._init_reasoning_parser()
+
+    def _init_reasoning_parser(self):
         if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=get_serving().reasoning_parser,
@@ -4032,6 +4076,16 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
+                    if not hasattr(self, "_kvu_admit_logged"):
+                        self._kvu_admit_logged = set()
+                    if (
+                        os.environ.get("SGLANG_KVU_ADMIT_LOG", "0") == "1"
+                        and req.rid not in self._kvu_admit_logged
+                    ):
+                        self._kvu_admit_logged.add(req.rid)
+                        logger.info(
+                            "[kvu-admit] rid=%s SKIP: ongoing prefetch", req.rid
+                        )
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
@@ -4045,6 +4099,28 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if res != AddReqResult.CONTINUE:
+                if not hasattr(self, "_kvu_admit_logged"):
+                    self._kvu_admit_logged = set()
+                if (
+                    os.environ.get("SGLANG_KVU_ADMIT_LOG", "0") == "1"
+                    and (req.rid, str(res)) not in self._kvu_admit_logged
+                ):
+                    self._kvu_admit_logged.add((req.rid, str(res)))
+                _pi = getattr(req, "prefix_indices", None)
+                logger.info(
+                    "[kvu-admit] rid=%s len=%d res=%s can_run=%d chunked=%s "
+                    "prefix_len=%s fill_len=%s rem_total=%s cur_rem=%s",
+                    req.rid,
+                    len(req.origin_input_ids) if req.origin_input_ids else -1,
+                    res,
+                    len(adder.can_run_list),
+                    self.chunked_req is not None,
+                    len(_pi) if _pi is not None else None,
+                    len(req.fill_ids) if getattr(req, "fill_ids", None) is not None else None,
+                    getattr(adder, "rem_total_tokens", "?"),
+                    getattr(adder, "cur_rem_tokens", "?"),
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)

@@ -373,11 +373,32 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
+    # lane prefill-graphs: with pipeline parallelism the layer list spans the
+    # full model (placeholder modules for other stages) and model_config.
+    # num_hidden_layers is the global count — comparing against either
+    # disables BCG for every PP>1 rig. Compare against the count of layers
+    # the counting walk recognizes (real decoder layers for this stage).
+    local_real_layers = sum(
+        1
+        for lyr in layer_model.layers
+        if hasattr(lyr, "self_attn")
+        or hasattr(lyr, "attn")
+        or hasattr(lyr, "linear_attn")
+        or hasattr(lyr, "attention")
+        or hasattr(lyr, "mixer")
+    )
+    # With global-id registration the list is padded with None holes, so count
+    # materialized entries instead of using len().
+    recognized_attn = sum(
+        1 for x in model_runner.attention_layers if x is not None
+    )
+    if recognized_attn < local_real_layers:
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,
-            "Disable prefill CUDA graph because some layers do not apply Standard GQA",
+            f"Disable prefill CUDA graph because some layers do not apply Standard GQA "
+            f"(attn={recognized_attn} local={local_real_layers} "
+            f"global={model_runner.model_config.num_hidden_layers})",
         )
         return result(None)
 

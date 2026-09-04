@@ -168,11 +168,20 @@ class SchedulerLoadInquirer:
                         )
                 except (AttributeError, TypeError) as e:
                     logger.debug(f"HiSparse host pool metrics not available: {e}")
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+        elif self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.NULL,
+            None,
+        ):
             # prefill-pool-degrade: the hicache host pool is the retention
             # constraint on a prefill arm; without this the snapshot reports
             # host_free_tok=0 unconditionally (staging C10B showed all-zero
             # host_free_tok from boot - the router was blind).
+            # kv-unit: the same reporting now also covers NON-disaggregated
+            # hicache servers (dp rigs where each rank is a full engine), and
+            # adds the tree's evictable (unlocked retained) tokens: the
+            # reclaimable half of the free+evictable capacity a dispatcher
+            # can place a session against.
             if self.server_args.enable_hierarchical_cache:
                 try:
                     tree_cache = self.get_tree_cache()
@@ -185,6 +194,9 @@ class SchedulerLoadInquirer:
                         host_pool = cc.mem_pool_host
                         host_pool_free_tokens = int(host_pool.available_size())
                         host_pool_total_tokens = int(host_pool.size)
+                        host_pool_evictable_tokens = int(
+                            tree_cache.evictable_size()
+                        )
                     except (AttributeError, TypeError) as e:
                         logger.debug(f"HiCache host pool metrics not available: {e}")
             # device-pool-degrade: in-flight handover mass + bound + blocks
@@ -199,6 +211,44 @@ class SchedulerLoadInquirer:
                 ) = self.get_pdho_inflight_state()
             except (AttributeError, TypeError) as e:
                 logger.debug(f"pdho inflight metrics not available: {e}")
+
+        # Device token-pool lock breakdown (prefill-oom-1328): same taxonomy
+        # as the [pool-locks] log line and the attributed OOM message, so the
+        # master /metrics sees per-rank WHO holds the device pool. Only the
+        # prefill arm is wired here; decode holders (park/migration) join the
+        # same fields when their lanes wire them.
+        (
+            dev_free,
+            dev_evictable,
+            dev_locked_transfer,
+            dev_locked_forward,
+            dev_locked_admission,
+            dev_locked_store_acks,
+            dev_locked_migration,
+            dev_oldest_transfer_age_s,
+            dev_oldest_admission_age_s,
+            dev_reclaimable,
+        ) = (-1, -1, -1, -1, -1, -1, -1, -1.0, -1.0, -1)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            try:
+                from sglang.srt.managers.scheduler_components.pool_lock_breakdown import (
+                    LoadInquirerAdapter,
+                    compute_pool_lock_breakdown,
+                )
+
+                b = compute_pool_lock_breakdown(LoadInquirerAdapter(self))
+                dev_free = b.get("free", -1)
+                dev_reclaimable = b.get("free", -1) + b.get("evictable", -1)
+                dev_evictable = b.get("evictable", -1)
+                dev_locked_transfer = b["transfer"].tokens
+                dev_locked_forward = b["forward"].tokens
+                dev_locked_admission = b["admission"].tokens
+                dev_locked_store_acks = b["store"].n
+                dev_locked_migration = b["migration"].tokens
+                dev_oldest_transfer_age_s = b["transfer"].oldest_age_s
+                dev_oldest_admission_age_s = b["admission"].oldest_age_s
+            except Exception as e:
+                logger.debug(f"device pool lock breakdown not available: {e}")
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (
@@ -299,6 +349,16 @@ class SchedulerLoadInquirer:
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
             host_pool_free_tokens=host_pool_free_tokens,
+            device_token_pool_free_tokens=dev_free,
+            device_token_pool_reclaimable_tokens=dev_reclaimable,
+            device_token_pool_evictable_tokens=dev_evictable,
+            device_token_pool_locked_transfer_tokens=dev_locked_transfer,
+            device_token_pool_locked_forward_tokens=dev_locked_forward,
+            device_token_pool_locked_admission_tokens=dev_locked_admission,
+            device_token_pool_locked_store_acks=dev_locked_store_acks,
+            device_token_pool_locked_migration_tokens=dev_locked_migration,
+            device_token_pool_oldest_transfer_age_s=dev_oldest_transfer_age_s,
+            device_token_pool_oldest_admission_age_s=dev_oldest_admission_age_s,
             host_pool_total_tokens=host_pool_total_tokens,
             host_pool_pinned_tokens=host_pool_pinned_tokens,
             host_pool_evictable_tokens=host_pool_evictable_tokens,

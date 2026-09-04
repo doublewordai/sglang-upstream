@@ -68,6 +68,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# kv-unit lane: per-phase timing of the blob read path (DIO read vs host
+# scatter), one INFO line per batch. Default off; no behavior change.
+_BLOB_PHASE_STATS = os.environ.get("SGLANG_KVU_BLOB_PHASE_STATS", "0") == "1"
+
 MAGIC = b"SGBLOB01"
 VERSION = 1
 HEADER_SIZE = 4096  # header content size (packed fields + page keys)
@@ -613,12 +617,18 @@ class HiCacheBlob(HiCacheStorage):
         Fills results[transfer_name][transfer_page_idx] = True on success.
         """
         path = self._obj_path(group_id)
+        _t_hdr = 0.0
+        _t_read = 0.0
+        _t_sc = 0.0
+        _n_bytes = 0
+        _n_pages = 0
+        _t0 = time.perf_counter() if _BLOB_PHASE_STATS else 0.0
         try:
             fd = self._open_read(path)
         except FileNotFoundError:
-            return
+            return None
         except OSError:
-            return
+            return None
         try:
             hbuf = self._aligned_buffer(HEADER_BLOCK)
             self._pread_all(fd, hbuf, HEADER_BLOCK)
@@ -661,26 +671,75 @@ class HiCacheBlob(HiCacheStorage):
                         return
 
             seg_cache: Dict[str, Any] = {}
+            if _BLOB_PHASE_STATS:
+                _t_hdr = time.perf_counter() - _t0
             try:
                 for name, targets in pool_targets.items():
                     geo = self._pools[name]
                     h = hmap[name]
                     pool = geo.host_pool
-                    for (p, host_idx, tn, ti) in targets:
+                    _ps = int(getattr(pool, "page_size", 1) or 1)
+                    _bulk = getattr(pool, "set_from_flat_data_pages_bulk", None)
+                    _k = 0
+                    _nt = len(targets)
+                    while _k < _nt:
+                        (p, host_idx, tn, ti) = targets[_k]
                         if p >= np_:
+                            _k += 1
                             continue
                         seg = seg_cache.get(name)
                         if seg is None:
                             m = self._aligned_buffer(h["seg_len"])
+                            _tr = time.perf_counter() if _BLOB_PHASE_STATS else 0.0
                             self._pread_all(fd, m, h["seg_len"], h["seg_off"])
+                            if _BLOB_PHASE_STATS:
+                                _t_read += time.perf_counter() - _tr
+                                _n_bytes += h["seg_len"]
                             seg = memoryview(m)
                             seg_cache[name] = seg
+                        # kv-unit: run-batched scatter — consecutive segment
+                        # pages mapped to consecutive host pages go as ONE
+                        # bulk store (the per-page path costs layer_num
+                        # copy_ calls per page; ~49% of restore wall).
+                        _run = 1
+                        if _bulk is not None:
+                            while (
+                                _k + _run < _nt
+                                and targets[_k + _run][0] == p + _run
+                                and targets[_k + _run][0] < np_
+                                and targets[_k + _run][1] == host_idx + _run * _ps
+                            ):
+                                _run += 1
+                        _ts = time.perf_counter() if _BLOB_PHASE_STATS else 0.0
+                        if _run >= 4 and _bulk is not None:
+                            _item = geo.dtype.itemsize
+                            _stride = geo.slot_bytes // _item
+                            _seg_t = torch.frombuffer(seg, dtype=geo.dtype)
+                            _run_t = torch.as_strided(
+                                _seg_t,
+                                (_run, pool.layer_num, pool.item_bytes),
+                                (_stride, pool.item_bytes, 1),
+                                storage_offset=(p * geo.slot_bytes) // _item,
+                            )
+                            _bulk(host_idx, _run_t, _run)
+                            for _r in range(_run):
+                                _tr2 = targets[_k + _r]
+                                results[_tr2[2]][_tr2[3]] = True
+                            if _BLOB_PHASE_STATS:
+                                _t_sc += time.perf_counter() - _ts
+                                _n_pages += _run
+                            _k += _run
+                            continue
                         src = seg[
                             p * geo.slot_bytes : p * geo.slot_bytes + geo.page_bytes
                         ]
                         page_t = torch.frombuffer(src, dtype=geo.dtype)
                         pool.set_from_flat_data_page(host_idx, page_t)
+                        if _BLOB_PHASE_STATS:
+                            _t_sc += time.perf_counter() - _ts
+                            _n_pages += 1
                         results[tn][ti] = True
+                        _k += 1
                 self._total_read_objects += 1
                 self._total_read_bytes += HEADER_BLOCK + sum(
                     h["seg_len"] for h in header["pools"]
@@ -689,8 +748,18 @@ class HiCacheBlob(HiCacheStorage):
                 # explicit close() raises while torch views exist; drop refs
                 # and let refcounting unmap the anonymous mmaps
                 seg_cache.clear()
+            if _BLOB_PHASE_STATS:
+                return {
+                    "hdr": _t_hdr,
+                    "read": _t_read,
+                    "sc": _t_sc,
+                    "bytes": _n_bytes,
+                    "pages": _n_pages,
+                }
+            return None
         except Exception as e:  # store failure = miss, never a raise
             logger.warning("[blob] read group %s failed: %s", group_id, e)
+            return None
         finally:
             os.close(fd)
 
@@ -764,11 +833,37 @@ class HiCacheBlob(HiCacheStorage):
                         self._read_group, gid, poolset, expected, pool_targets, results
                     )
                 )
+        _pt0 = time.perf_counter() if _BLOB_PHASE_STATS else 0.0
+        _agg = {"hdr": 0.0, "read": 0.0, "sc": 0.0, "bytes": 0, "pages": 0, "groups": 0}
         for fut in futures:
             try:
-                fut.result()
+                _r = fut.result()
+                if _r is not None:
+                    _agg["hdr"] += _r["hdr"]
+                    _agg["read"] += _r["read"]
+                    _agg["sc"] += _r["sc"]
+                    _agg["bytes"] += _r["bytes"]
+                    _agg["pages"] += _r["pages"]
+                    _agg["groups"] += 1
             except Exception as e:  # pragma: no cover
                 logger.warning("[blob] group read future failed: %s", e)
+        if _BLOB_PHASE_STATS and _agg["groups"]:
+            _tt = time.perf_counter() - _pt0
+            logger.info(
+                "[kvu-blob-phase] groups=%d pages=%d bytes=%.3e t_total_s=%.3f "
+                "t_header_s=%.3f t_read_s=%.3f t_scatter_s=%.3f t_other_s=%.3f "
+                "read_gbps=%.2f scatter_gbps=%.2f",
+                _agg["groups"],
+                _agg["pages"],
+                float(_agg["bytes"]),
+                _tt,
+                _agg["hdr"],
+                _agg["read"],
+                _agg["sc"],
+                _tt - _agg["hdr"] - _agg["read"] - _agg["sc"],
+                (_agg["bytes"] / 1e9 / _agg["read"]) if _agg["read"] > 0 else 0.0,
+                (_agg["bytes"] / 1e9 / _agg["sc"]) if _agg["sc"] > 0 else 0.0,
+            )
         return results
 
     # ------------------------------------------------------------------

@@ -1248,6 +1248,24 @@ class PrefillAdder:
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
 
+        # prefill-oom-1328: charge the TRUE LOCKED COST of the admission.
+        # Admitting a request locks its whole matched prefix (inc_lock_ref at
+        # admission), removing those pages from the evictable pool for every
+        # later allocation - but the old check compared only the delta +
+        # max_new + one page, so consecutive warm-hit admissions could each
+        # pass while collectively locking the entire reclaimable pool
+        # (production 13:28Z: 366,144- and 687,040-token cached prefixes
+        # admitted within 3 s on a rank with a ~1.1M-token cold prefill in
+        # flight -> full_available_size=0 AND full_evictable_size=0 -> the
+        # un-refusable chunked continuation raised and killed the arm). The
+        # live evictable count already reflects locks taken earlier in this
+        # pass, so charging the matched length HERE (in the check, not in the
+        # offsets) makes each admission require its whole footprint to fit in
+        # what is left. Conservative on shared prefixes: the same prefix
+        # admitted twice in one pass is charged twice, which serialises
+        # identical-prompt concurrency - the safe direction.
+        total_tokens += len(req.prefix_indices)
+
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
@@ -1292,7 +1310,24 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            #
+            # kv-unit (regression found on the rank-free rig, 2026-09-04):
+            # the request's OWN lock just removed its matched prefix from the
+            # evictable pool, and `total_tokens` still contains that prefix
+            # (the true-locked-cost charge). Re-billing it here double-charges
+            # the one mass the request itself made unavailable: a warm return
+            # to a rank whose evictable mass is mostly the session ITSELF can
+            # never satisfy the check (245,760-token session, 307,200-token
+            # pool: 247,936 >= 61,440 forever, 238k+ silent NO_TOKEN retries;
+            # the same shape as park-1m-wedge). Bill only the INCREMENT the
+            # admission still needs beyond the already-locked prefix. The
+            # pre-lock check above is unchanged and remains the stacking
+            # protection (a later request's full charge against a pool that
+            # already excludes earlier requests' locks); locks taken by
+            # OTHER requests during this acquisition still shrink
+            # rem_total_tokens and are caught by the increment check.
+            increment_tokens = total_tokens - len(req.prefix_indices)
+            if increment_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:

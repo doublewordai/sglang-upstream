@@ -275,11 +275,21 @@ def prepare_mlp_sync_batch_raw(
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
     )
-    can_run_prefill_cuda_graph = (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
+    if local_batch is None or local_batch.forward_mode.is_idle():
+        # lane prefill-graphs: an idle rank cannot replay the prefill graph
+        # (its runner-local check fails on 0 tokens: _pad_to_bucket(0) returns
+        # the bucket, which exceeds 0 * the padding factor). Voting permissive
+        # here desyncs the group: the owner replays the graph while idle ranks
+        # run eager idle forwards, and the baked collectives in the graph no
+        # longer match the eager sequence (NCCL mismatch -> illegal access /
+        # cublas failure at the first bucket replay; found via the DP4 dummy
+        # rig). Vote False so the min-reduced group verdict forces the whole
+        # group to eager. When no breakable prefill runner exists the flag is
+        # unused, so False is harmless.
+        can_run_prefill_cuda_graph = not breakable_prefill
+    else:
         # Breakable Cuda Graph Backend Check.
-        or (
+        can_run_prefill_cuda_graph = (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and (
                 prefill_graph_runner is None
@@ -297,7 +307,6 @@ def prepare_mlp_sync_batch_raw(
             )
             and breakable_prefill
         )
-    )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:

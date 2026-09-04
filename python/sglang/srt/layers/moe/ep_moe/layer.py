@@ -220,7 +220,14 @@ class DeepEPMoE(FusedMoE):
         topk_output: TopKOutput,
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
-        if is_in_breakable_cuda_graph():
+        # Exception (lane prefill-graphs): with worst-case (num_worst_tokens)
+        # dispatch there is no host sync and deep_ep documents the path as
+        # CUDA-graph compatible — capture the a2a in-graph.
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            deepep_worst_case_enabled,
+        )
+
+        if is_in_breakable_cuda_graph() and not deepep_worst_case_enabled():
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"
