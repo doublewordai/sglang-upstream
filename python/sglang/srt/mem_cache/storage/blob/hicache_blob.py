@@ -678,8 +678,14 @@ class HiCacheBlob(HiCacheStorage):
                     geo = self._pools[name]
                     h = hmap[name]
                     pool = geo.host_pool
-                    for (p, host_idx, tn, ti) in targets:
+                    _ps = int(getattr(pool, "page_size", 1) or 1)
+                    _bulk = getattr(pool, "set_from_flat_data_pages_bulk", None)
+                    _k = 0
+                    _nt = len(targets)
+                    while _k < _nt:
+                        (p, host_idx, tn, ti) = targets[_k]
                         if p >= np_:
+                            _k += 1
                             continue
                         seg = seg_cache.get(name)
                         if seg is None:
@@ -691,7 +697,39 @@ class HiCacheBlob(HiCacheStorage):
                                 _n_bytes += h["seg_len"]
                             seg = memoryview(m)
                             seg_cache[name] = seg
+                        # kv-unit: run-batched scatter — consecutive segment
+                        # pages mapped to consecutive host pages go as ONE
+                        # bulk store (the per-page path costs layer_num
+                        # copy_ calls per page; ~49% of restore wall).
+                        _run = 1
+                        if _bulk is not None:
+                            while (
+                                _k + _run < _nt
+                                and targets[_k + _run][0] == p + _run
+                                and targets[_k + _run][0] < np_
+                                and targets[_k + _run][1] == host_idx + _run * _ps
+                            ):
+                                _run += 1
                         _ts = time.perf_counter() if _BLOB_PHASE_STATS else 0.0
+                        if _run >= 4 and _bulk is not None:
+                            _item = geo.dtype.itemsize
+                            _stride = geo.slot_bytes // _item
+                            _seg_t = torch.frombuffer(seg, dtype=geo.dtype)
+                            _run_t = torch.as_strided(
+                                _seg_t,
+                                (_run, pool.layer_num, pool.item_bytes),
+                                (_stride, pool.item_bytes, 1),
+                                storage_offset=(p * geo.slot_bytes) // _item,
+                            )
+                            _bulk(host_idx, _run_t, _run)
+                            for _r in range(_run):
+                                _tr2 = targets[_k + _r]
+                                results[_tr2[2]][_tr2[3]] = True
+                            if _BLOB_PHASE_STATS:
+                                _t_sc += time.perf_counter() - _ts
+                                _n_pages += _run
+                            _k += _run
+                            continue
                         src = seg[
                             p * geo.slot_bytes : p * geo.slot_bytes + geo.page_bytes
                         ]
@@ -701,6 +739,7 @@ class HiCacheBlob(HiCacheStorage):
                             _t_sc += time.perf_counter() - _ts
                             _n_pages += 1
                         results[tn][ti] = True
+                        _k += 1
                 self._total_read_objects += 1
                 self._total_read_bytes += HEADER_BLOCK + sum(
                     h["seg_len"] for h in header["pools"]
