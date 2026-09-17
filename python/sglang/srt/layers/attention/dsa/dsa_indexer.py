@@ -1383,6 +1383,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_indices_offset_override=topk_offset_chunk,
             )
             topk_result[start:end] = raw_topk_chunk
+            # Do not retain the previous score matrix while allocating the next chunk.
+            del logits_chunk, raw_topk_chunk
             start = end
 
         return topk_result
